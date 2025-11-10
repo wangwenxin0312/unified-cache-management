@@ -126,7 +126,7 @@ def get_offset(block_shape, rank, tp_size, precision, layer_id, is_v, is_mla) ->
         k_offset = layer_size * layer_id
     else:
         k_offset = layer_size * layer_id + layer_size // tp_size * rank
-    v_offset = k_offset + k_min_data_block_size
+    v_offset = k_offset + k_min_data_block_size 
     return v_offset if is_v else k_offset
 
 
@@ -288,9 +288,7 @@ class ReqStatePerLayer:
             self.tasks[task_v_hash] = task_v
 
     def extract_block_repre(self, vllm_block_ids):
-        if not self.is_mla:
-            return self.k_cache[vllm_block_ids].mean(1)
-        return self.k_cache[vllm_block_ids].mean(1).unsqueeze(-2)
+        return self.k_cache[vllm_block_ids].mean(1)
 
     def maybe_register_static_data(self, forward_context: ForwardContext):
         if self.init_static_flag:

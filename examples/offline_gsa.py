@@ -96,7 +96,7 @@ def main():
     model = os.getenv("MODEL_PATH", "/home/models/DeepSeek-V2-Lite-Chat/")
     # ans_out_path = "dqa_zh_ans_gsa_1.json"
     setup_environment_variables()
-    tokenizer = AutoTokenizer.from_pretrained("/home/models/DeepSeek-R1-Distill-Qwen-32B/", use_chat_template = True)
+    tokenizer = AutoTokenizer.from_pretrained("/home/models/DeepSeek-V2-Lite-Chat/", use_chat_template = True)
     sparse_method = "gsa-deepseek-v2-lit-chat-pc"
     
     def get_prompt(prompt):
@@ -118,7 +118,7 @@ def main():
         # multifieldqa_zh
         sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1024, ignore_eos=False)
         jsonl_data = read_jsonl("/home/externals/wangwenxin21/datasets/LongBench/data/multifieldqa_zh.jsonl")
-        ans_out_path = f"DeepSeek-R1-Distill-Qwen-32B_{sparse_method}_multifieldqa_zh"
+        ans_out_path = f"DeepSeek-R1-Distill-Qwen-32B_{sparse_method}_multifieldqa_zh_new_token"
         for i, item in enumerate(jsonl_data):
             shutil.rmtree("/home/externals/wangwenxin21/unified-cache-management/datasets/data")
             os.makedirs("/home/externals/wangwenxin21/unified-cache-management/datasets/data")
