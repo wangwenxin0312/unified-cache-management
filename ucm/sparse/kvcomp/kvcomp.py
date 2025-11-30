@@ -30,7 +30,7 @@ from ucm.sparse.kvcomp.kvcomp_config import KvCompConfig
 from ucm.sparse.kvstar.utils import get_bind_cpus_for_rank
 from ucm.sparse.state import get_ucm_sparse
 from ucm.store.ucmstore import Task, UcmKVStoreBase
-
+from ucm.integration.vllm.ucm_connector import RequestHasher
 logger = init_logger(__name__)
 
 ReqType = Union[str, int]
@@ -151,7 +151,7 @@ class KvComp(ESA):
         self.rank = vllm_config.parallel_config.rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         if role == UcmSparseRole.WORKER:
-            self.connector = get_kv_transfer_group().connector
+            self.connector = get_kv_transfer_group().connector.store
         else:
             self.connector = None
         self.total_num_hidden_layers = (
@@ -166,6 +166,8 @@ class KvComp(ESA):
         ]["KvComp"]
 
         self.block_size = vllm_config.cache_config.block_size
+        self.block_hashes: dict[int, dict[int, list[str]]] = {}
+        self.request_hasher = RequestHasher(vllm_config, 0)
         self.num_kv_heads = vllm_config.model_config.get_num_kv_heads(
             vllm_config.parallel_config
         )

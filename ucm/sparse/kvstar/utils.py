@@ -18,6 +18,22 @@ def get_offset(block_shape, rank, tp_size, precision, layer_id, is_v, is_mla) ->
     v_offset = k_offset + k_min_data_block_size
     return v_offset if is_v else k_offset
 
+@cache
+def compute_layer_offset(
+    block_data_size: int,
+    layer_id: int,
+    is_v: bool,
+    is_mla: bool,
+) -> int:
+    layer_data_size = block_data_size if is_mla else block_data_size * 2
+
+    k_offset = layer_data_size * layer_id
+
+    if is_mla:
+        return k_offset
+
+    v_offset = k_offset + block_data_size
+    return v_offset if is_v else k_offset
 
 @cache
 def md5(input) -> int:
@@ -33,6 +49,12 @@ def block_hash_func(parent_block_hash, curr_block_token_ids):
     curr_block_token_ids_tuple = tuple(curr_block_token_ids)
     return md5((parent_block_hash, curr_block_token_ids_tuple))
 
+@cache
+def compute_parent_block_hash(model_name, world_size, dtype, seed_rank=0) -> int:
+    meta = f"{model_name}:{world_size}:{dtype}:{seed_rank}"
+    meta_bytes = meta.encode("utf-8")
+    h_seed = hashlib.md5(meta_bytes + b"UCM_HASH_SEED").digest()
+    return int.from_bytes(h_seed, byteorder="big")
 
 def execute_command(cmd_list):
     with subprocess.Popen(
