@@ -937,12 +937,12 @@ def _patch_scheduler() -> None:
                         )
 
                         # Get externally-cached tokens if using a KVConnector.
-                        if self.connector is not None:
-                            num_external_computed_tokens, load_kv_async = (
-                                self.connector.get_num_new_matched_tokens(
-                                    request, num_new_local_computed_tokens
-                                )
-                            )
+                        # if self.connector is not None:
+                        #     num_external_computed_tokens, load_kv_async = (
+                        #         self.connector.get_num_new_matched_tokens(
+                        #             request, num_new_local_computed_tokens
+                        #         )
+                        #     )
 
                         # Total computed tokens (local + external).
                         num_computed_tokens = (
@@ -1240,7 +1240,8 @@ def _patch_gpu_model_runner() -> None:
         from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
         from vllm.v1.worker.block_table import BlockTable
         from vllm.v1.worker.gpu_input_batch import CachedRequestState
-
+        from vllm.v1.spec_decode.eagle import EagleProposer
+        
         from ucm.sparse.base import INVALID_SLOT
         from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
@@ -2087,6 +2088,34 @@ def _patch_gpu_model_runner() -> None:
             )
 
         GPUModelRunner.execute_model = execute_model
+
+        from vllm.v1.kv_cache_interface import KVCacheConfig
+        def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+            """
+            Initialize KV cache based on `kv_cache_config`.
+            Args:
+                kv_cache_config: Configuration for the KV cache, including the KV
+                cache size of each layer
+            """
+            self.kv_cache_config = kv_cache_config
+            self.may_reinitialize_input_batch(kv_cache_config)
+            self.initialize_attn_backend(kv_cache_config)
+            kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+
+            if self.speculative_config and self.speculative_config.use_eagle():
+                assert isinstance(self.drafter, EagleProposer)
+                # validate all draft model layers belong to the same kv cache
+                # group
+                self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+            if has_kv_transfer_group():
+                get_kv_transfer_group().register_kv_caches(kv_caches)
+            
+            if has_ucm_sparse():
+                ucm_sparse = get_ucm_sparse()
+                ucm_sparse.init_host_slabs_from_kv(kv_cache_config)
+        
+        GPUModelRunner.initialize_kv_cache = initialize_kv_cache
 
     except ImportError:
         logger.warning("Could not patch prepare inputs - module not found")
