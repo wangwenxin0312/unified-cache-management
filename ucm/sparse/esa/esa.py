@@ -122,23 +122,6 @@ class ESASparseMetaData(UcmSparseMetadata):
         )
         self.requests.append(meta)
 
-
-@cache
-def get_offset(block_shape, rank, tp_size, precision, layer_id, is_v, is_mla) -> int:
-    block_size, num_key_heads_per_tp, head_size = block_shape
-    k_min_data_block_size = block_size * num_key_heads_per_tp * head_size * precision
-    v_min_data_block_size = k_min_data_block_size if not is_mla else 0
-    layer_size = (k_min_data_block_size + v_min_data_block_size) * (
-        tp_size if not is_mla else 1
-    )
-    if is_mla:
-        k_offset = layer_size * layer_id
-    else:
-        k_offset = layer_size * layer_id + layer_size // tp_size * rank
-    v_offset = k_offset + k_min_data_block_size
-    return v_offset if is_v else k_offset
-
-
 @cache
 def get_sparse_range(init_window_sz, local_window_sz, prompt_len, block_size):
     num_blocks_upper_bound = math.ceil(prompt_len / block_size)
@@ -153,27 +136,6 @@ def compute_parent_block_hash(model_name, world_size, dtype, seed_rank=0) -> int
     h_seed = hashlib.md5(meta_bytes + b"UCM_HASH_SEED").digest()
     return int.from_bytes(h_seed, byteorder="big")
 
-
-@cache
-def compute_layer_offset(
-    block_data_size: int,
-    layer_id: int,
-    is_v: bool,
-    is_mla: bool,
-) -> int:
-    layer_data_size = block_data_size if is_mla else block_data_size * 2
-
-    k_offset = layer_data_size * layer_id
-
-    if is_mla:
-        return k_offset
-
-    v_offset = k_offset + block_data_size
-    return v_offset if is_v else k_offset
-
-
-def task_hash_func(block_ids, store_type, tensor_type):
-    return hash((tuple(block_ids), store_type, tensor_type))
 
 
 def diff_two_map(map1: dict, map2: dict):
@@ -201,7 +163,6 @@ class ReqStatePerLayer:
         layer_name: str,
         rank: int,
         tp_size: int,
-        store_instance: UcmKVStoreBase,
         vllm_config: VllmConfig,
         retrieval_worker: Optional[RetrievalWorker] = None,
         repre_pool: Optional[ReprePool] = None,
@@ -218,7 +179,6 @@ class ReqStatePerLayer:
         self.slots = []
         self.slots_to_relative_indexes = {}
         self.repre_pool: ReprePool | None = repre_pool
-        self.store_instance = store_instance
         self.retrieval_worker: Optional[RetrievalWorker] = retrieval_worker
         self.retrieval_task = None
         self.req_meta = None
@@ -526,7 +486,6 @@ class ESA(UcmSparseBase):
         self.rank = vllm_config.parallel_config.rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         if role == UcmSparseRole.WORKER:
-            self.connector = get_kv_transfer_group().connector.store
             self.device = torch.device(f"cuda:{self.rank}")
             self.ucm_store_stream = torch.cuda.Stream(device=self.device)
             self.ucm_store_backend = ucm_sm_copy.TransBackend(
@@ -537,8 +496,6 @@ class ESA(UcmSparseBase):
             self.ucm_load_backend = ucm_sm_copy.TransBackend(
                 int(self.ucm_load_stream.cuda_stream)
             )
-        else:
-            self.connector = None
         self.esa_cfg = (
             Config(vllm_config.kv_transfer_config)
             .get_config()
@@ -623,7 +580,6 @@ class ESA(UcmSparseBase):
                 layer_name,
                 self.rank,
                 self.tp_size,
-                self.connector,
                 self._vllm_config,
                 self.retrieval_workers[layer_id],
                 self.layer_pools[layer_id],
