@@ -471,7 +471,7 @@ class ESA(UcmSparseBase):
         self._sparse_metadata: ESASparseMetaData = ESASparseMetaData()
         self.request_hasher = RequestHasher(vllm_config, 0)
         self.block_size = vllm_config.cache_config.block_size
-        self.block_hashes: dict[int, dict[int, list[str]]] = {}
+        self.block_hashes: dict[str, dict[str, list[str]]] = {}
         global data
 
         if data is None:
@@ -699,7 +699,7 @@ class ESA(UcmSparseBase):
             req = requests[req_id]
             if not self.is_sparsed_request(req):
                 continue
-            self.set_block_hashes(int(req_id), req.prompt_token_ids)
+            self.set_block_hashes(req_id, req.prompt_token_ids)
             if isinstance(attn_metadata, dict):
                 attn_metadata = next(iter(attn_metadata.values()))
 
@@ -714,7 +714,7 @@ class ESA(UcmSparseBase):
                     req.prompt_token_ids,
                     req.output_token_ids,
                     req_id in preempt_reqs,
-                    self.block_hashes[int(req_id)][self.rank],
+                    self.block_hashes[req_id][self.rank],
                 )
 
             else:
@@ -735,7 +735,7 @@ class ESA(UcmSparseBase):
                             req.prompt_token_ids,
                             req.output_token_ids,
                             req_id in preempt_reqs,
-                            self.block_hashes[int(req_id)][self.rank],
+                            self.block_hashes[req_id][self.rank],
                         )
 
                 else:
@@ -752,7 +752,7 @@ class ESA(UcmSparseBase):
                         req.prompt_token_ids,
                         req.output_token_ids,
                         req_id in preempt_reqs,
-                        self.block_hashes[int(req_id)][self.rank],
+                        self.block_hashes[req_id][self.rank],
                     )
 
             # self._sparse_metadata = sparse_meta
