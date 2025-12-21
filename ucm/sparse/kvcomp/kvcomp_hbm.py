@@ -18,22 +18,43 @@ from ucm.sparse.base import (
 from ucm.sparse.kvcomp.hash_code import triton_hash_code
 from ucm.sparse.kvcomp.hamming_topk import cuda_hamming_topk, fake_hamming_topk
 from vllm.v1.request import Request, RequestStatus
+from vllm.attention.ops.flashmla import get_mla_metadata
 
 logger = init_logger(__name__)
 
 ReqType = Union[str, int]
-class KvComp_NonOffload(UcmSparseBase):
+class KvCompOnDevice(UcmSparseBase):
     # handle batch
     def __init__(self, vllm_config: VllmConfig, role: UcmSparseRole):
         super().__init__(vllm_config, role)
-        # self.rank = vllm_config.parallel_config.rank
         
+        self.rank = vllm_config.parallel_config.rank
+
         self.om_hash_nope = None  # [512, 512]
         self.om_hash_rope = None  # [64, 64]
         self.pack_weight = None
-        self.kv_lora_rank = 512
-        self.qk_rope_head_dim = 64
+        self.kv_lora_rank = getattr(vllm_config.model_config.hf_text_config, "kv_lora_rank", None)
+        self.qk_rope_head_dim = getattr(vllm_config.model_config.hf_text_config, "qk_rope_head_dim", None)
         self.origin_attn_metadata = None
+        self.mla_block_size = vllm_config.cache_config.block_size
+        self.num_q_heads = vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config)
+        
+        if role == UcmSparseRole.WORKER:
+            self.device = torch.device(f"cuda:{self.rank}")
+            device_properties = torch.cuda.get_device_properties(self.device)
+            num_sms = device_properties.multi_processor_count
+        
+            if not vllm_config.model_config.enforce_eager:
+                self.cg_buf_topk_tile_scheduler_metadata = torch.zeros(
+                    (num_sms, 8),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                self.cg_buf_topk_num_splits = torch.empty(
+                    (vllm_config.scheduler_config.max_num_seqs + 1),
+                    device=self.device,
+                    dtype=torch.int32
+                )
 
         if self.om_hash_nope is None:
             def gen_matrix(dim):
@@ -73,7 +94,8 @@ class KvComp_NonOffload(UcmSparseBase):
         decode_ql_nope: Optional[torch.Tensor] = None,
         decode_q_pe: Optional[torch.Tensor] = None,
     ):
-        attn_metadata = forward_context.attn_metadata # todo:dict
+        # print("===[kvcomp begin]")
+        attn_metadata = forward_context.attn_metadata
         if isinstance(attn_metadata, dict):
             attn_metadata = attn_metadata[layer_name]
 
@@ -172,3 +194,38 @@ class KvComp_NonOffload(UcmSparseBase):
                                             dtype=dtype,
                                             device=device)
                 kv_caches[layer_name] = (kv_cache, khash_cache)
+
+    def build_decode_hash(self, seq_lens):
+        if envs.VLLM_HASH_ATTENTION:
+            from ucm.sparse.kvcomp.hamming_topk import update_seq_lens
+            topk_seq_lens = update_seq_lens(
+                seq_lens,
+                topk_token=envs.VLLM_HASH_ATTENTION_TOPK,
+                block_size=self.mla_block_size,
+            )
+            topk_tile_scheduler_metadata, topk_num_splits = \
+                get_mla_metadata(
+                topk_seq_lens,
+                self.num_q_heads,
+                1,
+            )
+        else:
+            topk_seq_lens = None
+            topk_tile_scheduler_metadata = None 
+            topk_num_splits = None
+        return topk_seq_lens, topk_tile_scheduler_metadata, topk_num_splits
+    
+    def maybe_init_cudagraph_buffers_for_topk(self, n, tile_scheduler_metadata):
+        sm_parts = tile_scheduler_metadata.size(0)
+        if envs.VLLM_HASH_ATTENTION:
+            topk_tile_scheduler_metadata_view = \
+                self.cg_buf_topk_tile_scheduler_metadata[:sm_parts]
+            topk_tile_scheduler_metadata_view.copy_(topk_tile_scheduler_metadata)
+            topk_tile_scheduler_metadata = topk_tile_scheduler_metadata_view
+
+            topk_num_splits_view = self.cg_buf_topk_num_splits[:n]
+            topk_num_splits_view.copy_(topk_num_splits)
+            self.cg_buf_topk_num_splits[n:].fill_(topk_num_splits[-1])
+            topk_num_splits = topk_num_splits_view
+        return topk_tile_scheduler_metadata, topk_num_splits
+    

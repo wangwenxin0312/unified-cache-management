@@ -25,6 +25,7 @@ def setup_environment_variables():
     os.environ["VLLM_USE_V1"] = "1"
     os.environ["PYTHONHASHSEED"] = "123456"
     os.environ["ENABLE_SPARSE"] = "true"
+    os.environ["VLLM_HASH_ATTENTION"] = "1"
 
     global model, path_to_dataset, data_dir, tokenizer
     model = os.getenv("MODEL_PATH", "/home/models/Qwen2.5-14B-Instruct")
@@ -77,7 +78,7 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
                 }
             ],
             "ucm_sparse_config": {
-                "KvComp_NonOffload": {
+                "KvCompOnDevice": {
                 }
             },
         },
@@ -90,9 +91,9 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=30000,
         block_size=128,
-        enforce_eager=True,
+        # enforce_eager=True,
         distributed_executor_backend="mp",
-        tensor_parallel_size=1,
+        tensor_parallel_size=2,
         trust_remote_code=True,
     )
 
