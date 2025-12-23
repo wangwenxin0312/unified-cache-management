@@ -24,7 +24,7 @@ def cuda_hamming_topk(
     q_hash = q_hash.view(torch.int32)
     k_hash = k_hash.view(torch.int32)
     assert k_hash.shape[1] == 1
-    assert k_hash.shape[-1] == 18 and q_hash.shape[-1] == 18
+    # assert k_hash.shape[-1] == 18 and q_hash.shape[-1] == 18
     block_size = k_hash.shape[2]
     assert topk_token % block_size == 0
     assert recent_token > 0 and topk_token > (sink_token + recent_token)

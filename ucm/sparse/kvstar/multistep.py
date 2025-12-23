@@ -734,7 +734,6 @@ class KVStarMultiStep(UcmSparseBase):
         output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
         k_hash: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
         decode_ql_nope: Optional[torch.Tensor] = None,
         decode_q_pe: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

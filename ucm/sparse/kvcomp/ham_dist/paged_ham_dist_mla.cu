@@ -71,6 +71,21 @@
       {                                        \
         __VA_ARGS__                            \
       }                                        \
+    } else if ((val) == 16) {                   \
+      constexpr int NumChunk = 16;              \
+      {                                        \
+        __VA_ARGS__                            \
+      }                                        \
+    } else if ((val) == 8) {                   \
+      constexpr int NumChunk = 8;              \
+      {                                        \
+        __VA_ARGS__                            \
+      }                                        \
+    } else if ((val) == 4) {                     \
+      constexpr int NumChunk = 4;              \
+      {                                        \
+        __VA_ARGS__                            \
+      }                                        \
     } else {                                   \
       LOG(FATAL) << "NumChunk is not support"; \
     }                                          \
@@ -356,7 +371,7 @@ torch::Tensor HammingScoreContiCUDA(torch::Tensor& key_codes,
   HEAD_SWITCH(num_head, NumHead, {
     KVHEAD_SWITCH(num_kv_head, NumKVHead, {
       NUMCHUNK_SWITCH(num_chunk, NumChunk, {
-        constexpr int32_t NumThreads = 576;
+        constexpr int32_t NumThreads = 512;
         size_t shm_size = 0;
         shm_size += NumThreads * sizeof(int32_t); // for popc results
         shm_size += NumHead * NumChunk * sizeof(int32_t); 
