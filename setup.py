@@ -26,6 +26,7 @@ import atexit
 import os
 import subprocess
 import sys
+import sysconfig
 
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
@@ -69,6 +70,101 @@ if not PLATFORM:
 def enable_sparse() -> bool:
     return ENABLE_SPARSE is not None and ENABLE_SPARSE.lower() == "true"
 
+def build_shared(
+    src_files,
+    target,
+    mode: str = "release",
+    module_name: str = "hamming",
+    out_dir_rel: str = "ucm/sparse/kvcomp/ham_dist",  # 期望输出目录（相对 ROOT_DIR）
+):
+    import torch
+    from torch.utils.cpp_extension import include_paths, library_paths
+
+    # ---- CUDA paths ----
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
+    cuda_inc = os.path.join(cuda_home, "include")
+    cuda_lib = os.path.join(cuda_home, "lib64")
+    if not (os.path.isdir(cuda_inc) and os.path.isdir(cuda_lib)):
+        raise SystemExit(f"CUDA not found. Set CUDA_HOME or install to {cuda_home}")
+
+    # ---- Python include ----
+    py_inc = sysconfig.get_paths()["include"]
+
+    # ---- Torch include/library paths ----
+    t_inc = include_paths()
+    t_lib = library_paths()
+
+    # ---- ABI flag must match PyTorch ----
+    cxx11_abi = getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", 1)
+    abi_macro = f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx11_abi)}"
+
+    # ---- module_name must be a valid C identifier ----
+    if not module_name.replace("_", "").isalnum() or module_name[0].isdigit():
+        raise ValueError(f"module_name '{module_name}' is not a valid C identifier")
+
+    # ---- Project include dir (for operator.h) ----
+    project_inc = os.path.join(ROOT_DIR, "ucm", "sparse", "kvcomp", "ham_dist")
+
+    # ---- Normalize src files to absolute paths ----
+    if not isinstance(src_files, (list, tuple)):
+        raise TypeError("src_files must be a list/tuple of source file paths")
+
+    src_files_abs = []
+    for p in src_files:
+        p_abs = p if os.path.isabs(p) else os.path.join(ROOT_DIR, p)
+        src_files_abs.append(p_abs)
+
+    # ---- Force output directory to ham_dist ----
+    out_dir_abs = os.path.join(ROOT_DIR, out_dir_rel)
+    os.makedirs(out_dir_abs, exist_ok=True)
+
+    target_basename = os.path.basename(target)  # 保留 EXT_SUFFIX
+    target_abs = os.path.join(out_dir_abs, target_basename)
+
+    print("module_name:", module_name)
+    print("output_so :", target_abs)
+
+    # ---- nvcc command ----
+    cmd = [
+        "nvcc",
+        "-std=c++17",
+        "-Xcompiler", "-fPIC",
+        "-shared",
+        "-I" + py_inc,
+        "-I" + cuda_inc,
+        "-I" + project_inc,
+        *[f"-I{p}" for p in t_inc],
+        abi_macro,
+        f"-DTORCH_EXTENSION_NAME={module_name}",
+        "-L" + cuda_lib,
+        *[f"-L{p}" for p in t_lib],
+        "-Xlinker", "-rpath", "-Xlinker", cuda_lib,
+        *[arg for p in t_lib for arg in ("-Xlinker", "-rpath", "-Xlinker", p)],
+        "-lc10",
+        "-lc10_cuda",
+        "-ltorch_cpu",
+        "-ltorch_cuda",
+        "-ltorch",
+        "-ltorch_python",
+        "-lcudart",
+    ]
+
+    if mode == "release":
+        cmd.append("-O3")
+    else:
+        cmd.extend(["-g", "-G", "-lineinfo", "-DTORCH_USE_CUDA_DSA"])
+
+    cmd.extend(src_files_abs)
+    cmd.extend(["-o", target_abs])
+
+    print("Building so with:", " ".join(cmd))
+
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(p.stdout)
+    p.check_returncode()
+
+    return target_abs
+
 
 def is_editable_mode() -> bool:
     commands = [arg.lower() for arg in sys.argv]
@@ -93,6 +189,21 @@ class CMakeBuild(build_ext):
 
         for ext in self.extensions:
             self.build_cmake(ext)
+        
+        install_dir = os.path.abspath(self.build_lib)
+        if is_editable_mode():
+            install_dir = self.extensions[0].cmake_file_path  # repo root (or choose a pkg dir)
+
+        ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+        out_so = os.path.join(install_dir, f"hamming{ext_suffix}")
+
+        build_shared(
+            [
+                "ucm/sparse/kvcomp/ham_dist/cpy/hamming.cpp",
+                "ucm/sparse/kvcomp/ham_dist/paged_ham_dist_mla.cu",
+            ],
+            out_so,
+        )
 
     def build_cmake(self, ext: CMakeExtension):
         build_dir = os.path.abspath(self.build_temp)
@@ -135,7 +246,6 @@ class CMakeBuild(build_ext):
             ["cmake", "--install", ".", "--config", "Release", "--component", "ucm"],
             cwd=build_dir,
         )
-
 
 setup(
     name="uc-manager",
