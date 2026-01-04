@@ -55,7 +55,11 @@ class ESA(UcmSparseBase):
         max_block_per_seq = math.ceil(model_config.max_model_len / vllm_config.cache_config.block_size)
         max_num_blocks =  max_block_per_seq * max_num_seqs
         shape = (1000, self.block_size, model_config.get_num_kv_heads(parallel_config), model_config.get_head_size()) # TODO:从config里拿到实际的blocks数量*3
-        self.host_kv_cache = [
+        self.host_k_cache = [
+            torch.zeros(shape, dtype=self.dtype, device="cpu", pin_memory=True)
+            for _ in range(self.total_num_hidden_layers)
+        ]
+        self.host_v_cache = [
             torch.zeros(shape, dtype=self.dtype, device="cpu", pin_memory=True)
             for _ in range(self.total_num_hidden_layers)
         ]
@@ -111,10 +115,14 @@ class ESA(UcmSparseBase):
         self.decode_q_index = torch.zeros(max_num_blocks, dtype=torch.int32, device=self.device)
         self.decode_repre_index_cpu = torch.zeros(max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=True)
         self.decode_repre_index = torch.zeros(max_num_blocks, dtype=torch.int32, device=self.device)
+        self.decode_block_tables_cpu = torch.zeros(max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=True)
+        self.decode_block_tables = torch.zeros(max_num_blocks, dtype=torch.int32, device=self.device)
+        
         self.decode_batch_offset_cpu = torch.zeros(max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
         self.decode_batch_offset = torch.zeros(max_num_seqs, dtype=torch.int32, device=self.device)
         self.decode_retrieval_batch = 0
         self.decode_retrieval_s_len = 0
+        self.decode_num_blocks = 0     
         self.has_decode = False        
         ########################
 
@@ -198,15 +206,17 @@ class ESA(UcmSparseBase):
                     for i, b in enumerate(repre_blocks):
                         self.decode_repre_index_cpu[decode_repre_index_offset + i] = b
                         self.decode_q_index_cpu[decode_repre_index_offset + i] = req_index
+                    # block_id decode
+                    for i, b in enumerate(req.block_ids[0]):
+                        self.decode_block_tables_cpu[decode_repre_index_offset + i] = b
                     self.decode_batch_offset_cpu[decode_batch_offset_index:decode_batch_offset_index+1] = decode_repre_index_offset
                     decode_batch_offset_index += 1
                     self.decode_retrieval_batch += 1
                     decode_repre_index_offset += len(repre_blocks)
 
 
-                        
-
             self.prefill_num_blocks = prefill_repre_index_offset
+            self.decode_num_blocks = decode_repre_index_offset
             if self.has_prefill:
                 self.prefill_repre_index[:prefill_repre_index_offset].copy_(self.prefill_repre_index_cpu[:prefill_repre_index_offset], True)
                 self.prefill_block_tables[:prefill_repre_index_offset].copy_(self.prefill_block_tables_cpu[:prefill_repre_index_offset], True)
@@ -219,16 +229,73 @@ class ESA(UcmSparseBase):
                 self.decode_retrieval_s_len = decode_repre_index_offset
                 self.decode_repre_index[:decode_repre_index_offset].copy_(self.decode_repre_index_cpu[:decode_repre_index_offset], True)
                 self.decode_q_index[:decode_repre_index_offset].copy_(self.decode_q_index_cpu[:decode_repre_index_offset], True)
+                self.decode_block_tables[:decode_repre_index_offset].copy_(self.decode_block_tables_cpu[:decode_repre_index_offset], True)
+
                 self.decode_batch_offset_cpu[decode_batch_offset_index:decode_batch_offset_index+1] = decode_repre_index_offset
                 decode_batch_offset_index += 1
                 self.decode_batch_offset[:decode_batch_offset_index].copy_(self.decode_batch_offset_cpu[:decode_batch_offset_index], True)
-
                 # bytes = math.ceil(repre_index_offset / 8) * 8 * self.size_of_int32
                 # esa_copy(self.repre_index_cpu, self.repre_index, bytes)
                 # esa_copy(self.q_index_cpu, self.q_index, bytes)
                 # bytes = math.ceil(batch_offset_index / 8) * 8 * self.size_of_int32
                 # esa_copy(self.batch_offset_cpu, self.batch_offset, bytes)
+    def verify_esa_scatter_copy(
+        self,
+        device_cache: torch.Tensor,
+        host_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        repre_index: torch.Tensor,
+        *,
+        atol: float = 0.0,
+        rtol: float = 0.0,
+        verbose: bool = True,
+    ):
+        assert block_tables.ndim == 1
+        assert repre_index.ndim == 1
+        assert block_tables.numel() == repre_index.numel()
 
+        N = block_tables.numel()
+
+        # Gather blocks
+        dev_sel = device_cache[block_tables]
+        host_sel = host_cache[repre_index]
+
+        # Move to same device & dtype for comparison
+        host_sel = host_sel.to(dev_sel.device).to(dev_sel.dtype)
+
+        if atol == 0.0 and rtol == 0.0:
+            equal = torch.equal(dev_sel, host_sel)
+        else:
+            equal = torch.allclose(dev_sel, host_sel, atol=atol, rtol=rtol)
+
+        if equal:
+            if verbose:
+                print(f"[ESA VERIFY] OK: {N} blocks matched")
+            return
+
+        # ---- Detailed debug path ----
+        diff = dev_sel != host_sel
+        first_mismatch = diff.view(-1).nonzero(as_tuple=False)[0].item()
+
+        flat_dev = dev_sel.view(-1)
+        flat_host = host_sel.view(-1)
+
+        blk_size = dev_sel[0].numel()
+        blk_id = first_mismatch // blk_size
+        elem_id = first_mismatch % blk_size
+
+        msg = (
+            "[ESA VERIFY] MISMATCH detected\n"
+            f"  block idx        : {blk_id}\n"
+            f"  device block id  : {int(block_tables[blk_id])}\n"
+            f"  host repre id    : {int(repre_index[blk_id])}\n"
+            f"  element offset   : {elem_id}\n"
+            f"  device value     : {flat_dev[first_mismatch].item()}\n"
+            f"  host value       : {flat_host[first_mismatch].item()}\n"
+        )
+
+        raise AssertionError(msg)
+    
     def attention_begin(
         self,
         query,
@@ -238,7 +305,6 @@ class ESA(UcmSparseBase):
         forward_context,
         phase = None,
     ) -> None:
-        return
         if not self.has_decode:
             return
         with nvtx.range(f"retrieval"):
@@ -251,8 +317,25 @@ class ESA(UcmSparseBase):
             self.retrieval_input.batch_offset = self.decode_batch_offset_cpu
             self.retrieval_input.batch = self.decode_retrieval_batch
             self.retrieval_input.s = self.decode_retrieval_s_len
+
+            # self.retrieval_input.decode_block_table = self.decode_block_tables
             h = esa_retrieval(self.retrieval_input, self.retrieval_output)
             self.handles.append(h)
+
+            # load
+            k_cache, v_cache = self.get_kv_cache(forward_context, layer_name)
+            k_cache.zero_()
+            v_cache.zero_()
+            ready = esa_lib.esa_retrieval_poll(h)
+            # if ready == 1:
+            
+            esa_scatter_copy(self.host_k_cache[layer_id].flatten(-3), k_cache.flatten(-3),
+                                self.decode_repre_index[:self.decode_num_blocks], self.decode_block_tables[:self.decode_num_blocks])
+            
+            esa_scatter_copy(self.host_v_cache[layer_id].flatten(-3), v_cache.flatten(-3),
+                                self.decode_repre_index[:self.decode_num_blocks], self.decode_block_tables[:self.decode_num_blocks])
+            # torch.cuda.synchronize()
+            
 
     def attention_finished(
         self,
@@ -267,26 +350,33 @@ class ESA(UcmSparseBase):
         if self.has_prefill:
             with nvtx.range(f"dump_kv_and_compute_repre"):
                 layer_id = self.get_layer_id(layer_name)
-                k_cache, _ = self.get_kv_cache(forward_context, layer_name)
+                k_cache, v_cache = self.get_kv_cache(forward_context, layer_name)
                 esa_repre(k_cache.flatten(-2, -1), self.repre_cache[layer_id].flatten(-2, -1),
                           self.prefill_block_tables[:self.prefill_num_blocks], self.prefill_repre_index[:self.prefill_num_blocks])
-                esa_scatter_copy(k_cache.flatten(-3), self.host_kv_cache[layer_id].flatten(-3),
+                esa_scatter_copy(k_cache.flatten(-3), self.host_k_cache[layer_id].flatten(-3),
                                  self.prefill_block_tables[:self.prefill_num_blocks], self.prefill_repre_index[:self.prefill_num_blocks])
 
+                esa_scatter_copy(v_cache.flatten(-3), self.host_v_cache[layer_id].flatten(-3),
+                                                self.prefill_block_tables[:self.prefill_num_blocks], self.prefill_repre_index[:self.prefill_num_blocks])
+                
+                # torch.cuda.synchronize()
+                # self.verify_esa_scatter_copy(
+                #     device_cache=k_cache,
+                #     host_cache=self.host_k_cache[layer_id],
+                #     block_tables=self.prefill_block_tables[:self.prefill_num_blocks],
+                #     repre_index=self.prefill_repre_index_cpu[:self.prefill_num_blocks],
+                #     atol=0.0,   # bf16 建议设 1e-3
+                #     rtol=0.0,
+                # )
+                # self.verify_esa_scatter_copy(
+                #     device_cache=v_cache,
+                #     host_cache=self.host_v_cache[layer_id],
+                #     block_tables=self.prefill_block_tables[:self.prefill_num_blocks],
+                #     repre_index=self.prefill_repre_index_cpu[:self.prefill_num_blocks],
+                #     atol=0.0,   # bf16 建议设 1e-3
+                #     rtol=0.0,
+                # )
 
-        if self.has_decode:
-            with nvtx.range(f"retrieval"):
-                layer_id = self.get_layer_id(layer_name)
-                self.retrieval_input.query = query
-                self.retrieval_input.repre_cache = self.repre_cache[layer_id]
-                self.retrieval_input.q_index = self.decode_q_index
-                self.retrieval_input.repre_index = self.decode_repre_index
-                self.retrieval_input.repre_index_cpu = self.decode_repre_index_cpu
-                self.retrieval_input.batch_offset = self.decode_batch_offset_cpu
-                self.retrieval_input.batch = self.decode_retrieval_batch
-                self.retrieval_input.s = self.decode_retrieval_s_len
-                h = esa_retrieval(self.retrieval_input, self.retrieval_output)
-                self.handles.append(h)
 
     def _wait(self, h, timeout_in_seconds):
         deadline = time.time() + timeout_in_seconds

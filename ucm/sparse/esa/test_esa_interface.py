@@ -304,5 +304,5 @@ def test_topk():
     print('np_times:', sum(times)/len(times)/1e6)
 
 if __name__ == "__main__":
-    # test_esa_retrieval(2, 50, 40)
+    test_esa_retrieval(2, 50, 40)
     test_topk()

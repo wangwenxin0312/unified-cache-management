@@ -34,6 +34,7 @@ struct RetrievalInputTensor{
     torch::Tensor repre_index;
     torch::Tensor repre_index_cpu;
     torch::Tensor batch_offset;
+    torch::Tensor decode_block_table;
     int batch;
     int s;
 };

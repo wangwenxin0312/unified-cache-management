@@ -40,27 +40,6 @@ int ceildiv(int a, int b) {
  * @param key_repre_index: [S]
  * @param repre_repre_index: [S]
  */
-__global__ void extract_repre_fp32(const float *key_cache, float *repre_cache, const int *block_table, const int *repre_index, int block_size, int dim, int num_blocks, int key_rows, int repre_rows) {
-    int idx = blockIdx.x;
-    if (idx >= num_blocks){
-        return;
-    }
-    int index1 = block_table[idx];
-    int index2 = repre_index[idx];
-    if (index1 < 0 || index1 >= key_rows || index2 < 0 || index2 >= repre_rows) {
-        return;
-    }
-    const float* key_ptr = key_cache + index1 * block_size * dim;
-    float* repre_ptr = repre_cache + index2 * dim;
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float sum = 0.0f;
-        for (int j = 0; j < block_size; ++j) {
-            sum += key_ptr[j * dim + d];
-        }
-        repre_ptr[d] = sum / block_size;
-    }
-}
-
 __global__ void extract_repre_bf16(const __nv_bfloat16 *key_cache, __nv_bfloat16 *repre_cache, const int *block_table, const int *repre_index, int block_size, int dim, int num_blocks, int key_rows, int repre_rows) {
     int idx = blockIdx.x;
     if (idx >= num_blocks){
@@ -82,26 +61,6 @@ __global__ void extract_repre_bf16(const __nv_bfloat16 *key_cache, __nv_bfloat16
     }
 }
 
-__global__ void extract_repre_fp16(const __half *key_cache, __half *repre_cache, const int *block_table, const int *repre_index, int block_size, int dim, int num_blocks, int key_rows, int repre_rows) {
-    int idx = blockIdx.x;
-    if (idx >= num_blocks){
-        return;
-    }
-    int index1 = block_table[idx];
-    int index2 = repre_index[idx];
-    if (index1 < 0 || index1 >= key_rows || index2 < 0 || index2 >= repre_rows) {
-        return;
-    }
-    const __half* key_ptr = key_cache + index1 * block_size * dim;
-    __half* repre_ptr = repre_cache + index2 * dim;
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float sum = 0.0f;
-        for (int j = 0; j < block_size; ++j) {
-            sum += __half2float(key_ptr[j * dim + d]);
-        }
-        repre_ptr[d] = __float2half(sum / block_size);
-    }
-}
 
 /**
  * This kernel performs: score[i] = queries[query_index[i]] * repre_cache[repre_index[i]]
@@ -112,98 +71,6 @@ __global__ void extract_repre_fp16(const __half *key_cache, __half *repre_cache,
  * @param repre_index: [S]
  * @param query_index: [S]
  */
-
-__global__ void retrieval_kernel_fp16(__half *__restrict__ queries, __half *__restrict__ repre_cache, __half *__restrict__ score, int *__restrict__ repre_index, int *__restrict__ query_index, int num_q_heads, int num_k_heads, int dim, int S){
-    if (blockIdx.x >= S){
-        return;
-    }
-    int warp_size = 32;
-    extern __shared__ float local_score[];
-    auto *q_offset = queries + query_index[blockIdx.x] * num_q_heads * dim;
-    auto *k_offset = repre_cache + repre_index[blockIdx.x] * num_k_heads * dim;
-    int num_tiles_y = ceildiv(num_q_heads, blockDim.y);
-    int num_tiles_x = ceildiv(dim, blockDim.x);
-    int gqa_size = num_q_heads / num_k_heads;
-
-    float sum = 0.0f;
-    for (int y = 0; y < num_tiles_y; ++y){
-        int q_head = y * blockDim.y + threadIdx.y;
-        int k_head = q_head / gqa_size;
-        for(int x = 0; x < num_tiles_x; ++x){
-            int d = x * blockDim.x + threadIdx.x;
-            if (q_head < num_q_heads && k_head < num_k_heads && d < dim){
-                auto q_val = *(q_offset + q_head * dim + d);
-                auto k_val = *(k_offset + k_head * dim + d);
-                sum += __half2float(q_val) * __half2float(k_val);
-            }
-        }
-    }
-
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
-    int warp_id = tid / numWarps;
-    int lane_id = tid & (warp_size - 1);
-
-    auto warp_sum = warpReduceSum(sum);
-    if(lane_id == 0){
-        local_score[warp_id] = warp_sum;
-    }
-    __syncthreads();
-    if(warp_id == 0){
-        sum = lane_id < numWarps ? local_score[lane_id] : 0.0f;
-        sum = warpReduceSum(sum);
-        if(lane_id == 0){
-            score[blockIdx.x] = __float2half(sum);
-        }
-    }
-}
-
-
-__global__ void retrieval_kernel_fp32(float *__restrict__ queries, float *__restrict__ repre_cache, float *__restrict__ score, int *__restrict__ repre_index, int *__restrict__ query_index, int num_q_heads, int num_k_heads, int dim, int S){
-    if (blockIdx.x >= S){
-        return;
-    }
-    int warp_size = 32;
-    extern __shared__ float local_score[];
-    auto *q_offset = queries + query_index[blockIdx.x] * num_q_heads * dim;
-    auto *k_offset = repre_cache + repre_index[blockIdx.x] * num_k_heads * dim;
-    int num_tiles_y = ceildiv(num_q_heads, blockDim.y);
-    int num_tiles_x = ceildiv(dim, blockDim.x);
-    int gqa_size = num_q_heads / num_k_heads;
-
-    float sum = 0.0f;
-    for (int y = 0; y < num_tiles_y; ++y){
-        int q_head = y * blockDim.y + threadIdx.y;
-        int k_head = q_head / gqa_size;
-        for(int x = 0; x < num_tiles_x; ++x){
-            int d = x * blockDim.x + threadIdx.x;
-            if (q_head < num_q_heads && k_head < num_k_heads && d < dim){
-                auto q_val = *(q_offset + q_head * dim + d);
-                auto k_val = *(k_offset + k_head * dim + d);
-                sum += q_val * k_val;
-            }
-        }
-    }
-
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
-    int warp_id = tid / numWarps;
-    int lane_id = tid & (warp_size - 1);
-
-    auto warp_sum = warpReduceSum(sum);
-    if(lane_id == 0){
-        local_score[warp_id] = warp_sum;
-    }
-    __syncthreads();
-    if(warp_id == 0){
-        sum = lane_id < numWarps ? local_score[lane_id] : 0.0f;
-        sum = warpReduceSum(sum);
-        if(lane_id == 0){
-            score[blockIdx.x] = sum;
-        }
-    }
-}
-
 __global__ void retrieval_kernel_bf16(__nv_bfloat16 *__restrict__ queries, __nv_bfloat16 *__restrict__ repre_cache, __nv_bfloat16 *__restrict__ score, int *__restrict__ repre_index, int *__restrict__ query_index, int num_q_heads, int num_k_heads, int dim, int S){
     if (blockIdx.x >= S){
         return;
@@ -283,28 +150,7 @@ extern "C" void esa_repre(torch::Tensor key_cache, torch::Tensor repre_cache, to
     int blocks = num_blocks;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, key_cache.scalar_type(), "esa_repre_cuda", ([&] {
-        if constexpr (std::is_same_v<scalar_t, float>) {
-            extract_repre_fp32<<<blocks, threads>>>(
-                key_cache.data_ptr<float>(),
-                repre_cache.data_ptr<float>(),
-                block_table.data_ptr<int>(),
-                repre_table.data_ptr<int>(),
-                block_size,
-                dim,
-                num_blocks,
-                key_rows,
-                repre_rows);
-        } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-            extract_repre_fp16<<<blocks, threads>>>(
-                reinterpret_cast<__half*>(key_cache.data_ptr()),
-                reinterpret_cast<__half*>(repre_cache.data_ptr()),
-                block_table.data_ptr<int>(),
-                repre_table.data_ptr<int>(),
-                block_size,
-                dim,
-                num_blocks,
-                key_rows,
-                repre_rows);
+        if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
         } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
             extract_repre_bf16<<<blocks, threads>>>(
                 reinterpret_cast<__nv_bfloat16*>(key_cache.data_ptr()),
@@ -320,38 +166,16 @@ extern "C" void esa_repre(torch::Tensor key_cache, torch::Tensor repre_cache, to
     }));
 }
 
-extern "C" void esa_topk(torch::Tensor score, torch::Tensor index, torch::Tensor offsets, torch::Tensor score_out, torch::Tensor index_out, torch::Tensor workspace){
-    void* temp_workspace = nullptr;
-    size_t temp_bytes = 0;
-    size_t B = offsets.size(0) - 1;
-    size_t total = score.size(0);
-    cub::DeviceSegmentedRadixSort::SortPairsDescending(
-            temp_workspace, temp_bytes,
-            score.data_ptr<float>(),  score_out.data_ptr<float>(),
-            index.data_ptr<int>(), index_out.data_ptr<int>(),
-            total, B, offsets.data_ptr<int>(), offsets.data_ptr<int>() + 1);
-    // NOTE: Don't use malloc, just reuse the workspace, but the first call of
-    // SortPairsDescending is necesssary to determine the workspace size.
-    // CUDA_CHECK(cudaMalloc(&temp_workspace, temp_bytes));
-    temp_workspace = workspace.data_ptr<int>();
-    cub::DeviceSegmentedRadixSort::SortPairsDescending(
-            temp_workspace, temp_bytes,
-            score.data_ptr<float>(),  score_out.data_ptr<float>(),
-            index.data_ptr<int>(), index_out.data_ptr<int>(),
-            total, B, offsets.data_ptr<int>(), offsets.data_ptr<int>() + 1);
-}
-
 
 namespace {
 
 // Forward declare SM copy kernel API implemented in esa_sm_copy.cu
 extern "C" void esa_copy(torch::Tensor src, torch::Tensor dst, size_t size);
 
-
 extern "C" void esa_scatter_copy(torch::Tensor src,
                                  torch::Tensor dst,
                                  torch::Tensor block_table_src,
-                                 torch::Tensor block_table_dst);
+                                 torch::Tensor block_table_dst)
 
 // Async context for CPU argsort per-batch
 struct RetrievalCtx {
@@ -548,23 +372,7 @@ extern "C" int esa_retrieval_launcher(torch::Tensor query, torch::Tensor repre_c
 
     NVTX_PUSH("esa_retrieval: kernel");
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, repre_cache.scalar_type(), "esa_retrieval_cuda", ([&] {
-        if constexpr (std::is_same_v<scalar_t, float>) {
-            retrieval_kernel_fp32<<<numBlocks, numThreads, bytes, stream>>>(
-                reinterpret_cast<float*>(query.data_ptr()),
-                reinterpret_cast<float*>(repre_cache.data_ptr()),
-                reinterpret_cast<float*>(score.data_ptr()),
-                repre_index.data_ptr<int>(),
-                q_index.data_ptr<int>(),
-                num_q_heads, num_k_heads, dim, s);
-        } else if constexpr (std::is_same_v<scalar_t, at::Half>) {
-            retrieval_kernel_fp16<<<numBlocks, numThreads, bytes, stream>>>(
-                reinterpret_cast<__half*>(query.data_ptr()),
-                reinterpret_cast<__half*>(repre_cache.data_ptr()),
-                reinterpret_cast<__half*>(score.data_ptr()),
-                repre_index.data_ptr<int>(),
-                q_index.data_ptr<int>(),
-                num_q_heads, num_k_heads, dim, s);
-        } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+        if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
             retrieval_kernel_bf16<<<numBlocks, numThreads, bytes, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(query.data_ptr()),
                 reinterpret_cast<__nv_bfloat16*>(repre_cache.data_ptr()),
@@ -581,14 +389,7 @@ extern "C" int esa_retrieval_launcher(torch::Tensor query, torch::Tensor repre_c
     size_t score_bytes = static_cast<size_t>(s) * static_cast<size_t>(score.element_size());
     NVTX_PUSH("esa_retrieval: D2H score->cpu (cudaMemcpyAsync)");
     esa_copy(score, score_cpu, score_bytes);
-    // cudaError_t memcpy_status = cudaMemcpyAsync(
-    //     score_cpu.data_ptr(),            // dst (pinned host)
-    //     score.data_ptr(),                // src (device)
-    //     score_bytes,
-    //     cudaMemcpyDeviceToHost,
-    //     stream
-    // );
-    // TORCH_CHECK(memcpy_status == cudaSuccess, "cudaMemcpyAsync score->cpu failed: ", cudaGetErrorString(memcpy_status));
+    
     NVTX_POP();
 
     // Prepare ctx and D2H copies of metadata needed by CPU worker
