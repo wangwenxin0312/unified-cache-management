@@ -149,16 +149,22 @@ def main():
 
     llm = build_llm_with_uc(module_path, name, model)
     prompts = []
-    batch_size = 1
+    batch_size = 5
     assert os.path.isfile(
         path_to_dataset
     ), f"Incorrect dataset path. Please specify the dataset path by `export DATASET_PATH=/path/to/longbench/multifieldqa_zh.jsonl`"
     with open(path_to_dataset, "r") as f:
         lines = f.readlines()
-    line = lines[10]
-    data = json.loads(line)
-    prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
-    prompts = [get_prompt(prompt)]
+    for i in range(batch_size):
+            line = lines[i]
+            data = json.loads(line)
+            prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
+            prompts.append(get_prompt(prompt))
+
+    # line = lines[10]
+    # data = json.loads(line)
+    # prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
+    # prompts = [get_prompt(prompt)]
     # og_prompt = get_prompt(prompt)
     # og_len = len(og_prompt)
     # prompts = [og_prompt[:og_len//3]]
@@ -166,15 +172,15 @@ def main():
     sampling_params = SamplingParams(
         temperature=0, top_p=0.95, max_tokens=256, ignore_eos=True
     )
-    for _ in range(1):
-        print_output(llm, prompts, sampling_params, "init")
-    llm.reset_prefix_cache()
+    # for _ in range(1):
+    #     print_output(llm, prompts, sampling_params, "init")
+    # llm.reset_prefix_cache()
 
-    print("========\n\n\n========")
-    line = lines[0]
-    data = json.loads(line)
-    prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
-    prompts = [get_prompt(prompt)]
+    # print("========\n\n\n========")
+    # line = lines[0]
+    # data = json.loads(line)
+    # prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
+    # prompts = [get_prompt(prompt)]
     # og_prompt = get_prompt(prompt)
     # og_len = len(og_prompt)
     # prompts = [og_prompt[:og_len//3]]
