@@ -325,9 +325,11 @@ class KvCompOnDevice(UcmSparseBase):
                 )
             else:  # GQA
                 if self.is_cuda:
+                    ## 重新捞取所有token的key
                     k_hash_compute = self.hash_encoder.compute_hash(key).view(
                         torch.bfloat16
                     )
+                    # print("[layer_name]", layer_name, "==[key]", key.shape, "[slot mapping]",attn_metadata.slot_mapping.flatten())
                     valid_k_hash_token = attn_metadata.slot_mapping.flatten().numel()
                     reshape_and_cache_khash_triton(
                         k_hash_compute[:valid_k_hash_token],
@@ -335,6 +337,25 @@ class KvCompOnDevice(UcmSparseBase):
                         k_hash,
                         block_size=self.block_size,
                     )
+                    if not self.is_tensor_computed:
+                            if self.decode_mask.any():
+                                q_start = attn_metadata.query_start_loc
+                                self.decode_req_ids = torch.nonzero(
+                                    self.decode_mask, as_tuple=False
+                                ).flatten()
+                                self.decode_token_idx = q_start[:-1].index_select(
+                                    0, self.decode_req_ids
+                                )
+                                
+                                self.block_table_decode = attn_metadata.block_table.index_select(
+                                    0, self.decode_req_ids
+                                )
+                                self.seq_len_decode = self.ori_seq_lens_decode.index_select(
+                                    0, self.decode_req_ids
+                                )
+                                self.new_block_table = attn_metadata.block_table
+                                self.new_seq_lens = attn_metadata.seq_lens
+                                self.is_tensor_computed = True
                 else:  # NPU
                     if not self.is_tensor_computed:
                         if self.decode_mask.any():  # with at least one decode request
@@ -431,50 +452,40 @@ class KvCompOnDevice(UcmSparseBase):
                 if not is_rollback_layer:
                     if is_skip_hash_layer:
                         # 跳层 使用上一个topk结果
-                        attn_metadata.block_tables = self.topk_block_table
+                        attn_metadata.block_table = self.topk_block_table
                         attn_metadata.seq_lens = self.topk_seq_lens
+                        # print(f"====[req decode] block_table{attn_metadata.block_table[0]} seq_len {attn_metadata.seq_lens[0]}")
                     else:
                         if self.is_cuda:
-
-                            decode_req_ids = torch.nonzero(
-                                self.decode_mask, as_tuple=False
-                            ).flatten()
-                            decode_token_idx = q_start[:-1].index_select(
-                                0, decode_req_ids
-                            )
-                            q_decode = query.index_select(0, decode_token_idx)
+                            q_decode = query.index_select(0, self.decode_token_idx)
                             q_hash = self.hash_code(query=q_decode)
-
-                            topk_token = self.hash_topk_tokens
-
-                            block_table_decode = attn_metadata.block_table.index_select(
-                                0, decode_req_ids
-                            )
-                            seq_len_decode = self.ori_seq_lens_decode.index_select(
-                                0, decode_req_ids
-                            )
+                            # print(f"====[topkbefore decode] block_table{self.block_table_decode} seq_len {self.seq_len_decode}")
+                            # print(f"===[ptr] ori{self.ori_seq_lens_decode.data_ptr()} attn_ptr {attn_metadata.seq_lens.data_ptr()} self.seq_len_decode {self.seq_len_decode}")
                             block_table_decode = cuda_hamming_topk(
                                 q_hash.unsqueeze(1),
                                 k_hash,
-                                block_table_decode,
-                                seq_len_decode,
-                                topk_token=topk_token,
+                                self.block_table_decode,
+                                self.seq_len_decode,
+                                topk_token=self.hash_topk_tokens,
                                 sink_token=64,
                                 recent_token=512,
                                 is_mla=self.is_mla,
                             )
                             # update topk_block_table
                             topk = block_table_decode.shape[1]
-                            attn_metadata.block_table[decode_req_ids, :topk] = (
-                                block_table_decode
-                            )
-                            attn_metadata.block_table[decode_req_ids, topk:] = 0
-
-                            attn_metadata.seq_lens[self.decode_mask] = (
-                                self.topk_seq_lens_qwen
-                            )
+                           
+                            self.new_block_table[self.decode_req_ids, :topk] = block_table_decode
+                            self.new_block_table[self.decode_req_ids, topk:] = 0
+                            attn_metadata.block_table = self.new_block_table
+                            
+                            self.new_seq_lens[self.decode_mask] = self.topk_seq_lens_qwen
+                            attn_metadata.seq_lens = self.new_seq_lens
+                            # print("===[after new_block_table]", block_table_decode)
+                            # print(f"===[after ptr] ori{self.ori_seq_lens_decode.data_ptr()} attn_ptr {attn_metadata.seq_lens.data_ptr()}")
+                            # attn_metadata.seq_lens[self.decode_mask] = (
+                            #     self.topk_seq_lens_qwen
+                            # )
                         else:  # NPU
-
                             decode_req_ids = torch.nonzero(
                                 self.decode_mask_npu, as_tuple=False
                             ).flatten()
@@ -520,6 +531,7 @@ class KvCompOnDevice(UcmSparseBase):
                         # topk for skip layer
                         self.topk_block_table = attn_metadata.block_table
                         self.topk_seq_lens = attn_metadata.seq_lens
+                        # print(f"====[topk decode] block_table{self.topk_block_table[0]} seq_len {self.topk_seq_lens[0]}")
 
         return query, key, value, output
 
@@ -549,6 +561,7 @@ class KvCompOnDevice(UcmSparseBase):
             if self.decode_mask.any():
                 attn_metadata.block_table = self.ori_block_table_decode
                 attn_metadata.seq_lens = self.ori_seq_lens_decode
+                # print(f"====[finish decode] block_table{attn_metadata.block_table [0]} seq_len {attn_metadata.seq_lens[0]}")
 
     def request_begin(self, request_id: ReqType, prompt_token_ids: List[int]):
         pass
@@ -627,6 +640,7 @@ class KvCompOnDevice(UcmSparseBase):
         self.decode_mask = q_lens == 1
 
         self.ori_seq_lens_decode = seq_lens.clone()
+        # print(f"===[build decode meta] {self.ori_seq_lens_decode.data_ptr()} seq_len_ptr:{seq_lens.data_ptr()}")
         self.ori_block_table_decode = block_table.clone()
         if self.decode_mask.any():
             decode_seq_lens = seq_lens[self.decode_mask]

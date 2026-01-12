@@ -317,6 +317,10 @@ class HashEncoder:
 
     def _init_hash_weights(self):
         # Step 1: 随机高斯矩阵
+        # torch.manual_seed(42)
+        # if self.device.type == "cuda":
+        #     torch.cuda.manual_seed(42)
+        #     torch.cuda.manual_seed_all(42)
         random_weights = torch.normal(
             mean=0,
             std=2,
