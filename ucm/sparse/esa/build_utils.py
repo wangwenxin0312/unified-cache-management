@@ -93,4 +93,4 @@ def build_shared(src_files, target, mode = "release"):
 
 
 if __name__ == "__main__":
-    build_shared(["./esa_interface.cc", "./esa_kernels.cu", "./esa_sm_copy.cu"],"esa_interface.so",mode=os.environ.get("BUILD_MODE", "debug"))
+    build_shared(["./esa_interface.cc", "./esa_kernels_simple.cu", "./esa_sm_copy.cu"],"esa_interface.so",mode=os.environ.get("BUILD_MODE", "debug"))

@@ -56,6 +56,24 @@ def load_module():
 
 esa = load_module()
 
+class style():
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    BLUE = '\033[94m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
+
+def print_red(msg):
+    print(style.RED + msg + style.RESET)
+
+def print_green(msg):
+    print(style.GREEN + msg + style.RESET)
+
+def print_blue(msg):
+    print(style.BLUE + msg + style.RESET)
+
+def print_yellow(msg):
+    print(style.YELLOW + msg + style.RESET)
 
 def _wait_ready(handle: int, timeout_s: float = 5.0) -> bool:
     t0 = time.time()
@@ -148,6 +166,193 @@ def test_esa_retrieval_debug(batch_size, num_repre_blocks, num_q_heads):
     print("score_cpu[0:4] =", sc[:4].tolist())
     print("index_sorted_cpu[0:4] =", out.index_sorted_cpu[:4].tolist())
 
+def test_esa_retrieval_q1(batch_size, num_repre_blocks, num_q_heads):
+    """
+    目标：从 Python 进入 esa_retrieval_launcher -> retrieval_kernel_bf16 (esa_kernels.cu)
+    运行时建议：
+      CUDA_LAUNCH_BLOCKING=1 BUILD_MODE=debug cuda-gdb --args python -m pytest -s test_esa.py::test_esa_retrieval_debug
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    dim = 128
+    num_k_heads = 8
+    total_blocks = batch_size * num_repre_blocks
+    N = total_blocks * 2  # repre_cache rows
+
+    # query = torch.randn(batch_size, num_q_heads, dim, device=device, dtype=dtype)
+    # repre_cache = torch.randn(N, num_k_heads, dim, device=device, dtype=dtype)
+    
+    base_dir="/home/externals/wangwenxin21/unified-cache-management/repre/bs1"
+    q_file = "q_req1_bs1.pt"
+    repre_file = "req1_bs1.pt"
+    query = torch.load(os.path.join(base_dir, q_file))
+    repre_cache = torch.load(os.path.join(base_dir, repre_file))
+    # indices
+    q_index_file="q_index_bs1.pt"
+    repre_index_file="repre_index_bs1.pt"
+    # repre_index = torch.randint(0, N, (total_blocks,), device=device, dtype=torch.int32)
+    # q_index = torch.randint(0, batch_size, (total_blocks,), device=device, dtype=torch.int32)
+    repre_index = torch.load(os.path.join(base_dir, repre_index_file))
+    q_index = torch.load(os.path.join(base_dir, q_index_file))
+
+    # offsets [B+1]
+    batch_offset = torch.arange(0, (batch_size + 1) * num_repre_blocks,
+                                step=num_repre_blocks,
+                                device=device,
+                                dtype=torch.int32)
+
+    # outputs
+    score = torch.empty(total_blocks, device=device, dtype=dtype)
+
+    # pinned CPU buffers required by C++ checks
+    score_cpu = torch.empty(total_blocks, device="cpu", dtype=dtype, pin_memory=True)
+    score_sorted_cpu = torch.empty(total_blocks, device="cpu", dtype=dtype, pin_memory=True)
+    index_sorted_cpu = torch.empty(total_blocks, device="cpu", dtype=torch.int32, pin_memory=True)
+
+    # pinned CPU tensor for repre_index_cpu (C++ 会用 data_ptr<int32_t>())
+    repre_index_cpu = torch.empty(total_blocks, device="cpu", dtype=torch.int32, pin_memory=True)
+
+    # pack structs
+    inp = esa.RetrievalInputTensor()
+    inp.query = query
+    inp.repre_cache = repre_cache
+    inp.q_index = q_index
+    inp.repre_index = repre_index
+    inp.repre_index_cpu = repre_index_cpu
+    inp.batch_offset = batch_offset
+    inp.batch = batch_size
+    inp.s = total_blocks
+
+    out = esa.RetrievalOutputTensor()
+    out.score = score
+    out.score_cpu = score_cpu
+    out.score_sorted_cpu = score_sorted_cpu
+    out.index_sorted_cpu = index_sorted_cpu
+
+    esa.esa_retrieval(inp, out)
+
+    start = time.perf_counter_ns()
+    esa.esa_retrieval(inp, out)
+    torch.cuda.synchronize()
+    duration = time.perf_counter_ns() - start
+    print_green(f"{' '*4}esa_retrieval host API time: {duration/1e6:.3f} ms")
+
+    def naive_retrieval():
+        query_batched = query[q_index].to(torch.float32)
+        key = torch.repeat_interleave(repre_cache[repre_index],
+                                      num_q_heads//num_k_heads,
+                                      dim=1).to(torch.float32)
+        score_gt = (query_batched * key).sum(-1).sum(-1).to(dtype)
+        index_gt = torch.cat([ repre_index[s:t][score_gt[s:t].argsort(descending=True)] for s,t in zip(batch_offset[:-1], batch_offset[1:]) ])
+        return score_gt, index_gt
+
+    start = time.perf_counter_ns()
+    score_gt, index_gt = naive_retrieval()
+    torch.cuda.synchronize()
+    duration = time.perf_counter_ns() - start
+    print_red(f"{' '*4}naive_retrieval host API time: {duration/1e6:.3f} ms")
+
+    diff = (score - score_gt[:32]).abs()
+    print_blue(f"{' '*4}score diff: {diff.mean():.3f}(mean), {diff.max():.3f}(max)")
+    
+    print("")
+    assert diff.mean() < 1e-3
+
+def test_esa_retrieval_q2(batch_size, num_repre_blocks, num_q_heads):
+    """
+    目标：从 Python 进入 esa_retrieval_launcher -> retrieval_kernel_bf16 (esa_kernels.cu)
+    运行时建议：
+      CUDA_LAUNCH_BLOCKING=1 BUILD_MODE=debug cuda-gdb --args python -m pytest -s test_esa.py::test_esa_retrieval_debug
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    dim = 128
+    num_k_heads = 8
+    total_blocks = batch_size * num_repre_blocks
+    N = total_blocks * 2  # repre_cache rows
+
+    # query = torch.randn(batch_size, num_q_heads, dim, device=device, dtype=dtype)
+    # repre_cache = torch.randn(N, num_k_heads, dim, device=device, dtype=dtype)
+    
+    base_dir="/home/externals/wangwenxin21/unified-cache-management/repre/bs1"
+    q_file = "q_req1_bs1.pt"
+    repre_file = "req1_bs1.pt"
+    query = torch.load(os.path.join(base_dir, q_file))
+    repre_cache = torch.load(os.path.join(base_dir, repre_file))
+    # indices
+    q_index_file="q_index_bs1.pt"
+    repre_index_file="repre_index_bs1.pt"
+    # repre_index = torch.randint(0, N, (total_blocks,), device=device, dtype=torch.int32)
+    # q_index = torch.randint(0, batch_size, (total_blocks,), device=device, dtype=torch.int32)
+    repre_index = torch.load(os.path.join(base_dir, repre_index_file))
+    q_index = torch.load(os.path.join(base_dir, q_index_file))
+
+    # offsets [B+1]
+    batch_offset = torch.arange(0, (batch_size + 1) * num_repre_blocks,
+                                step=num_repre_blocks,
+                                device=device,
+                                dtype=torch.int32)
+
+    # outputs
+    score = torch.empty(total_blocks, device=device, dtype=dtype)
+
+    # pinned CPU buffers required by C++ checks
+    score_cpu = torch.empty(total_blocks, device="cpu", dtype=dtype, pin_memory=True)
+    score_sorted_cpu = torch.empty(total_blocks, device="cpu", dtype=dtype, pin_memory=True)
+    index_sorted_cpu = torch.empty(total_blocks, device="cpu", dtype=torch.int32, pin_memory=True)
+
+    # pinned CPU tensor for repre_index_cpu (C++ 会用 data_ptr<int32_t>())
+    repre_index_cpu = torch.empty(total_blocks, device="cpu", dtype=torch.int32, pin_memory=True)
+
+    # pack structs
+    inp = esa.RetrievalInputTensor()
+    inp.query = query
+    inp.repre_cache = repre_cache
+    inp.q_index = q_index
+    inp.repre_index = repre_index
+    inp.repre_index_cpu = repre_index_cpu
+    inp.batch_offset = batch_offset
+    inp.batch = batch_size
+    inp.s = total_blocks
+
+    out = esa.RetrievalOutputTensor()
+    out.score = score
+    out.score_cpu = score_cpu
+    out.score_sorted_cpu = score_sorted_cpu
+    out.index_sorted_cpu = index_sorted_cpu
+
+    esa.esa_retrieval(inp, out)
+
+    start = time.perf_counter_ns()
+    esa.esa_retrieval(inp, out)
+    torch.cuda.synchronize()
+    duration = time.perf_counter_ns() - start
+    print_green(f"{' '*4}esa_retrieval host API time: {duration/1e6:.3f} ms")
+
+    def naive_retrieval():
+        query_batched = query[q_index].to(torch.float32)
+        key = torch.repeat_interleave(repre_cache[repre_index],
+                                      num_q_heads//num_k_heads,
+                                      dim=1).to(torch.float32)
+        score_gt = (query_batched * key).sum(-1).sum(-1).to(dtype)
+        index_gt = torch.cat([ repre_index[s:t][score_gt[s:t].argsort(descending=True)] for s,t in zip(batch_offset[:-1], batch_offset[1:]) ])
+        return score_gt, index_gt
+
+    start = time.perf_counter_ns()
+    score_gt, index_gt = naive_retrieval()
+    torch.cuda.synchronize()
+    duration = time.perf_counter_ns() - start
+    print_red(f"{' '*4}naive_retrieval host API time: {duration/1e6:.3f} ms")
+
+    diff = (score - score_gt[:32]).abs()
+    print_blue(f"{' '*4}score diff: {diff.mean():.3f}(mean), {diff.max():.3f}(max)")
+    
+    print("")
+    assert diff.mean() < 1e-3
 
 @pytest.mark.parametrize("num_blocks", [16])
 def test_esa_repre_debug(num_blocks):
@@ -180,5 +385,5 @@ def test_esa_repre_debug(num_blocks):
 
 if __name__ == "__main__":
     # 方便直接 python test_esa.py 跑
-    test_esa_retrieval_debug(2, 32, 16)
-    test_esa_repre_debug(16)
+    test_esa_retrieval_q1(1, 32, 40)
+    # test_esa_repre_debug(16)
