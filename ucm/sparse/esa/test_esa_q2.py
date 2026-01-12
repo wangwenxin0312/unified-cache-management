@@ -105,7 +105,7 @@ def test_esa_retrieval_q2(batch_size, num_repre_blocks, num_q_heads):
     # query = torch.randn(batch_size, num_q_heads, dim, device=device, dtype=dtype)
     # repre_cache = torch.randn(N, num_k_heads, dim, device=device, dtype=dtype)
     
-    base_dir="/home/externals/wangwenxin21/unified-cache-management/repre/bs2"
+    base_dir="/home/externals/wangwenxin21/unified-cache-management/repre/bs2_new"
     q_file = "q_req1_bs2.pt"
     repre_file = "req1_bs2.pt"
     query = torch.load(os.path.join(base_dir, q_file))
@@ -139,7 +139,7 @@ def test_esa_retrieval_q2(batch_size, num_repre_blocks, num_q_heads):
 
     # pack structs
     inp = esa.RetrievalInputTensor()
-    inp.query = query
+    inp.query = query.contiguous()
     inp.repre_cache = repre_cache
     inp.q_index = q_index
     inp.repre_index = repre_index
