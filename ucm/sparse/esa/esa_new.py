@@ -305,6 +305,7 @@ class ESA(UcmSparseBase):
         forward_context,
         phase = None,
     ) -> None:
+        return 
         if not self.has_decode:
             return
         with nvtx.range(f"retrieval"):
@@ -376,6 +377,34 @@ class ESA(UcmSparseBase):
                 #     atol=0.0,   # bf16 建议设 1e-3
                 #     rtol=0.0,
                 # )
+        if self.has_decode:
+            with nvtx.range(f"retrieval"):
+                layer_id = self.get_layer_id(layer_name)
+                self.retrieval_input.query = query
+                self.retrieval_input.repre_cache = self.repre_cache[layer_id]
+                self.retrieval_input.q_index = self.decode_q_index
+                self.retrieval_input.repre_index = self.decode_repre_index
+                self.retrieval_input.repre_index_cpu = self.decode_repre_index_cpu
+                self.retrieval_input.batch_offset = self.decode_batch_offset_cpu
+                self.retrieval_input.batch = self.decode_retrieval_batch
+                self.retrieval_input.s = self.decode_retrieval_s_len
+
+                # self.retrieval_input.decode_block_table = self.decode_block_tables
+                h = esa_retrieval(self.retrieval_input, self.retrieval_output)
+                self.handles.append(h)
+
+                # load
+                k_cache, v_cache = self.get_kv_cache(forward_context, layer_name)
+                k_cache.zero_()
+                v_cache.zero_()
+                ready = esa_lib.esa_retrieval_poll(h)
+                # if ready == 1:
+                
+                esa_scatter_copy(self.host_k_cache[layer_id].flatten(-3), k_cache.flatten(-3),
+                                    self.decode_repre_index[:self.decode_num_blocks], self.decode_block_tables[:self.decode_num_blocks])
+                
+                esa_scatter_copy(self.host_v_cache[layer_id].flatten(-3), v_cache.flatten(-3),
+                                    self.decode_repre_index[:self.decode_num_blocks], self.decode_block_tables[:self.decode_num_blocks])
 
 
     def _wait(self, h, timeout_in_seconds):
