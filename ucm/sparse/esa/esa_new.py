@@ -24,6 +24,7 @@ from ucm.sparse.base import (
     INVALID_SLOT,
     UcmSparseBase,
     UcmSparseMetadata,
+    UcmSparseCachedRequestData,
     UcmSparseRole,
     UcmSparseBlockManager,
     UcmSparseCpuGpuBuffer
@@ -47,7 +48,6 @@ class EsaPrefillMetadata:
     """Metadata of current prefill batch."""
     kv_blocks: torch.Tensor  # kv block ids
     repre_blocks: torch.Tensor  # repre block ids
-    num_blocks: int = 0  # num of kv blocks
 
 
 @dataclass
@@ -55,12 +55,15 @@ class EsaDecodeMetadata:
     """Metadata of current decode batch."""
     kv_blocks: torch.Tensor  # kv block ids
     repre_blocks: UcmSparseCpuGpuBuffer  # repre block ids
+    leftover_kv_blocks: torch.Tensor  # leftover kv block ids
+    leftover_repre_blocks: torch.Tensor  # leftover repre block ids
     req_indexes: torch.Tensor  # req indexes
     batch_offset: torch.Tensor  # num repre blocks offset
     topk_offset: torch.Tensor  # num topk blocks offset
     fixed_block_indexes: torch.Tensor  # fixed block indexes in repre_blocks (with maximum score)
     num_blocks: int = 0  # num of vllm blocks
     num_repre_blocks: int = 0  # num of repre blocks
+    num_leftover_blocks: int = 0  # num of leftover blocks
     num_fixed_blocks: int = 0  # num of fixed blocks (with maximum score)    
 
 
@@ -104,6 +107,7 @@ class ESA(UcmSparseBase):
     def _init_sparse_cfg(self):
         self.esa_cfg = Config(self.vllm_config.kv_transfer_config).get_config().get("ucm_sparse_config").get("ESA")
         self.min_blocks = self.esa_cfg.get("min_blocks", 4)
+        self.sparse_ratio = self.esa_cfg.get("sparse_ratio", 0.2)
         self.init_window = self.esa_cfg.get("init_window_sz", 1)
         self.local_window = self.esa_cfg.get("local_window_sz", 2)
         self.fixed_window = self.init_window + self.local_window
@@ -167,9 +171,19 @@ class ESA(UcmSparseBase):
         self.decode_req_indexes.clear()
         self.decode_fixed_indexes.clear()
 
+    def _clear_buffer(self) -> None:
+        self.prefill_kv_blocks.clear()
+        self.prefill_repre_blocks.clear()
+        self.decode_kv_blocks.clear()
+        self.decode_repre_blocks.clear()
+        self.decode_leftover_kv_blocks.clear()
+        self.decode_leftover_repre_blocks.clear()
+        self.decode_req_indexes.clear()
+        self.decode_fixed_indexes.clear()
+
     def _get_num_compressed_prompt_blocks(self, num_prompt_blocks: int) -> int:
         return self.fixed_window + int((num_prompt_blocks - self.fixed_window) * self.sparse_ratio)
-    
+
     def build_sparse_meta(self,
                           scheduler_output: SchedulerOutput,
                           requests: dict[str, CachedRequestState],
@@ -186,7 +200,6 @@ class ESA(UcmSparseBase):
             for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
                 req = requests[req_id]
                 is_decode = req_id in self.cached_reqs
-                
                 if is_decode:
                     num_prompt_blocks = self.cached_reqs[req_id].num_prompt_blocks
                 else:
@@ -231,8 +244,6 @@ class ESA(UcmSparseBase):
                     else:
                         num_compressed_prompt_blocks = self.cached_reqs[req_id].num_compressed_prompt_blocks
                     self.cached_reqs[req_id].step += 1
-
-                   
                   
                     fixed_indexes = list(chain(range(num_decode_repre_blocks, num_decode_repre_blocks + self.init_window),
                                             range(num_decode_repre_blocks + num_repre_blocks - self.local_window,
