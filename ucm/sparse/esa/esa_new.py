@@ -210,7 +210,7 @@ class ESA(UcmSparseBase):
                     assert repre_blocks is not None, f"req {req_id} does not has sparse blocks."
                     
                     is_first_decode_step = (len(req.output_token_ids) == 1)
-                    drop_block_tail = 0 if is_first_decode_step else 0
+                    drop_block_tail = 0 if is_first_decode_step else 1
                     num_repre_blocks = len(repre_blocks) - drop_block_tail
                     num_decode_blocks = len(block_tables) - drop_block_tail
                     
@@ -219,7 +219,6 @@ class ESA(UcmSparseBase):
                         f"drop_tail={drop_block_tail}, req={req_id}"
                     )
                   
-                    # fixed_indexes = [repre_blocks[0], repre_blocks[-2]] + ([repre_blocks[-1]] if is_first_decode_step else [])
                     fixed_indexes = list(chain(range(num_decode_repre_blocks, num_decode_repre_blocks + self.init_window),
                                             range(num_decode_repre_blocks + num_repre_blocks - self.local_window + drop_block_tail,
                                                     num_decode_repre_blocks + num_repre_blocks))) # todo: 抢占恢复
@@ -229,7 +228,7 @@ class ESA(UcmSparseBase):
                     self.decode_kv_blocks.np[num_decode_kv_blocks:num_decode_kv_blocks + num_decode_blocks] = block_tables[:num_decode_blocks]
                     self.decode_repre_blocks.np[num_decode_repre_blocks:num_decode_repre_blocks + num_repre_blocks] = repre_blocks[:num_repre_blocks]
                     self.decode_fixed_indexes.np[num_decode_fixed_blocks:num_decode_fixed_blocks + self.fixed_window_use] = fixed_indexes
-                    self.decode_req_indexes.np[num_decodes] = input_batch.req_id_to_index[req_id]
+                    self.decode_req_indexes.np[num_decode_repre_blocks:num_decode_repre_blocks + num_repre_blocks] = input_batch.req_id_to_index[req_id]
                     num_decode_kv_blocks += num_decode_blocks
                     num_decode_repre_blocks += num_repre_blocks
                     num_decode_fixed_blocks += self.fixed_window_use
@@ -252,7 +251,7 @@ class ESA(UcmSparseBase):
             if num_decodes > 0:
                 self.decode_kv_blocks.copy_to_gpu(num_decode_kv_blocks)
                 self.decode_repre_blocks.copy_to_gpu(num_decode_repre_blocks)
-                self.decode_req_indexes.copy_to_gpu(num_decodes)
+                self.decode_req_indexes.copy_to_gpu(num_decode_repre_blocks)
                 self.decode_fixed_indexes.copy_to_gpu(num_decode_fixed_blocks)
                 decode_metadata = EsaDecodeMetadata(
                     kv_blocks=self.decode_kv_blocks.gpu,
@@ -286,7 +285,7 @@ class ESA(UcmSparseBase):
 
         with nvtx.range(f"esa_attention_begin"):
             layer_id = get_layer_id(layer_name)
-            self.retrieval_input.query = query
+            self.retrieval_input.query = query.contiguous()
             self.retrieval_input.repre_cache = self.device_repre_cache[layer_id]
             self.retrieval_input.q_index = self.sparse_metadata.decode.req_indexes
             self.retrieval_input.repre_index = self.sparse_metadata.decode.repre_blocks.gpu
@@ -303,7 +302,6 @@ class ESA(UcmSparseBase):
             topk_idx_per_req = []
             topk_offsets = self.sparse_metadata.decode.topk_offset[: self.sparse_metadata.num_decodes + 1]
             for b in range(req_score_offsets.numel() - 1):
-                # s, e = int(self.sparse_metadata.decode.repre_blocks.gpu[req_score_offsets[b]]), int(self.sparse_metadata.decode.repre_blocks.gpu[req_score_offsets[b + 1]])
                 s, e = int(req_score_offsets[b]), int(req_score_offsets[b + 1])
                 seg = score[s:e]                      # scores for this req
                 k = int(topk_offsets[b+1] - topk_offsets[b])
@@ -313,7 +311,7 @@ class ESA(UcmSparseBase):
                 # print(f"layer_id {layer_id} start:{s} end:{e} topk:{k} before {topk.indices + s} sort_idx {idx}")
                 topk_idx_per_req.append(idx)
             topk_index = torch.cat(topk_idx_per_req, dim=0)
-            print(f"layer_id {layer_id} --repre_blocks {self.sparse_metadata.decode.repre_blocks.gpu[topk_index]} --kv_blocks {self.sparse_metadata.decode.kv_blocks[:self.sparse_metadata.decode.num_blocks]} ")
+            # print(f"layer_id {layer_id} --repre_blocks {self.sparse_metadata.decode.repre_blocks.gpu[topk_index]} --kv_blocks {self.sparse_metadata.decode.kv_blocks[:self.sparse_metadata.decode.num_blocks]} ")
             k_cache, v_cache = get_kv_cache(forward_context, layer_name)
             esa_scatter_copy(self.host_k_cache[layer_id].flatten(-3), k_cache.flatten(-3),
                                 self.sparse_metadata.decode.repre_blocks.gpu[topk_index], 
