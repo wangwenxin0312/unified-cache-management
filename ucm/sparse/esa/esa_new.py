@@ -83,6 +83,8 @@ class EsaCachedRequestData(UcmSparseCachedRequestData):
     num_prompt_blocks: int = 0  # num of prompt blocks when prefill
     num_compressed_prompt_blocks: int = 0  # num of prompt blocks when decode (after compression)
     step: int = 0  # the step of request
+    decode_block_tables_used: Any = None
+    decode_repre_blocks_used: Any = None
 
 
 class ESA(UcmSparseBase):
@@ -171,16 +173,6 @@ class ESA(UcmSparseBase):
         self.decode_req_indexes.clear()
         self.decode_fixed_indexes.clear()
 
-    def _clear_buffer(self) -> None:
-        self.prefill_kv_blocks.clear()
-        self.prefill_repre_blocks.clear()
-        self.decode_kv_blocks.clear()
-        self.decode_repre_blocks.clear()
-        self.decode_leftover_kv_blocks.clear()
-        self.decode_leftover_repre_blocks.clear()
-        self.decode_req_indexes.clear()
-        self.decode_fixed_indexes.clear()
-
     def _get_num_compressed_prompt_blocks(self, num_prompt_blocks: int) -> int:
         return self.fixed_window_sz + int((num_prompt_blocks - self.fixed_window_sz) * self.sparse_ratio)
 
@@ -242,16 +234,18 @@ class ESA(UcmSparseBase):
                         num_leftover_blocks = num_blocks - num_compressed_prompt_blocks + 1 # Number of blocks available for decode after excluding prompt-filled blocks (also used for block preemption)
                         self.decode_leftover_kv_blocks.append_numpy(block_tables[-num_leftover_blocks:])
                         self.decode_leftover_repre_blocks.append_numpy(repre_blocks[-num_leftover_blocks:])
+                        self.cached_reqs[req_id].decode_block_tables_used = block_tables[:num_compressed_prompt_blocks - 1]
+                        self.cached_reqs[req_id].decode_repre_blocks_used = repre_blocks[:num_repre_blocks - 1]
                     else:
                         num_compressed_prompt_blocks = self.cached_reqs[req_id].num_compressed_prompt_blocks
                     self.cached_reqs[req_id].step += 1
                   
                     fixed_indexes = list(chain(range(num_decode_repre_blocks, num_decode_repre_blocks + self.init_window_sz),
-                                            range(num_decode_repre_blocks + num_repre_blocks - self.local_window_sz,
-                                                     num_decode_repre_blocks + num_repre_blocks - 1)))   # todo: 抢占恢复
+                                            range(num_decode_repre_blocks + num_prompt_blocks - self.local_window_sz,
+                                                     num_decode_repre_blocks + num_prompt_blocks - 1)))   # todo: 抢占恢复
                     print(f"===req_id {req_id}[fixed_indexes]{fixed_indexes}")
-                    self.decode_kv_blocks.append_numpy(block_tables[:num_compressed_prompt_blocks - 1])
-                    self.decode_repre_blocks.append_numpy(repre_blocks[:num_prompt_blocks - 1])
+                    self.decode_kv_blocks.append_numpy(self.cached_reqs[req_id].decode_block_tables_used)
+                    self.decode_repre_blocks.append_numpy(self.cached_reqs[req_id].decode_repre_blocks_used)
                     self.decode_fixed_indexes.append_numpy(fixed_indexes)
                     req_index = int(input_batch.req_id_to_index[req_id])
                     self.decode_req_indexes.append_numpy([req_index] * (num_prompt_blocks - 1)) # req_indexes must match the number of repre blocks
