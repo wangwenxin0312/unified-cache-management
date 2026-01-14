@@ -82,8 +82,9 @@ class EsaCachedRequestData(UcmSparseCachedRequestData):
     num_prompt_blocks: int = 0  # num of prompt blocks when prefill
     num_compressed_prompt_blocks: int = 0  # num of prompt blocks when decode (after compression)
     step: int = 0  # the step of request
-    decode_block_tables_used: Any = None
-    decode_repre_blocks_used: Any = None
+    # metadata for decode
+    decode_block_tables_used: List[int] = field(default_factory=list)
+    decode_repre_blocks_used: List[int] = field(default_factory=list)
 
 
 class ESA(UcmSparseBase):
@@ -102,8 +103,9 @@ class ESA(UcmSparseBase):
         self.dtype = model_config.dtype
         self.pin_memory = True
 
-        self._init_sparse_cfg()
-        self._init_cache()
+        if role == UcmSparseRole.WORKER:
+            self._init_sparse_cfg()
+            self._init_cache()
 
     def _init_sparse_cfg(self):
         self.esa_cfg = Config(self.vllm_config.kv_transfer_config).get_config().get("ucm_sparse_config").get("ESA")
@@ -468,7 +470,7 @@ class ESA(UcmSparseBase):
         if request_id not in self.cached_reqs:
             return
         print(f"free req={request_id}")
-        self.block_manager.free(self.cached_reqs[request_id].sparse_blocks)
+        self.block_manager.free(self.cached_reqs[request_id].repre_blocks)
         del self.cached_reqs[request_id]
 
     def update_states(self, scheduler_output: SchedulerOutput) -> None:
