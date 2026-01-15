@@ -1,6 +1,6 @@
 from importlib import resources
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import torch
 
@@ -294,6 +294,96 @@ class KvCompOnDevice(UcmSparseBase):
             layer_id < len(self.hash_skip_layers) and self.hash_skip_layers[layer_id]
         )
         return is_rollback_layer, is_skip_hash_layer
+    
+    def rebuild_prefix_slot_mapping_from_attn_metadata_batch(
+        self,
+        block_table: torch.Tensor,      # [B, max_blocks] int32 CUDA, 0 padding
+        prefix_lens: torch.Tensor,      # [B] int64 CUDA
+        block_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        只对 prefix_len>0 的序列重建 prefix slots。
+        return:
+        slot_prefix_cat: [sum(prefix_lens[prefix>0])] int32 CUDA
+        prefix_seq_ids:  [num_prefix_seqs] int64 CUDA  (哪些序列有prefix)
+        """
+        assert block_table.is_cuda and prefix_lens.is_cuda
+        B = int(prefix_lens.numel())
+        device = block_table.device
+
+        prefix_seq_ids = torch.nonzero(prefix_lens > 0, as_tuple=False).squeeze(-1)  # [P]
+        if prefix_seq_ids.numel() == 0:
+            empty = torch.empty((0,), device=device, dtype=torch.int32)
+            return empty, prefix_seq_ids.to(torch.int64)
+
+        slots_list = []
+        for i in prefix_seq_ids.tolist():
+            p_len = int(prefix_lens[i].item())
+            nblocks = (p_len + block_size - 1) // block_size
+
+            bt_row = block_table[i].to(torch.int64)          # [max_blocks]
+            blk_ids = bt_row[:nblocks]                       # [nblocks]
+
+            # 处理 padding 0（如果 0 出现在有效区，需要过滤；过滤后要确保 blocks 足够）
+            if (blk_ids == 0).any():
+                blk_ids = blk_ids[blk_ids != 0]
+                if blk_ids.numel() * block_size < p_len:
+                    raise RuntimeError(
+                        f"block_table row {i} not enough blocks for prefix_len={p_len}, "
+                        f"valid_blocks={int(blk_ids.numel())}"
+                    )
+
+            t = torch.arange(p_len, device=device, dtype=torch.int64)
+            blk_idx = t // block_size
+            off = t - blk_idx * block_size
+            blk = blk_ids[blk_idx]                           # [p_len]
+            slot = blk * block_size + off                    # [p_len]
+            slots_list.append(slot.to(torch.int32))
+
+        slot_prefix_cat = torch.cat(slots_list, dim=0) if slots_list else torch.empty((0,), device=device, dtype=torch.int32)
+        return slot_prefix_cat, prefix_seq_ids.to(torch.int64)
+    
+    def gather_prefix_keys_from_kv_cache(
+        self,
+        kv_cache_blocked: torch.Tensor,   # kv_cache[0][0]
+        slot_mapping: torch.Tensor,       # [prefix_len], int32/int64, CUDA
+        block_size: int,
+    ) -> torch.Tensor:
+        """
+        kv_cache_blocked: [num_blocks, block_size, num_kv_heads, head_dim]
+        slot_mapping:     [T]  (slot = block_id * block_size + offset)
+
+        return:
+            keys: [T, num_kv_heads, head_dim]
+        """
+        assert kv_cache_blocked.is_cuda
+        assert slot_mapping.is_cuda
+
+        slot = slot_mapping.to(torch.int64)
+
+        # 1) slot -> (block_id, offset)
+        block_id = slot // block_size           # [T]
+        offset   = slot - block_id * block_size # [T]
+
+        # 2) gather
+        # 这是合法且高效的 advanced indexing（完全在 GPU 上）
+        keys = kv_cache_blocked[block_id, offset]
+
+        return keys
+
+    def get_prefix_stats(self, attn_metadata) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        return:
+        prefix_lens: [B] int64
+        new_lens:    [B] int64   (本次 forward 实际参与计算的 tokens)
+        total_lens:  [B] int64   (prefix + new)
+        """
+        total_lens = attn_metadata.seq_lens  # [B]
+        qsl = attn_metadata.query_start_loc
+        new_lens = (qsl[1:] - qsl[:-1])      # [B]
+        prefix_lens = total_lens - new_lens
+        prefix_lens = torch.clamp(prefix_lens, min=0)
+        return prefix_lens, new_lens, total_lens
 
     def attention_begin(
         self,
@@ -326,6 +416,35 @@ class KvCompOnDevice(UcmSparseBase):
             else:  # GQA
                 if self.is_cuda:
                     ## 重新捞取所有token的key
+                    
+                    prefix_lens, new_lens, total_lens = self.get_prefix_stats(attn_metadata)
+                    has_any_prefix = bool((prefix_lens > 0).any().item())
+
+                    prefix_keys = None
+                    slot_prefix = None
+                    prefix_seq_ids = None
+
+                    if has_any_prefix:
+                        attn = forward_context.no_compile_layers[layer_name]
+                        kv_cache = attn.kv_cache[forward_context.virtual_engine]
+                        k_cache = kv_cache[0][0]  # shape: [num_blocks, block_size, num_kv_heads, head_dim]
+
+                        # 1) 只对 batch 内 prefix_len>0 的序列重建 slot_prefix（拼接）
+                        slot_prefix, prefix_seq_ids = self.rebuild_prefix_slot_mapping_from_attn_metadata_batch(
+                            block_table=attn_metadata.block_table,
+                            prefix_lens=prefix_lens.to(attn_metadata.block_table.device),
+                            block_size=self.block_size,
+                        )
+
+                        # 2) 从 k_cache 读回 prefix keys（对应 slot_prefix 拼接顺序）
+                        #    prefix_keys shape: [sum(prefix_lens[prefix>0]), num_kv_heads, head_dim]
+                        if slot_prefix.numel() > 0:
+                            prefix_keys = self.gather_prefix_keys_from_kv_cache(
+                                k_cache=k_cache,
+                                slot_mapping=slot_prefix,
+                                block_size=self.block_size,
+                            )
+
                     k_hash_compute = self.hash_encoder.compute_hash(key).view(
                         torch.bfloat16
                     )
@@ -518,6 +637,7 @@ class KvCompOnDevice(UcmSparseBase):
                                 self.hamming_output[: len(decode_req_ids)],
                             )
                             topk = self.hamming_output.shape[-1]
+                            self.cache_req[req_id].block_table
                             attn_metadata.block_table[decode_req_ids, :topk] = (
                                 self.hamming_output[: len(decode_req_ids), 0, :]
                             )
@@ -637,11 +757,15 @@ class KvCompOnDevice(UcmSparseBase):
         from ucm.sparse.kvcomp.hamming_topk import update_seq_lens
 
         q_lens = query_start_loc[1:] - query_start_loc[:-1]
-        self.decode_mask = q_lens == 1
+        self.decode_mask = q_lens == 1 # NOTE 1: MTP场景 怎么判断
+        self.prefill_mask = (q_lens > 1) # NOTE 2: prefix cache new token=1 怎么判断
 
         self.ori_seq_lens_decode = seq_lens.clone()
-        # print(f"===[build decode meta] {self.ori_seq_lens_decode.data_ptr()} seq_len_ptr:{seq_lens.data_ptr()}")
         self.ori_block_table_decode = block_table.clone()
+        # print(f"===[build decode meta] {self.ori_seq_lens_decode.data_ptr()} seq_len_ptr:{seq_lens.data_ptr()}")
+        prefix_lens = torch.clamp(seq_lens - q_lens, min=0)
+        self.prefill_has_prefix_mask = self.prefill_mask & (prefix_lens > 0)
+        
         if self.decode_mask.any():
             decode_seq_lens = seq_lens[self.decode_mask]
             self.topk_seq_lens_qwen = update_seq_lens(
@@ -649,7 +773,9 @@ class KvCompOnDevice(UcmSparseBase):
                 topk_token=self.hash_topk_tokens,
                 block_size=self.block_size,
             )
-        return self.decode_mask, self.topk_seq_lens_qwen
+        return self.decode_mask, self.prefill_mask, self.prefill_has_prefix_mask, self.topk_seq_lens_qwen
+    
+    
 
     def build_decode_attention_meta_npu(self, query_lens, seq_lens, block_table):
 
