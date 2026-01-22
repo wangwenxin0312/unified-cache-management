@@ -102,9 +102,9 @@ class ESA(UcmSparseBase):
         self.device = vllm_config.device_config.device
         self.dtype = model_config.dtype
         self.pin_memory = True
-
-        if role == UcmSparseRole.WORKER:
-            self._init_sparse_cfg()
+        self._init_sparse_cfg()
+        
+        if role == UcmSparseRole.WORKER: 
             self._init_cache()
 
     def _init_sparse_cfg(self):
@@ -244,7 +244,7 @@ class ESA(UcmSparseBase):
                     fixed_indexes = list(chain(range(num_decode_repre_blocks, num_decode_repre_blocks + self.init_window_sz),
                                             range(num_decode_repre_blocks + num_prompt_blocks - self.local_window_sz,
                                                      num_decode_repre_blocks + num_prompt_blocks - 1)))   # todo: 抢占恢复
-                    print(f"===req_id {req_id}[fixed_indexes]{fixed_indexes}")
+                    # print(f"===req_id {req_id}[fixed_indexes]{fixed_indexes}")
                     self.decode_kv_blocks.append_numpy(self.cached_reqs[req_id].decode_block_tables_used)
                     self.decode_repre_blocks.append_numpy(self.cached_reqs[req_id].decode_repre_blocks_used)
                     self.decode_fixed_indexes.append_numpy(fixed_indexes)
@@ -306,9 +306,9 @@ class ESA(UcmSparseBase):
                         phase: Optional[str] = None) -> None:
         if self.sparse_metadata.decode is None:
             return
-
-        with nvtx.range(f"esa_attention_begin"):
-            layer_id = get_layer_id(layer_name)
+        layer_id = get_layer_id(layer_name)
+        with nvtx.range(f"esa_attention_begin_retrieval_input_layer_{layer_id}_score_batch{self.sparse_metadata.num_decodes}"):
+            
             self.retrieval_input.query = query.contiguous()
             self.retrieval_input.repre_cache = self.device_repre_cache[layer_id]
             self.retrieval_input.q_index = self.sparse_metadata.decode.req_indexes
@@ -318,13 +318,13 @@ class ESA(UcmSparseBase):
             self.retrieval_input.batch = self.sparse_metadata.num_decodes
             self.retrieval_input.s = self.sparse_metadata.decode.num_repre_blocks
             esa_retrieval(self.retrieval_input, self.retrieval_output)
-            
-            req_score_offsets  = self.retrieval_input.batch_offset[: self.sparse_metadata.num_decodes + 1]
-            score = self.retrieval_output.score        
+            score = self.retrieval_output.score
 
-            score[self.decode_fixed_indexes.gpu[:self.sparse_metadata.decode.num_fixed_blocks]] = torch.inf
+            # topk outside
+            req_score_offsets = self.retrieval_input.batch_offset[: self.sparse_metadata.num_decodes + 1]
+            score[self.sparse_metadata.decode.fixed_block_indexes]= torch.inf
             topk_idx_per_req = []
-            topk_offsets = self.sparse_metadata.decode.topk_offset[: self.sparse_metadata.num_decodes + 1]
+            topk_offsets = self.sparse_metadata.decode.topk_offset[: self.sparse_metadata.num_decodes + 1]   
             for b in range(req_score_offsets.numel() - 1):
                 s, e = int(req_score_offsets[b]), int(req_score_offsets[b + 1])
                 seg = score[s:e]                      # scores for this req
