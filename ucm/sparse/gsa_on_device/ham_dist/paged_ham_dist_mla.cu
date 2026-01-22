@@ -329,7 +329,7 @@ torch::Tensor HammingScoreContiCUDA(torch::Tensor& key_codes,
     int32_t max_num_block_per_seq = block_table.size(1);
     TORCH_CHECK(bsz == block_table.size(0), "batch size mismatch between query_code and block_table");
     TORCH_CHECK(key_codes.is_contiguous(), "key_codes must be contiguous, but got non-contiguous tensor");
-    torch::Tensor output = torch::empty({bsz, num_kv_head, max_seq_len}, options);
+    torch::Tensor output = torch::zeros({bsz, num_kv_head, max_seq_len}, options);
     const int32_t* block_table_ptr = block_table.data_ptr<int32_t>();
     HEAD_SWITCH(num_head, NumHead, {
       KVHEAD_SWITCH(num_kv_head, NumKVHead, {
