@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-
+import os
 if hasattr(torch, "npu") and torch.npu.is_available():
     import torch_npu
     import ucm_custom_ops
@@ -478,6 +478,23 @@ class GSAOnDevice(UcmSparseBase):
                                 recent_token=512,
                                 is_mla=self.is_mla,
                             )
+                            base_dir = "/home/externals/wangwenxin21/va_new/dump_tensor/old"
+                            torch.save(q_decode, os.path.join(
+                                    base_dir,
+                                    f"q_decode_layer{layer_name}_old_{self.rank}.pt"
+                                ))
+                            torch.save(q_hash, os.path.join(
+                                    base_dir,
+                                    f"q_hash_layer{layer_name}_old_{self.rank}.pt"
+                                ))
+                            torch.save(k_hash, os.path.join(
+                                    base_dir,
+                                    f"k_hash_layer{layer_name}_old_{self.rank}.pt"
+                                ))
+                            torch.save(block_table_decode, os.path.join(
+                                    base_dir,
+                                    f"block_table_decode_layer{layer_name}_old_{self.rank}.pt"
+                                ))
                             # update topk_block_table
                             topk = block_table_decode.shape[1]
                             self.new_block_table[self.decode_req_ids, :topk] = block_table_decode

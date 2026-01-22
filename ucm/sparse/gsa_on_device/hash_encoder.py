@@ -317,6 +317,7 @@ class HashEncoder:
 
     def _init_hash_weights(self):
         # Step 1: 随机高斯矩阵
+        torch.manual_seed(42)
         random_weights = torch.normal(
             mean=0,
             std=2,
