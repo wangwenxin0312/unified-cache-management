@@ -35,6 +35,8 @@ esa_retrieval = esa_lib.esa_retrieval
 esa_repre = esa_lib.esa_repre
 esa_copy = esa_lib.esa_copy
 esa_scatter_copy = esa_lib.esa_scatter_copy
+esa_retrieval_poll = esa_lib.esa_retrieval_poll
+esa_retrieval_copy_topk_to_device = esa_lib.esa_retrieval_copy_topk_to_device
 
 @cache
 def get_sparse_range(init_window_sz, local_window_sz, prompt_len, block_size):
@@ -315,11 +317,13 @@ class ESA(UcmSparseBase):
             self.retrieval_input.repre_index = self.sparse_metadata.decode.repre_blocks.gpu
             self.retrieval_input.repre_index_cpu = self.sparse_metadata.decode.repre_blocks.cpu
             self.retrieval_input.batch_offset = self.sparse_metadata.decode.batch_offset
+            self.retrieval_input.topk_offset = self.sparse_metadata.decode.topk_offset
             self.retrieval_input.batch = self.sparse_metadata.num_decodes
             self.retrieval_input.s = self.sparse_metadata.decode.num_repre_blocks
-            esa_retrieval(self.retrieval_input, self.retrieval_output)
+            handle = esa_retrieval(self.retrieval_input, self.retrieval_output)
             score = self.retrieval_output.score
 
+            '''
             # topk outside
             req_score_offsets = self.retrieval_input.batch_offset[: self.sparse_metadata.num_decodes + 1]
             score[self.sparse_metadata.decode.fixed_block_indexes]= torch.inf
@@ -335,14 +339,26 @@ class ESA(UcmSparseBase):
                 # print(f"layer_id {layer_id} start:{s} end:{e} topk:{k} before {topk.indices + s} sort_idx {idx}")
                 topk_idx_per_req.append(idx)
             topk_index = torch.cat(topk_idx_per_req, dim=0)
+            '''
+            # cpu topk
+            
+            while not esa_retrieval_poll(handle):
+                pass
+            topk_offsets = self.sparse_metadata.decode.topk_offset[: self.sparse_metadata.num_decodes + 1]   
+
+            topk_total = int(topk_offsets[self.sparse_metadata.num_decodes])
+            topk_index_dev = torch.empty((topk_total,), device="cuda", dtype=torch.int32)
+            ok = esa_retrieval_copy_topk_to_device(handle, topk_index_dev)
+            assert ok == 1
+
             # print(f"layer_id {layer_id} --repre_blocks {self.sparse_metadata.decode.repre_blocks.gpu[topk_index]} --kv_blocks {self.sparse_metadata.decode.kv_blocks[:self.sparse_metadata.decode.num_blocks]} ")
             k_cache, v_cache = get_kv_cache(forward_context, layer_name)
             esa_scatter_copy(self.host_k_cache[layer_id].flatten(-3), k_cache.flatten(-3),
-                                self.sparse_metadata.decode.repre_blocks.gpu[topk_index], 
+                                self.sparse_metadata.decode.repre_blocks.gpu[topk_index_dev], 
                                 self.sparse_metadata.decode.kv_blocks)
             
             esa_scatter_copy(self.host_v_cache[layer_id].flatten(-3), v_cache.flatten(-3),
-                                self.sparse_metadata.decode.repre_blocks.gpu[topk_index], 
+                                self.sparse_metadata.decode.repre_blocks.gpu[topk_index_dev], 
                                 self.sparse_metadata.decode.kv_blocks)
             
             if self.sparse_metadata.decode.num_leftover_blocks > 0:

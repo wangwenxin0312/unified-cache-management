@@ -9,13 +9,14 @@
 namespace py = pybind11;
 
 extern "C" int esa_retrieval_launcher(torch::Tensor query, torch::Tensor repre_cache, torch::Tensor q_index, torch::Tensor repre_index, torch::Tensor repre_index_cpu,
-        torch::Tensor batch_offset, torch::Tensor score, torch::Tensor score_cpu, torch::Tensor score_sorted_cpu, torch::Tensor index_sorted_cpu,
+        torch::Tensor batch_offset,torch::Tensor topk_offset, torch::Tensor score, torch::Tensor score_cpu, torch::Tensor score_sorted_cpu, torch::Tensor index_sorted_cpu,
         int batch, int s);
 
 extern "C" int esa_retrieval_poll(int handle);
 extern "C" int esa_retrieval_cleanup(int handle);
 extern "C" int esa_retrieval_pending();
 extern "C" void esa_retrieval_shutdown();
+extern "C" int esa_retrieval_copy_topk_to_device(int handle, torch::Tensor topk_index_dev);
 
 extern "C" void esa_topk(torch::Tensor score, torch::Tensor index, torch::Tensor offsets, torch::Tensor score_out, torch::Tensor index_out, torch::Tensor workspace);
 
@@ -34,6 +35,7 @@ struct RetrievalInputTensor{
     torch::Tensor repre_index;
     torch::Tensor repre_index_cpu;
     torch::Tensor batch_offset;
+    torch::Tensor topk_offset;
     int batch;
     int s;
 };
@@ -54,6 +56,7 @@ int esa_retrieval(RetrievalInputTensor input, RetrievalOutputTensor output){
     auto repre_index = input.repre_index;
     auto repre_index_cpu = input.repre_index_cpu;
     auto batch_offset = input.batch_offset;
+    auto topk_offset = input.topk_offset;
 
     auto score = output.score;
     // CPU pinned outputs
@@ -63,7 +66,7 @@ int esa_retrieval(RetrievalInputTensor input, RetrievalOutputTensor output){
 
     return esa_retrieval_launcher(
         query, repre_cache, q_index, repre_index, repre_index_cpu,
-        batch_offset, score,
+        batch_offset, topk_offset, score,
         score_cpu, score_sorted_cpu, index_sorted_cpu,
         input.batch, input.s
     );
@@ -84,6 +87,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("repre_index", &RetrievalInputTensor::repre_index)
         .def_readwrite("repre_index_cpu", &RetrievalInputTensor::repre_index_cpu)
         .def_readwrite("batch_offset", &RetrievalInputTensor::batch_offset)
+        .def_readwrite("topk_offset", &RetrievalInputTensor::topk_offset)
         .def_readwrite("batch", &RetrievalInputTensor::batch)
         .def_readwrite("s", &RetrievalInputTensor::s);
 
@@ -106,4 +110,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("esa_retrieval_cleanup", &esa_retrieval_cleanup, "Cleanup a retrieval handle");
     m.def("esa_retrieval_pending", &esa_retrieval_pending, "Number of pending retrieval contexts");
     m.def("esa_retrieval_shutdown", &esa_retrieval_shutdown, "Shutdown retrieval worker/callback streams");
+    m.def("esa_retrieval_copy_topk_to_device", &esa_retrieval_copy_topk_to_device, "copy topk index to device (returns 0/1)");
 }

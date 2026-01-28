@@ -140,9 +140,10 @@ __global__ void retrieval_kernel_fp16(__half *__restrict__ queries, __half *__re
     }
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
-    int warp_id = tid / numWarps;
+    // int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
+    int warp_id = tid / warp_size;
     int lane_id = tid & (warp_size - 1);
+    int numWarps = (blockDim.x * blockDim.y + warp_size - 1) / warp_size;
 
     auto warp_sum = warpReduceSum(sum);
     if(lane_id == 0){
@@ -186,9 +187,10 @@ __global__ void retrieval_kernel_fp32(float *__restrict__ queries, float *__rest
     }
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
-    int warp_id = tid / numWarps;
+    // int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
+    int warp_id = tid / warp_size;
     int lane_id = tid & (warp_size - 1);
+    int numWarps = (blockDim.x * blockDim.y + warp_size - 1) / warp_size;
 
     auto warp_sum = warpReduceSum(sum);
     if(lane_id == 0){
@@ -231,9 +233,10 @@ __global__ void retrieval_kernel_bf16(__nv_bfloat16 *__restrict__ queries, __nv_
     }
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
-    int warp_id = tid / numWarps;
+    // int numWarps = ceildiv(blockDim.x * blockDim.y, warp_size);
+    int warp_id = tid / warp_size;
     int lane_id = tid & (warp_size - 1);
+    int numWarps = (blockDim.x * blockDim.y + warp_size - 1) / warp_size;
 
     auto warp_sum = warpReduceSum(sum);
     if(lane_id == 0){
@@ -361,7 +364,7 @@ struct RetrievalCtx {
     torch::Tensor repre_index_dev;     // [S] device int32 (input)
     torch::Tensor repre_index_cpu;     // [S] pinned CPU int32 (copied from device)
     torch::Tensor offsets_cpu;         // [B+1] pinned CPU int32 (copied from device)
-
+    torch::Tensor topk_offsets_cpu;    // [B+1] pinned CPU int32 (copied from device)
     // For stream dependency
     cudaEvent_t ready_event{nullptr};
 };
@@ -403,43 +406,64 @@ void worker_loop() {
 
         NVTX_PUSH("worker_argmin");
         // Perform segmented argsort on CPU
-        const int32_t* offsets = job->offsets_cpu.data_ptr<int32_t>();
+        const int32_t* req_offsets = job->offsets_cpu.data_ptr<int32_t>();
+        const int32_t* topk_offsets = job->topk_offsets_cpu.data_ptr<int32_t>();      // [B+1]
+        const int32_t* repre_idx    = job->repre_index_cpu.data_ptr<int32_t>();       // [S]
         int32_t* out_idx = job->index_sorted_cpu.data_ptr<int32_t>();
         auto st = job->score_cpu.scalar_type();
 
-        auto do_segments = [&](auto* scores_ptr, auto* out_scores_ptr) {
-            using T = std::remove_pointer_t<decltype(scores_ptr)>;
+        auto do_segments_topk = [&](auto* scores_ptr) {
             for (int b = 0; b < job->B; ++b) {
-                int s = offsets[b];
-                int e = offsets[b + 1];
-                int n = e - s;
-                if (n <= 0) continue;
+                int32_t s = req_offsets[b];
+                int32_t e = req_offsets[b + 1];
+                int32_t k = topk_offsets[b + 1] - topk_offsets[b];
+                if (k <= 0 || e <= s) continue;
 
-                std::vector<int> idx(n);
-                for (int i = 0; i < n; ++i) idx[i] = i;
-                std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-                    float va = static_cast<float>(scores_ptr[s + a]);
-                    float vb = static_cast<float>(scores_ptr[s + b]);
-                    if (va == vb) return a < b; // stable tie-breaker on original position
-                    return va > vb; // descending
-                });
-                for (int i = 0; i < n; ++i) {
-                    int src = s + idx[i];
-                    out_idx[s + i] = job->repre_index_cpu.data_ptr<int32_t>()[src];
-                    out_scores_ptr[s + i] = scores_ptr[src];
+                int32_t n = e - s;
+                if (k > n) k = n; // avoid  k > segment length
+
+                std::priority_queue<ScoredPos, std::vector<ScoredPos>, MinCmp> heap;
+                heap = decltype(heap)();
+
+                for (int32_t pos = s; pos < e; ++pos) {
+                    float v = static_cast<float>(scores_ptr[pos]);
+
+                    if ((int32_t)heap.size() < k) {
+                        heap.push({v, pos});
+                    } else {
+                        const auto& top = heap.top();
+                        if (v > top.score || (v == top.score && pos < top.pos)) {
+                            heap.pop();
+                            heap.push({v, pos});
+                        }
+                    }
+                }
+
+                std::vector<int32_t> selected_global_idx;
+                selected_global_idx.reserve(k);
+
+                while (!heap.empty()) {
+                    auto x = heap.top();
+                    heap.pop();
+                    selected_global_idx.push_back(repre_idx[x.pos]); // repre_inx
+                }
+
+                std::sort(selected_global_idx.begin(), selected_global_idx.end());
+
+                // 写到拼接输出的位置：topk_offsets 控制写入区间
+                int32_t out_base = topk_offsets[b];
+                for (int32_t i = 0; i < (int32_t)selected_global_idx.size(); ++i) {
+                    out_idx[out_base + i] = selected_global_idx[i];
                 }
             }
         };
-
+        
         if (st == at::kFloat) {
-            do_segments(job->score_cpu.data_ptr<float>(),
-                        job->score_sorted_cpu.data_ptr<float>());
+            do_segments_topk(job->score_cpu.data_ptr<float>());
         } else if (st == at::kHalf) {
-            do_segments(job->score_cpu.data_ptr<at::Half>(),
-                        job->score_sorted_cpu.data_ptr<at::Half>());
+            do_segments_topk(job->score_cpu.data_ptr<at::Half>());
         } else if (st == at::kBFloat16) {
-            do_segments(job->score_cpu.data_ptr<at::BFloat16>(),
-                        job->score_sorted_cpu.data_ptr<at::BFloat16>());
+            do_segments_topk(job->score_cpu.data_ptr<at::BFloat16>());
         } else {
             // Unsupported dtype; mark ready without doing anything
         }
@@ -510,8 +534,40 @@ extern "C" void esa_retrieval_shutdown() {
     }
 }
 
+extern "C" int esa_retrieval_copy_topk_to_device(int handle, torch::Tensor topk_index_dev) {
+    TORCH_CHECK(topk_index_dev.is_cuda(), "topk_index_dev must be CUDA tensor");
+    TORCH_CHECK(topk_index_dev.scalar_type() == at::kInt, "topk_index_dev must be int32");
+
+    RetrievalCtx* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_ctx.find(handle);
+        if (it == g_ctx.end()) return -1;
+        ctx = it->second.get();
+    }
+    if (!ctx->ready.load(std::memory_order_acquire)) return 0; // note:memory_order_acquire是啥
+    const int32_t* topk_offsets = ctx->topk_offsets_cpu.data_ptr<int32_t>(); // 为啥需要（）
+    int topk_total = topk_offsets[ctx->B];
+
+    TORCH_CHECK(topk_index_dev.numel() == topk_total,
+                "topk_index_dev.numel mismatch");
+    
+    auto* src = ctx->index_sorted_cpu.data_ptr<int32_t>();
+    auto* dst = topk_index_dev.data_ptr<int32_t>();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaError_t err = cudaMemcpyAsync(
+        dst, src,
+        sizeof(int32_t) * (size_t)topk_total,
+        cudaMemcpyHostToDevice,
+        stream
+    );
+    TORCH_CHECK(err == cudaSuccess, "H2D memcpy failed: ", cudaGetErrorString(err));
+    return 1;
+}
+
 extern "C" int esa_retrieval_launcher(torch::Tensor query, torch::Tensor repre_cache, torch::Tensor q_index, torch::Tensor repre_index, torch::Tensor repre_index_cpu,
-        torch::Tensor batch_offset, torch::Tensor score, torch::Tensor score_cpu, torch::Tensor score_sorted_cpu, torch::Tensor index_sorted_cpu,
+        torch::Tensor batch_offset, torch::Tensor topk_offset, torch::Tensor score, torch::Tensor score_cpu, torch::Tensor score_sorted_cpu, torch::Tensor index_sorted_cpu,
         int batch, int s){
     TORCH_CHECK(query.dim() == 3, "query dim must be 3");
     TORCH_CHECK(repre_cache.dim() == 3, "repre_cache dim must be 3");
@@ -519,6 +575,7 @@ extern "C" int esa_retrieval_launcher(torch::Tensor query, torch::Tensor repre_c
     TORCH_CHECK(q_index.dtype() == at::kInt, "q_index must be int32 (torch.long)");
     TORCH_CHECK(repre_index.dtype() == at::kInt, "repre_index must be int32 (torch.long)");
     TORCH_CHECK(batch_offset.dtype() == at::kInt, "batch_offset must be int32 (torch.long)");
+    TORCH_CHECK(topk_offset.dtype() == at::kInt, "topk_offset must be int32 (torch.long)");
 
     // CPU pinned outputs must be provided
     TORCH_CHECK(score_cpu.device().is_cpu() && score_cpu.is_pinned() && score_cpu.dim() == 1, "score_cpu must be pinned CPU [s]");
@@ -596,6 +653,7 @@ extern "C" int esa_retrieval_launcher(torch::Tensor query, torch::Tensor repre_c
     ctx->repre_index_dev = repre_index;
     ctx->offsets_cpu = batch_offset;
     ctx->repre_index_cpu = repre_index_cpu;
+    ctx->topk_offsets_cpu = topk_offset;
 
     int handle;
     {

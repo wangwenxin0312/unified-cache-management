@@ -287,7 +287,7 @@ def _patch_attention_layer() -> None:
                 num_actual_toks = attn_metadata.num_actual_tokens
                 if num_actual_toks == 1:
                     self.step += 1
-            with torch.cuda.nvtx.range(f"attn_layer_{layer_name}_step_{self.step}_impl"):
+            with torch.cuda.nvtx.range(f"attn_layer_{layer_name}_step_impl"):
                 self.impl.forward(
                     self,
                     query,
