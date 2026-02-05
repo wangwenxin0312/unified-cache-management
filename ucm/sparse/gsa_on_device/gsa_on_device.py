@@ -544,8 +544,6 @@ class GSAOnDevice(UcmSparseBase):
                     ),
                 )
 
-                # self.new_block_table[self.decode_req_ids, :topk] = block_table_decode[self.decode_req_ids]
-                # self.new_block_table[self.decode_req_ids, topk:] = 0
             attn_metadata.block_table = self.new_block_table
 
             # update seq_lens
