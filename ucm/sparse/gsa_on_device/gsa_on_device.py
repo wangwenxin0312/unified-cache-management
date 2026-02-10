@@ -234,12 +234,17 @@ class GSAOnDevice(UcmSparseBase):
                 dtype=torch.int32,
                 device=self.device,
             )
+            
+            self.topk_block_table_buf = torch.empty_like(self.full_block_table)  # [maxB, maxBlocks]
+            self.topk_seq_lens_buf = torch.empty_like(self.full_seq_lens)        # [maxB]
 
             self._zero_block_table = torch.zeros(
                 (self.max_batch_size, max_block_per_seq),
                 dtype=torch.int32,
                 device=self.device,
             )
+
+            self.topk_seq_lens_qwen_buf = torch.empty_like(self.full_seq_lens)
 
             self.init_for_pc()
 
@@ -520,10 +525,12 @@ class GSAOnDevice(UcmSparseBase):
             # 直接 slice 写入
             self.new_block_table[: self.num_reqs, :topk] = block_table_decode
             self.new_block_table[: self.num_reqs, topk:] = 0
-            attn_metadata.block_table = self.new_block_table
+            # attn_metadata.block_table = self.new_block_table
+            attn_metadata.block_table.copy_(self.new_block_table)
             # update seq_lens
             self.new_seq_lens[: self.num_reqs] = self.topk_seq_lens_qwen
-            attn_metadata.seq_lens = self.new_seq_lens
+            # attn_metadata.seq_lens = self.new_seq_lens
+            attn_metadata.seq_lens.copy_(self.new_seq_lens)
         else:
             self.new_block_table.narrow(1, 0, topk).index_copy_(
                 0,
@@ -552,8 +559,10 @@ class GSAOnDevice(UcmSparseBase):
             )
             attn_metadata.seq_lens = self.new_seq_lens
         # topk for skip layer
-        self.topk_block_table = attn_metadata.block_table
-        self.topk_seq_lens = attn_metadata.seq_lens
+        # self.topk_block_table = attn_metadata.block_table
+        # self.topk_seq_lens = attn_metadata.seq_lens
+        self.topk_block_table_buf[:self.num_reqs].copy_(attn_metadata.block_table)
+        self.topk_seq_lens_buf[:self.num_reqs].copy_(attn_metadata.seq_lens)
 
     def update_decode_topk_gqa_npu(self, query, k_hash, attn_metadata):
         q_start = attn_metadata.query_start_loc
@@ -607,6 +616,7 @@ class GSAOnDevice(UcmSparseBase):
         decode_ql_nope: Optional[torch.Tensor] = None,
         decode_q_pe: Optional[torch.Tensor] = None,
     ):
+        
         attn_metadata = self.get_layer_attn_metadata(forward_context, layer_name)
         # TODO: Should mark MTP layer as rollback layer
         is_rollback_layer, is_skip_hash_layer = self.get_layer_state(layer_name)
@@ -646,10 +656,11 @@ class GSAOnDevice(UcmSparseBase):
                     if is_skip_hash_layer:
                         # 跳层 使用上一个topk结果
                         if self.is_cuda:
-                            attn_metadata.block_table = self.topk_block_table
+                            attn_metadata.block_table.copy_(self.topk_block_table_buf[:self.num_reqs])
+                            attn_metadata.seq_lens.copy_(self.topk_seq_lens_buf[:self.num_reqs])
                         else:
                             attn_metadata.block_tables = self.topk_block_table
-                        attn_metadata.seq_lens = self.topk_seq_lens
+                            attn_metadata.seq_lens = self.topk_seq_lens
                     else:
                         if self.is_cuda:
                             self.update_decode_topk_gqa_cuda(
@@ -689,10 +700,12 @@ class GSAOnDevice(UcmSparseBase):
                 is_rollback_layer, is_skip_hash_layer = self.get_layer_state(layer_name)
                 if not is_rollback_layer:
                     if self.is_cuda:
-                        attn_metadata.block_table = self.ori_block_table_decode
+                        # attn_metadata.block_table = self.ori_block_table_decode
+                        attn_metadata.block_table.copy_(self.ori_block_table_decode)
+                        attn_metadata.seq_lens.copy_(self.ori_seq_lens_decode)
                     else:
                         attn_metadata.block_tables = self.ori_block_table_decode
-                    attn_metadata.seq_lens = self.ori_seq_lens_decode
+                        attn_metadata.seq_lens = self.ori_seq_lens_decode
 
     def request_begin(self, request_id: ReqType, prompt_token_ids: List[int]):
         pass
