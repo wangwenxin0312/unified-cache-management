@@ -113,7 +113,7 @@ class GSAOnDevice(UcmSparseBase):
             raise ValueError(
                 f"Unsupported device type: {vllm_config.device_config.device_type}"
             )
-
+        self.open_gsa = False
         self.num_q_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
@@ -616,7 +616,8 @@ class GSAOnDevice(UcmSparseBase):
         decode_ql_nope: Optional[torch.Tensor] = None,
         decode_q_pe: Optional[torch.Tensor] = None,
     ):
-        
+        if not self.open_gsa:
+            return query, key, value, output
         attn_metadata = self.get_layer_attn_metadata(forward_context, layer_name)
         # TODO: Should mark MTP layer as rollback layer
         is_rollback_layer, is_skip_hash_layer = self.get_layer_state(layer_name)
@@ -683,6 +684,8 @@ class GSAOnDevice(UcmSparseBase):
         forward_context: ForwardContext,
         phase: Optional[str] = None,
     ) -> None:
+        # if not self.open_gsa:
+        #     return
         attn_metadata = self.get_layer_attn_metadata(forward_context, layer_name)
         if self.is_mla:
             if phase == "decode":
@@ -858,8 +861,21 @@ class GSAOnDevice(UcmSparseBase):
     def build_sparse_meta(
         self, scheduler_output, requests, input_batch, attn_metadata
     ) -> UcmSparseMetadata:
+        
         from ucm.sparse.gsa_on_device.hamming_topk import update_seq_lens
-
+        self.num_reqs = len(scheduler_output.num_scheduled_tokens)
+        
+        total_tokens = 0
+        for req_id, req in requests.items():
+            total_tokens += req.num_tokens
+        concurrency_threshold = 4  
+        self.open_gsa = (
+            self.num_reqs > concurrency_threshold
+            and total_tokens > self.num_reqs * self.hash_topk_tokens
+        )
+        if not self.open_gsa:
+            return
+        # print("==build_sparse_meta")
         if not self.is_mla:
             self.has_decode = False
             self.decode_only = False
@@ -879,7 +895,7 @@ class GSAOnDevice(UcmSparseBase):
             )
             self.decode_req_ids_buf.clear()
 
-            self.num_reqs = len(scheduler_output.num_scheduled_tokens)
+            
             for (
                 req_id,
                 num_scheduled_tokens,
@@ -1008,6 +1024,7 @@ class GSAOnDevice(UcmSparseBase):
     def _free_cached_request(self, request_id: Union[int, str]) -> None:
         if request_id not in self.is_prefill_flag:
             return
+        print(f"==_free_cached_request{request_id}")
         del self.is_prefill_flag[request_id]
 
     def update_states(self, scheduler_output: SchedulerOutput) -> None:

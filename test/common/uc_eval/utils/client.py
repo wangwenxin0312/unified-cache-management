@@ -169,7 +169,7 @@ class BaseClient:
 
         for record in records:
             record.input_tokens = len(self.tokenizer.tokenize(record.input_data))
-            record.output_tokens = len(self.tokenizer.tokenize(record.output_data))
+            # record.output_tokens = len(self.tokenizer.tokenize(record.output_data))
             record.tbt_list = record.tbt_list[2:] if record.tbt_list else []
             record.tbt_latency = (
                 sum(record.tbt_list) / record.output_tokens if record.tbt_list else 0
@@ -202,6 +202,7 @@ class BaseClient:
 
         record.request_id = request_id
         record.output_data = output
+        record.output_tokens = result.get("completion_tokens", -1)
         record.is_success = True
         record.end_time = time.time()
         record.req_cost = record.end_time - record.start_time
@@ -212,7 +213,7 @@ class BaseClient:
         output = ""
         if message.get("content", "") is not None:
             output += message.get("content", "")
-        elif message.get("reasoning_content", "") is not None:
+        if message.get("reasoning_content", "") is not None:
             output += message.get("reasoning_content", "")
         return output
 
@@ -319,6 +320,7 @@ class BaseClient:
         record.is_success = True
         record.end_time = time.perf_counter()
         record.req_cost = record.end_time - record.start_time
+        record.output_tokens = payload.get("max_tokens", -1)
         logger.debug(f"{record.request_id} finished, cost: {record.req_cost:.2f}s")
         return record
 

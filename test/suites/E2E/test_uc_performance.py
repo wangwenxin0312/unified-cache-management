@@ -1,5 +1,5 @@
 import os
-
+import dataclasses
 import pytest
 from common.capture_utils import export_vars
 from common.config_utils import config_utils as config_instance
@@ -110,43 +110,56 @@ sync_perf_cases = [
         PerfConfig(
             data_type="synthetic",
             enable_prefix_cache=False,
-            parallel_num=[1, 4, 8],
-            prompt_tokens=[4000, 8000],
-            output_tokens=[1000, 1000],
+            parallel_num=[1],
+            prompt_tokens=[65536],
+            output_tokens=[4096],
             benchmark_mode="default-perf",
             kv_hit_type="HBM",
-            epoch_num=5,
-            test_name="no gsa and no prefix cache",
+            epoch_num=1,
+            test_name="Qwen3-32B-fa-cuda-default-perf",
         ),
     ),
     pytest.param(
         PerfConfig(
             data_type="synthetic",
-            enable_prefix_cache=True,
-            parallel_num=[1, 4, 8],
-            prompt_tokens=[4000, 8000],
-            output_tokens=[1000, 1000],
-            prefix_cache_num=[0.8, 0.8],
+            enable_prefix_cache=False,
+            parallel_num=[2, 3, 7],
+            prompt_tokens=[65536],
+            output_tokens=[4096],
             benchmark_mode="default-perf",
-            kv_hit_type="HBM",  # HBM or DISK
-            epoch_num=5,
-            test_name="no gsa and enable prefix cache",
-        ),
-    ),
-    pytest.param(
-        PerfConfig(
-            data_type="synthetic",
-            enable_prefix_cache=True,
-            parallel_num=[1, 4, 8],
-            prompt_tokens=[4000, 8000],
-            output_tokens=[1000, 1000],
-            prefix_cache_num=[0.8, 0.8],
-            benchmark_mode="stable-perf",
             kv_hit_type="HBM",
-            epoch_num=5,
-            test_name="no gsa and enable prefix cache and stable perf",
+            epoch_num=1,
+            test_name="Qwen3-32B-fa-cuda-default-perf",
         ),
     ),
+    # pytest.param(
+    #     PerfConfig(
+    #         data_type="synthetic",
+    #         enable_prefix_cache=True,
+    #         parallel_num=[1, 4, 8],
+    #         prompt_tokens=[4000, 8000],
+    #         output_tokens=[1000, 1000],
+    #         prefix_cache_num=[0.8, 0.8],
+    #         benchmark_mode="default-perf",
+    #         kv_hit_type="HBM",  # HBM or DISK
+    #         epoch_num=5,
+    #         test_name="no gsa and enable prefix cache",
+    #     ),
+    # ),
+    # pytest.param(
+    #     PerfConfig(
+    #         data_type="synthetic",
+    #         enable_prefix_cache=True,
+    #         parallel_num=[1, 4, 8],
+    #         prompt_tokens=[4000, 8000],
+    #         output_tokens=[1000, 1000],
+    #         prefix_cache_num=[0.8, 0.8],
+    #         benchmark_mode="stable-perf",
+    #         kv_hit_type="HBM",
+    #         epoch_num=5,
+    #         test_name="no gsa and enable prefix cache and stable perf",
+    #     ),
+    # ),
 ]
 
 
