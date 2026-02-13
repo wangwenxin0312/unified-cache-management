@@ -684,8 +684,8 @@ class GSAOnDevice(UcmSparseBase):
         forward_context: ForwardContext,
         phase: Optional[str] = None,
     ) -> None:
-        # if not self.open_gsa:
-        #     return
+        if not self.open_gsa:
+            return
         attn_metadata = self.get_layer_attn_metadata(forward_context, layer_name)
         if self.is_mla:
             if phase == "decode":
@@ -871,11 +871,10 @@ class GSAOnDevice(UcmSparseBase):
         concurrency_threshold = 4  
         self.open_gsa = (
             self.num_reqs > concurrency_threshold
-            and total_tokens > self.num_reqs * self.hash_topk_tokens
+            and total_tokens > self.num_reqs * self.seq_len_threshhold
         )
         if not self.open_gsa:
             return
-        # print("==build_sparse_meta")
         if not self.is_mla:
             self.has_decode = False
             self.decode_only = False
@@ -915,7 +914,7 @@ class GSAOnDevice(UcmSparseBase):
                 )
 
                 # when prompt length < topk_tokens Skip sparse!
-                if req.num_prompt_tokens < self.hash_topk_tokens:
+                if req.num_prompt_tokens < self.seq_len_threshhold:
                     continue
 
                 if is_decode:
