@@ -36,7 +36,7 @@ for i, n in enumerate(num_blocks_per_seq):
 block_table = block_table.cuda()
 print(f"block_table: {block_table}")
 
-key = torch.randn(num_blocks, hk, block_size, hd // 32).to(torch.float32)
+key = torch.randn(num_blocks, block_size, hk, hd // 32).to(torch.float32)
 query = torch.randn(b, sq, h, hd // 32).to(torch.float32)
 key = key.view(torch.int32).cuda()
 query = query.view(torch.int32).cuda()
