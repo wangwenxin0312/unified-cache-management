@@ -827,7 +827,6 @@ class GSAOnDevice(UcmSparseBase):
         self, scheduler_output, requests, input_batch, attn_metadata
     ) -> UcmSparseMetadata:
         from ucm.sparse.gsa_on_device.hamming_topk import update_seq_lens
-
         if not self.is_mla:
             self.has_decode = False
             self.decode_only = False
@@ -867,7 +866,7 @@ class GSAOnDevice(UcmSparseBase):
                 )
 
                 # when prompt length < topk_tokens Skip sparse!
-                if req.num_prompt_tokens < self.hash_topk_tokens:
+                if req.num_prompt_tokens < self.seq_len_threshhold:
                     continue
 
                 if is_decode:
