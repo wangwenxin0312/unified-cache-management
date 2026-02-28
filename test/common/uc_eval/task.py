@@ -119,7 +119,7 @@ class BaseTask(ABC):
         self.enable_clear_hbm = model_config.enable_clear_hbm
         self.save_to_excel = save_to_excel
         self.file_save_path = PathUtil.get_datasets_dir_path(file_save_path).joinpath(
-            self.benchmark_mode, f"{self.data_type}_latency.xlsx"
+            self.benchmark_mode, f"{self.data_type}_latency_gsa_threshold_1.xlsx"
         )
 
         self.dataset, self.client, self.benchmark = TaskFactory.create_task(
