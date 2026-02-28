@@ -1053,7 +1053,7 @@ class GSAOnDevice(UcmSparseBase):
         has_long_seq = bool(
             (seq_lens[: self.num_reqs] >= self.seq_len_threshold).any().item()
         )
-        enough_concurrency = self.num_reqs > self.concurrency_threshold
+        enough_concurrency = self.num_reqs >= self.concurrency_threshold
 
         self.open_gsa = has_long_seq and enough_concurrency
         if not self.open_gsa:
