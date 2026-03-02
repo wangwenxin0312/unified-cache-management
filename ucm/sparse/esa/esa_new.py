@@ -119,7 +119,7 @@ class ESA(UcmSparseBase):
     
     def _init_cache(self):
         # kv and repre cache
-        host_kv_shape = (1000, self.block_size, self.num_kv_heads, self.head_size) # TODO:从config里拿到实际的blocks数量*3
+        host_kv_shape = (10000, self.block_size, self.num_kv_heads, self.head_size) # TODO:从config里拿到实际的blocks数量*3
         self.host_k_cache = [
             torch.zeros(host_kv_shape, dtype=self.dtype, device="cpu", pin_memory=self.pin_memory)
             for _ in range(self.num_layers)
@@ -152,8 +152,8 @@ class ESA(UcmSparseBase):
         self.decode_leftover_repre_blocks = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_req_indexes = self._make_buffer(self.max_num_blocks, dtype=torch.int32)
         self.decode_fixed_indexes = self._make_buffer(self.fixed_window_sz * self.max_num_seqs, dtype=torch.int32)
-        self.decode_batch_offset = torch.zeros(self.max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
-        self.decode_topk_offset = torch.zeros(self.max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
+        self.decode_batch_offset = torch.zeros(self.max_num_seqs + 1, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
+        self.decode_topk_offset = torch.zeros(self.max_num_seqs + 1, dtype=torch.int32, device="cpu", pin_memory=self.pin_memory)
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
