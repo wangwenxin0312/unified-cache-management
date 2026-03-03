@@ -872,7 +872,6 @@ class GSAOnDevice(UcmSparseBase):
 
     def execute_begin(self, scheduler_output: SchedulerOutput):
         self.is_tensor_computed = False
-        self.gsa_enabled = False
 
     def estimate_num_slots_sparsed(self, request: Request) -> int:
         return INVALID_SLOT
@@ -1039,6 +1038,25 @@ class GSAOnDevice(UcmSparseBase):
         else:
             return attn_metadata.block_tables[req_row_id]
 
+    def get_seq_lens(self, attn_metadata, is_mla, is_cuda):
+        if not is_mla:
+            return getattr(attn_metadata, "seq_lens", None)
+
+        attn_metadata_decode = getattr(attn_metadata, "decode", None)
+        if attn_metadata_decode is not None:
+            return getattr(attn_metadata_decode, "seq_lens", None)
+
+        attn_metadata_prefill = getattr(attn_metadata, "prefill", None)
+        if attn_metadata_prefill is None:
+            return None
+
+        if is_cuda:
+            chunked = getattr(attn_metadata_prefill, "chunked_context", None)
+            if chunked is not None:
+                return getattr(chunked, "seq_lens", None)
+
+        return getattr(attn_metadata_prefill, "seq_lens", None)  # NPU
+
     def build_sparse_meta(
         self, scheduler_output, requests, input_batch, attn_metadata
     ) -> UcmSparseMetadata:
@@ -1049,7 +1067,12 @@ class GSAOnDevice(UcmSparseBase):
         if isinstance(attn_metadata, dict):
             attn_metadata = next(iter(attn_metadata.values()))
 
-        seq_lens = attn_metadata.seq_lens
+        self.gsa_enabled = False
+        seq_lens = self.get_seq_lens(attn_metadata, self.is_mla, self.is_cuda)
+
+        if seq_lens is None:
+            return
+
         num_long_reqs = int(
             (seq_lens[: self.num_reqs] >= self.seq_len_threshold).sum().item()
         )
