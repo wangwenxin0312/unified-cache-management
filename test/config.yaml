@@ -27,12 +27,12 @@ results:
 #      retry: 3
 
 models:
-  ip_ports: "0.0.0.0:10035"
+  ip_ports: "0.0.0.0:6699"
   tokenizer_path: "/home/models/Qwen3-32B"
-  served_model_name: "vllm_cpu_offload"
-  payload: '{"temperature":0, "max_tokens":1024, "ignore_eos":false}'
-  enable_clear_hbm: false
-  max_seq_length: 18500
+  served_model_name: "Qwen3-32B"
+  payload: '{"temperature":0, "max_tokens":1024, "ignore_eos":true}'
+  enable_clear_hbm: true
+  max_seq_length: 131072
 
 # LLM Connection Configuration
 llm_connection:
