@@ -11,8 +11,9 @@
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:
-      store_pipeline: "Empty"
-      ishare_buffer_enablet: True
+      store_pipeline: "Cache|Fake"
+      storage_backends: "/home/externals/wangwenxin21/va_ucm_0110/data"
+      
 
 # Enable UCM metrics so they can be monitored online via Grafana and Prometheus.
 # metrics_config_path: "/workspace/unified-cache-management/examples/metrics/metrics_configs.yaml"
