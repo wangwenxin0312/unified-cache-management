@@ -208,10 +208,20 @@ def _posix_pipeline_builder(
     store_dir = Path(__file__).resolve().parent.parent
     pipeline.Stack("Posix", str(store_dir / "posix/libposixstore.so"), config)
 
+def _cache_fake_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    store_dir = Path(__file__).resolve().parent.parent
+    fake_config = copy.deepcopy(config)
+    fake_config["share_buffer_enable"] = True
+    pipeline.Stack("Fake", str(store_dir / "fake/libfakestore.so"), fake_config)
+    pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
 
+    
 UcmPipelineStoreBuilder.register("Cache|Ds3fs", _cache_ds3fs_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Empty", _cache_empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Posix", _cache_posix_pipeline_builder)
+UcmPipelineStoreBuilder.register("Cache|Fake", _cache_fake_pipeline_builder)
 UcmPipelineStoreBuilder.register("Empty", _empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Fake", _fake_pipeline_builder)
 UcmPipelineStoreBuilder.register("Posix", _posix_pipeline_builder)
