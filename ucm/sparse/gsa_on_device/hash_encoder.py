@@ -260,7 +260,6 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
         )
         return k_hash
 
-
     @triton.jit
     def fused_hash_and_cache_kernel(
         x_ptr,
@@ -268,30 +267,23 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
         pack_w_ptr,
         slot_ptr,
         k_cache_ptr,
-
         T,
         H,
         K,
         N_BITS,
         N_BYTES,
-
         stride_xt,
         stride_xh,
         stride_xk,
-
         stride_codek,
         stride_coden,
-
         stride_packw,
-
         stride_cb,
         stride_cs,
         stride_ch,
         stride_cw,
-
         block_size: tl.constexpr,
         cache_num_slots: tl.constexpr,
-
         BLOCK_K: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -352,6 +344,7 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
             + offs_byte * stride_cw
         )
         tl.store(out_ptrs, packed, mask=out_mask)
+
 
 @torch.compile()
 def torch_hash_code(x, code, pack_weight):
@@ -544,7 +537,7 @@ class HashEncoder:
 
     def compute_hash_and_cache(
         self,
-        x: torch.Tensor,             # [T, H, K]
+        x: torch.Tensor,  # [T, H, K]
         slot_mapping: torch.Tensor,  # [T]
         k_hash_cache: torch.Tensor,  # [B, BS, H, ?], uint8 or bf16
         block_size: int = 128,
@@ -563,20 +556,18 @@ class HashEncoder:
             内部 reinterpret 为 uint8 后写 packed hash
         """
         if self.device.type != "cuda":
-            raise NotImplementedError("compute_hash_and_cache currently only supports CUDA")
+            raise NotImplementedError(
+                "compute_hash_and_cache currently only supports CUDA"
+            )
 
         if x.ndim != 3:
             raise ValueError(f"x must be [T,H,K], got {x.shape}")
         if slot_mapping.ndim != 1:
             raise ValueError(f"slot_mapping must be [T], got {slot_mapping.shape}")
         if k_hash_cache.ndim != 4:
-            raise ValueError(
-                f"k_hash_cache must be rank-4, got {k_hash_cache.shape}"
-            )
+            raise ValueError(f"k_hash_cache must be rank-4, got {k_hash_cache.shape}")
         if x.shape[-1] != self.input_dim:
-            raise ValueError(
-                f"x last dim must be {self.input_dim}, got {x.shape[-1]}"
-            )
+            raise ValueError(f"x last dim must be {self.input_dim}, got {x.shape[-1]}")
         if x.device != self.device:
             raise ValueError(
                 f"x device {x.device} does not match required device {self.device}"
@@ -596,9 +587,7 @@ class HashEncoder:
         B, BS, H_cache, _ = k_hash_cache.shape
 
         if slot_mapping.shape[0] != T:
-            raise ValueError(
-                f"slot_mapping length {slot_mapping.shape[0]} != T {T}"
-            )
+            raise ValueError(f"slot_mapping length {slot_mapping.shape[0]} != T {T}")
         if BS != block_size:
             raise ValueError(f"k_hash_cache.shape[1]={BS} != block_size={block_size}")
         if H_cache != H:
@@ -639,30 +628,23 @@ class HashEncoder:
             pack_w_ptr=self.bit_masks,
             slot_ptr=slot_mapping,
             k_cache_ptr=k_hash_cache_u8,
-
             T=T,
             H=H,
             K=K,
             N_BITS=self.hash_bits,
             N_BYTES=self.hash_numbers,
-
             stride_xt=stride_xt,
             stride_xh=stride_xh,
             stride_xk=stride_xk,
-
             stride_codek=stride_codek,
             stride_coden=stride_coden,
-
             stride_packw=stride_packw,
-
             stride_cb=stride_cb,
             stride_cs=stride_cs,
             stride_ch=stride_ch,
             stride_cw=stride_cw,
-
             block_size=block_size,
             cache_num_slots=cache_num_slots,
-
             BLOCK_K=BLOCK_K,
             BLOCK_N=BLOCK_N,
             num_warps=num_warps,

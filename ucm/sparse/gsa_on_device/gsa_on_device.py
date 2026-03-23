@@ -565,7 +565,6 @@ class GSAOnDevice(UcmSparseBase):
     def cache_k_hash_gqa_cuda(
         self, key, attn_metadata, k_hash, forward_context, layer_name
     ):
-        # k_hash_compute = self.hash_encoder.compute_hash(key).view(torch.bfloat16)
         valid_k_hash_token = attn_metadata.slot_mapping.flatten().numel()
         self.hash_encoder.compute_hash_and_cache(
             key[:valid_k_hash_token],
@@ -573,12 +572,7 @@ class GSAOnDevice(UcmSparseBase):
             k_hash,
             block_size=self.block_size,
         )
-        # reshape_and_cache_khash_triton(
-        #     k_hash_compute[:valid_k_hash_token],
-        #     attn_metadata.slot_mapping.flatten(),
-        #     k_hash,
-        #     block_size=self.block_size,
-        # )
+
         if self.has_pc_hit:
             ## 重新捞取所有token的key
             attn = forward_context.no_compile_layers[layer_name]
@@ -586,7 +580,7 @@ class GSAOnDevice(UcmSparseBase):
 
             k_cache = kv_cache[0][0][self.prefix_block_ids]
             k_cache = k_cache.reshape(-1, k_cache.shape[2], k_cache.shape[3])
-            
+
             prefix_valid_k_hash_token = self.prefix_slot_mapping.flatten().numel()
             self.hash_encoder.compute_hash_and_cache(
                 k_cache[:prefix_valid_k_hash_token],
@@ -594,17 +588,6 @@ class GSAOnDevice(UcmSparseBase):
                 k_hash,
                 block_size=self.block_size,
             )
-            
-            # prefix_k_hash_compute = self.hash_encoder.compute_hash(k_cache).view(
-            #     torch.bfloat16
-            # )
-            
-            # reshape_and_cache_khash_triton(
-            #     prefix_k_hash_compute[:prefix_valid_k_hash_token],
-            #     self.prefix_slot_mapping.flatten(),
-            #     k_hash,
-            #     block_size=self.block_size,
-            # )
 
     def cache_k_hash_gqa_npu(
         self, key, k_hash, attn_metadata, forward_context, layer_name
