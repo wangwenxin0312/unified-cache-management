@@ -164,8 +164,10 @@ class GSAOnDevice(UcmSparseBase):
         if role != UcmSparseRole.WORKER:
             return
 
+        self.use_graph = False
         if self.is_cuda:  # cuda only variables
             if not vllm_config.model_config.enforce_eager:
+                self.use_graph = True
                 device_properties = torch.cuda.get_device_properties(self.device)
                 num_sms = device_properties.multi_processor_count
                 self.cg_buf_topk_tile_scheduler_metadata = torch.zeros(
@@ -194,6 +196,11 @@ class GSAOnDevice(UcmSparseBase):
         self.topk_seq_lens = None
         self.topk_seq_lens_qwen = None
         self.has_pc_hit = False
+
+        # for MLA
+        self.topk_seq_lens_mla = None
+        self.topk_tile_scheduler_metadata = None
+        self.topk_num_splits = None
 
         self.is_prefill_flag: dict[str, bool] = dict()
 
@@ -713,9 +720,9 @@ class GSAOnDevice(UcmSparseBase):
                 )
                 attn_metadata.decode.topk_block_table = block_table
 
-            seq_lens = attn_metadata.decode.topk_seq_lens
-            tile_scheduler_metadata = attn_metadata.decode.topk_tile_scheduler_metadata
-            num_splits = attn_metadata.decode.topk_num_splits
+            seq_lens = self.topk_seq_lens_mla
+            tile_scheduler_metadata = self.topk_tile_scheduler_metadata
+            num_splits = self.topk_num_splits
 
             self.ori_block_table_decode = attn_metadata.decode.block_table
             self.ori_seq_lens_decode = attn_metadata.decode.seq_lens
@@ -1164,20 +1171,6 @@ class GSAOnDevice(UcmSparseBase):
                     khash_cache = None
                 kv_caches[layer_name] = (kv_cache, khash_cache)
 
-    def build_decode_hash(self, seq_lens):
-        from ucm.sparse.gsa_on_device.hamming_topk import update_seq_lens
-
-        topk_seq_lens = update_seq_lens(
-            seq_lens,
-            topk_token=self.hash_topk_tokens,
-            block_size=self.block_size,
-        )
-        topk_tile_scheduler_metadata, topk_num_splits = get_mla_metadata(
-            topk_seq_lens,
-            self.num_q_heads,
-            1,
-        )
-        return topk_seq_lens, topk_tile_scheduler_metadata, topk_num_splits
 
     def build_decode_attention_meta_npu(self, query_lens, seq_lens, block_table):
 
@@ -1187,6 +1180,7 @@ class GSAOnDevice(UcmSparseBase):
         self.ori_block_table_decode = block_table.clone()
 
         if self.is_mla:
+            # TODO: only decode need
             self.new_seq_lens = update_seq_lens(
                 seq_lens,
                 topk_token=self.hash_topk_tokens,
@@ -1320,31 +1314,47 @@ class GSAOnDevice(UcmSparseBase):
     def prepare_cuda_decode_sparse_meta(self, attn_metadata, num_decodes):
         from ucm.sparse.gsa_on_device.hamming_topk import update_seq_lens
 
-        # for roll_back recode the full seqlens & block_table
-        self.full_seq_lens[: self.num_reqs].copy_(attn_metadata.seq_lens, True)
-        self.full_block_table[: self.num_reqs].copy_(attn_metadata.block_table, True)
+        if self.is_mla:
+            attn_metadata_decode = getattr(attn_metadata, "decode", None)
+            if attn_metadata_decode is not None:
+                self.topk_seq_lens_mla = update_seq_lens(
+                    attn_metadata.decode.seq_lens,
+                    topk_token=self.hash_topk_tokens,
+                    block_size=self.block_size,
+                    )
+                self.topk_tile_scheduler_metadata, self.topk_num_splits = get_mla_metadata(
+                    self.topk_seq_lens_mla,
+                    self.num_q_heads,
+                    1,
+                )
+                if self.use_graph:
+                    self.topk_tile_scheduler_metadata, self.topk_num_splits, self.topk_seq_lens_mla  = self.maybe_init_cudagraph_buffers_for_topk(attn_metadata_decode.num_splits.size(0), attn_metadata_decode.tile_scheduler_metadata, self.topk_tile_scheduler_metadata, self.topk_num_splits, self.topk_seq_lens_mla)
+        else:     
+            # for roll_back recode the full seqlens & block_table
+            self.full_seq_lens[: self.num_reqs].copy_(attn_metadata.seq_lens, True)
+            self.full_block_table[: self.num_reqs].copy_(attn_metadata.block_table, True)
 
-        self.ori_seq_lens_decode = self.full_seq_lens[: self.num_reqs]
-        self.ori_block_table_decode = self.full_block_table[: self.num_reqs]
+            self.ori_seq_lens_decode = self.full_seq_lens[: self.num_reqs]
+            self.ori_block_table_decode = self.full_block_table[: self.num_reqs]
 
-        if not self.decode_only:
-            self.decode_req_ids_buf.copy_to_gpu(num_decodes)
-            self.decode_req_ids = self.decode_req_ids_buf.gpu[:num_decodes]
+            if not self.decode_only:
+                self.decode_req_ids_buf.copy_to_gpu(num_decodes)
+                self.decode_req_ids = self.decode_req_ids_buf.gpu[:num_decodes]
 
-        _topk = update_seq_lens(
-            attn_metadata.seq_lens,
-            topk_token=self.hash_topk_tokens,
-            block_size=self.block_size,
-        )
-        self.cg_buf_topk_seq_lens_qwen[: self.num_reqs].copy_(_topk)
-        self.topk_seq_lens_qwen = self.cg_buf_topk_seq_lens_qwen[: self.num_reqs]
+            _topk = update_seq_lens(
+                attn_metadata.seq_lens,
+                topk_token=self.hash_topk_tokens,
+                block_size=self.block_size,
+            )
+            self.cg_buf_topk_seq_lens_qwen[: self.num_reqs].copy_(_topk)
+            self.topk_seq_lens_qwen = self.cg_buf_topk_seq_lens_qwen[: self.num_reqs]
 
-        
-        self.new_block_table = attn_metadata.block_table
-        self.new_seq_lens = attn_metadata.seq_lens
-        # Pre-fill new_seq_lens with the topk values computed above so they are
-        # ready before the attention kernel runs (updated in-place per layer).
-        # self.new_seq_lens.copy_(self.topk_seq_lens_qwen[: self.num_reqs])
+            
+            self.new_block_table = attn_metadata.block_table
+            self.new_seq_lens = attn_metadata.seq_lens
+            # Pre-fill new_seq_lens with the topk values computed above so they are
+            # ready before the attention kernel runs (updated in-place per layer).
+            # self.new_seq_lens.copy_(self.topk_seq_lens_qwen[: self.num_reqs])
 
     def build_sparse_meta(
         self, scheduler_output, requests, input_batch, attn_metadata
@@ -1470,7 +1480,7 @@ class GSAOnDevice(UcmSparseBase):
             if not self.is_cuda:
                 self.prefix_token_len = self.prefix_token_len_full[:num_pc_hit]
 
-        if self.is_mla or not self.gsa_enabled:
+        if not self.gsa_enabled:
             return
 
         # Build decode sparse metadata for CUDA GQA only.
