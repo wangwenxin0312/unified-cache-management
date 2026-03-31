@@ -10,7 +10,7 @@ from typing import Optional
 
 import torch
 from vllm.config import VllmConfig
-from vllm.forward_context import ForwardContext
+from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 
 from ucm.logger import init_logger
 from ucm.sparse.base import UcmSparseBase, UcmSparseRole
@@ -163,4 +163,58 @@ def maybe_execute_sparse_attention_finished(
 
     ucm_sparse.attention_finished(
         query, key, value, attn_output, layer_name, forward_context, phase
+    )
+
+def update_current_batch_descriptor_for_ucm_sparse() -> None:
+    if not has_ucm_sparse():
+        return
+
+    forward_context = get_forward_context()
+    batch_descriptor = forward_context.batch_descriptor
+    if batch_descriptor is None:
+        return
+
+    ucm_sparse = get_ucm_sparse()
+    sparse_decode = bool(
+        getattr(ucm_sparse, "gsa_enabled", False)
+        and getattr(ucm_sparse, "has_decode", False)
+    )
+    if batch_descriptor.sparse_decode == sparse_decode:
+        return
+
+    forward_context.batch_descriptor = BatchDescriptor(
+        num_tokens=batch_descriptor.num_tokens,
+        uniform_decode=batch_descriptor.uniform_decode,
+        sparse_decode=sparse_decode,
+    )
+
+    logger.info(
+        "[ucm_sparse] switched batch_descriptor to num_tokens=%s uniform_decode=%s "
+        "sparse_decode=%s runtime_mode=%s",
+        batch_descriptor.num_tokens,
+        batch_descriptor.uniform_decode,
+        sparse_decode,
+        forward_context.cudagraph_runtime_mode.name,
+    )
+
+def set_current_batch_descriptor_sparse_decode(sparse_decode: bool) -> None:
+    forward_context = get_forward_context()
+    batch_descriptor = forward_context.batch_descriptor
+    if batch_descriptor is None:
+        return
+    if batch_descriptor.sparse_decode == sparse_decode:
+        return
+
+    forward_context.batch_descriptor = BatchDescriptor(
+        num_tokens=batch_descriptor.num_tokens,
+        uniform_decode=batch_descriptor.uniform_decode,
+        sparse_decode=sparse_decode,
+    )
+    logger.info(
+        "[ucm_sparse] force batch_descriptor to num_tokens=%s uniform_decode=%s "
+        "sparse_decode=%s runtime_mode=%s",
+        batch_descriptor.num_tokens,
+        batch_descriptor.uniform_decode,
+        sparse_decode,
+        forward_context.cudagraph_runtime_mode.name,
     )
