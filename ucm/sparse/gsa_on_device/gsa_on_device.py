@@ -682,8 +682,8 @@ class GSAOnDevice(UcmSparseBase):
     ):
         if not is_rollback_layer:
             if is_skip_hash_layer:
-                assert attn_metadata.decode.topk_block_table is not None
-                block_table = attn_metadata.decode.topk_block_table
+                # assert attn_metadata.decode.topk_block_table is not None
+                block_table = self.topk_block_table
             else:
                 q_nope_hash, q_rope_hash = self.hash_code(
                     nope=decode_ql_nope,
@@ -702,7 +702,8 @@ class GSAOnDevice(UcmSparseBase):
                     recent_token=self.block_size * 4,
                     is_mla=self.is_mla,
                 )
-                attn_metadata.decode.topk_block_table = block_table
+                # attn_metadata.decode.topk_block_table = block_table
+                self.topk_block_table = block_table
 
             seq_lens = self.topk_seq_lens_mla
             tile_scheduler_metadata = self.topk_tile_scheduler_metadata
@@ -719,6 +720,7 @@ class GSAOnDevice(UcmSparseBase):
             attn_metadata.decode.seq_lens = seq_lens
             attn_metadata.decode.tile_scheduler_metadata = tile_scheduler_metadata
             attn_metadata.decode.num_splits = num_splits
+            # logger.info(f"[update_decode_topk_mla_cuda] type:{type(attn_metadata.decode.seq_lens)}")
 
     def update_decode_topk_mla_npu(
         self,
@@ -1335,6 +1337,10 @@ class GSAOnDevice(UcmSparseBase):
                 req_row_id = input_batch.req_id_to_index[req_id]
 
                 cur_qlen = compute_q_lens[req_row_id]
+                
+                if cur_qlen == 1 and self.is_mla:
+                    num_decodes += 1
+
                 ext_tokens = int(
                     scheduler_output.num_external_computed_tokens_per_req.get(req_id, 0)
                 )
@@ -1389,9 +1395,9 @@ class GSAOnDevice(UcmSparseBase):
         if self.has_decode and self.is_cuda:
             self.prepare_cuda_decode_sparse_meta(attn_metadata, num_decodes)
 
-    def prepare_full_cudagraph_capture(self, attn_metadata) -> bool:
+    def build_dummy_sparse_meta(self, attn_metadata) -> bool:
         if not (self.is_cuda):
-            logger.info("[gsaondevice-cg] skip sparse capture prep: is_cuda=%s", self.is_cuda)
+            logger.info("[gsaondevice-cg] skip sparse capture prep: is_cuda={self.is_cuda}")
             return False
 
         if isinstance(attn_metadata, dict):
@@ -1410,18 +1416,15 @@ class GSAOnDevice(UcmSparseBase):
             int((seq_lens[: self.num_reqs] >= self.seq_len_threshold).sum().item())
             >= 1
         )
+        # self.gsa_enabled = False
         if not self.gsa_enabled:
             logger.info(
-                "[gsaondevice-cg] sparse capture disabled: num_reqs=%s threshold=%s "
-                "concurrency_threshold=%s seq_lens=%s",
-                self.num_reqs,
-                self.seq_len_threshold,
-                self.concurrency_threshold,
-                seq_lens[: self.num_reqs],
+                "[gsaondevice-cg] sparse capture disabled: num_reqs={self.num_reqs} threshold={self.seq_len_threshold} "
+                "concurrency_threshold={self.concurrency_threshold} seq_lens={seq_lens[: self.num_reqs]}"
             )
             return False
 
-        # self.prepare_cuda_decode_sparse_meta(attn_metadata, self.num_reqs)
+        self.prepare_cuda_decode_sparse_meta(attn_metadata, self.num_reqs)
         # logger.info(
         #     "[gsaondevice-cg] prepared sparse full-capture: num_reqs=%s "
         #     "has_decode=%s decode_only=%s gsa_enabled=%s",

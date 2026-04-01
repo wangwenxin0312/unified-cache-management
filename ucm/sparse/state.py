@@ -188,14 +188,6 @@ def update_current_batch_descriptor_for_ucm_sparse() -> None:
         sparse_decode=sparse_decode,
     )
 
-    logger.info(
-        "[ucm_sparse] switched batch_descriptor to num_tokens=%s uniform_decode=%s "
-        "sparse_decode=%s runtime_mode=%s",
-        batch_descriptor.num_tokens,
-        batch_descriptor.uniform_decode,
-        sparse_decode,
-        forward_context.cudagraph_runtime_mode.name,
-    )
 
 def set_current_batch_descriptor_sparse_decode(sparse_decode: bool) -> None:
     forward_context = get_forward_context()
@@ -209,12 +201,4 @@ def set_current_batch_descriptor_sparse_decode(sparse_decode: bool) -> None:
         num_tokens=batch_descriptor.num_tokens,
         uniform_decode=batch_descriptor.uniform_decode,
         sparse_decode=sparse_decode,
-    )
-    logger.info(
-        "[ucm_sparse] force batch_descriptor to num_tokens=%s uniform_decode=%s "
-        "sparse_decode=%s runtime_mode=%s",
-        batch_descriptor.num_tokens,
-        batch_descriptor.uniform_decode,
-        sparse_decode,
-        forward_context.cudagraph_runtime_mode.name,
     )
