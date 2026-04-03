@@ -1,7 +1,7 @@
-From ce508dea471e7dd240e8bfaaaa6a29dfc73d53fc Mon Sep 17 00:00:00 2001
+From dd71451fa8f42051e4810e2fcec12ae83a260165 Mon Sep 17 00:00:00 2001
 From: AooooooA-C <chenaozhu@outlook.com>
 Date: Mon, 19 Jan 2026 23:03:08 -0800
-Subject: [PATCH 1/4] apply sparse method patches
+Subject: [PATCH 1/5] apply sparse method patches
 
 ---
  vllm/attention/layer.py                    | 63 +++++++++++++++
@@ -865,10 +865,10 @@ index 8c75e8914..c3e9e781f 100644
 2.34.1
 
 
-From d9eed9606eb5bffcb14ef0c66a1697f5f4cc8319 Mon Sep 17 00:00:00 2001
+From a5dc32d249c010caa9c5fd2405c3116afbd45279 Mon Sep 17 00:00:00 2001
 From: Qiong Wu <wq674452797@gmail.com>
 Date: Sat, 31 Jan 2026 16:06:09 +0800
-Subject: [PATCH 2/4] update sparse patch for vllm
+Subject: [PATCH 2/5] update sparse patch for vllm
 
 ---
  vllm/attention/layer.py                  | 51 ++----------------------
@@ -977,10 +977,10 @@ index 86771060c..f2bac0202 100644
 2.34.1
 
 
-From 5175c05806154fbdf09af0d1f135fafd01367d5c Mon Sep 17 00:00:00 2001
+From ddf6150d353d643dec62047bcf3c1c7fabc24cee Mon Sep 17 00:00:00 2001
 From: wenxinwang <wangwenxin21@huawei.com>
 Date: Wed, 4 Feb 2026 18:14:49 -0800
-Subject: [PATCH 3/4] [bugfix] gsa graph patch
+Subject: [PATCH 3/5] gsa graph patch
 
 ---
  vllm/v1/attention/backends/mla/flashmla.py |  2 +-
@@ -1048,10 +1048,10 @@ index dca14b5d3..964f8f0a4 100644
 2.34.1
 
 
-From f635d244b74f308d55d703aa2e05684ec0db7c3e Mon Sep 17 00:00:00 2001
+From ebc5a019b9137df31f86b20e85931a5bdbcd0e79 Mon Sep 17 00:00:00 2001
 From: wenxinwang <wangwenxin21@huawei.com>
 Date: Tue, 10 Mar 2026 06:10:44 -0700
-Subject: [PATCH 4/4] [bugfix] Fix CUDA full graph for DeepSeek implementation
+Subject: [PATCH 4/5] Fix CUDA full graph for DeepSeek implementation
 
 ---
  vllm/v1/attention/backends/mla/flashmla.py | 5 ++++-
@@ -1073,6 +1073,242 @@ index c4f4cf847..8f77eaea6 100644
  
          return FlashMLADecodeMetadata(
              block_table=block_table_tensor,
+-- 
+2.34.1
+
+
+From c3221754fa64c9b707c9631021659e3a49f687c7 Mon Sep 17 00:00:00 2001
+From: wenxinwang <wangwenxin21@huawei.com>
+Date: Thu, 2 Apr 2026 23:13:42 -0700
+Subject: [PATCH 5/5] [opt] cuda full graph
+
+---
+ vllm/forward_context.py                    |  7 +-
+ vllm/v1/attention/backends/mla/flashmla.py | 25 +------
+ vllm/v1/worker/gpu_model_runner.py         | 76 +++++++++++++++++++++-
+ 3 files changed, 83 insertions(+), 25 deletions(-)
+
+diff --git a/vllm/forward_context.py b/vllm/forward_context.py
+index 344628e88..0ef42beed 100644
+--- a/vllm/forward_context.py
++++ b/vllm/forward_context.py
+@@ -36,6 +36,7 @@ class BatchDescriptor(NamedTuple):
+     """
+     num_tokens: int
+     uniform_decode: bool = False
++    sparse_decode: bool = False
+     """
+     False can also be used for an uniform decode batch to dispatch to the 
+     cudagraph supporting non-uniform batches.
+@@ -46,7 +47,11 @@ class BatchDescriptor(NamedTuple):
+         """
+         Return a non-uniform version of current batch descriptor.
+         """
+-        return BatchDescriptor(self.num_tokens, uniform_decode=False)
++        return BatchDescriptor(
++            self.num_tokens,
++            uniform_decode=False,
++            sparse_decode=self.sparse_decode,
++        )
+ 
+ 
+ def _compute_sp_num_tokens(num_tokens_across_dp_cpu: torch.Tensor,
+diff --git a/vllm/v1/attention/backends/mla/flashmla.py b/vllm/v1/attention/backends/mla/flashmla.py
+index 8f77eaea6..80642b4ba 100644
+--- a/vllm/v1/attention/backends/mla/flashmla.py
++++ b/vllm/v1/attention/backends/mla/flashmla.py
+@@ -5,7 +5,6 @@ from dataclasses import dataclass
+ from typing import ClassVar, Optional, Union
+ 
+ import torch
+-import os
+ 
+ from vllm.attention.backends.abstract import AttentionLayer, AttentionType
+ from vllm.attention.ops.flashmla import (flash_mla_with_kvcache,
+@@ -21,7 +20,6 @@ from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
+ from vllm.v1.attention.backends.utils import AttentionCGSupport
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+-from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
+ 
+ logger = init_logger(__name__)
+ 
+@@ -49,10 +47,7 @@ class FlashMLABackend(MLACommonBackend):
+ class FlashMLADecodeMetadata(MLACommonDecodeMetadata):
+     tile_scheduler_metadata: torch.Tensor
+     num_splits: torch.Tensor
+-    topk_seq_lens: torch.Tensor
+-    topk_tile_scheduler_metadata: torch.Tensor
+-    topk_num_splits: torch.Tensor
+-    topk_block_table: torch.Tensor = None
++
+ 
+ 
+ @dataclass
+@@ -103,14 +98,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
+             self.num_q_heads,
+             1, # MQA for the decode path
+         )
+-        topk_seq_lens = None
+-        topk_tile_scheduler_metadata = None
+-        topk_num_splits = None
+-        if has_ucm_sparse():
+-            ucm_sparse = get_ucm_sparse()
+-            if os.getenv("VLLM_HASH_ATTENTION") == "1":
+-                topk_seq_lens, topk_tile_scheduler_metadata, topk_num_splits = ucm_sparse.build_decode_hash(seq_lens_device)
+-
++        
+         # TODO: we can disambiguate between decode and mixed-prefill decode here
+         # so we can only use the persistent buffer if a cudagraph is actually
+         # being used.
+@@ -137,19 +125,12 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
+             #  it needs to monotonically increasing by 1)
+             self.cg_buf_num_splits[n:].fill_(num_splits[-1])
+             num_splits = num_splits_view
+-            if has_ucm_sparse():
+-                ucm_sparse = get_ucm_sparse()
+-                if os.getenv("VLLM_HASH_ATTENTION") == "1":
+-                    topk_tile_scheduler_metadata, topk_num_splits, topk_seq_lens  = ucm_sparse.maybe_init_cudagraph_buffers_for_topk(n, tile_scheduler_metadata, topk_tile_scheduler_metadata, topk_num_splits, topk_seq_lens)
+-
++           
+         return FlashMLADecodeMetadata(
+             block_table=block_table_tensor,
+             seq_lens=seq_lens_device,
+             tile_scheduler_metadata=tile_scheduler_metadata,
+             num_splits=num_splits,
+-            topk_seq_lens=topk_seq_lens,
+-            topk_tile_scheduler_metadata=topk_tile_scheduler_metadata,
+-            topk_num_splits=topk_num_splits,
+         )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index d7c6a8e0a..3e5143925 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -115,7 +115,9 @@ from .utils import (AttentionGroup, MultiModalBudget,
+                     gather_mm_placeholders, sanity_check_mm_encoder_outputs,
+                     scatter_mm_placeholders)
+ 
+-from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.state import (get_ucm_sparse, has_ucm_sparse,
++                              set_current_batch_descriptor_sparse_decode,
++                              update_current_batch_descriptor_for_ucm_sparse)
+ from ucm.sparse.base import INVALID_SLOT
+ 
+ if TYPE_CHECKING:
+@@ -2631,6 +2633,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+                 uc_setup_model(self.model)
+         ucm_sparse = get_ucm_sparse()
+         ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
++        update_current_batch_descriptor_for_ucm_sparse()
+         ucm_sparse.execute_begin(scheduler_output)
+ 
+     def maybe_execute_ucm_sparse_finished(self, logits_indices):
+@@ -2967,6 +2970,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
+         force_attention: bool = False,
+         uniform_decode: bool = False,
++        force_ucm_sparse_decode: bool = False,
+         allow_microbatching: bool = True,
+         skip_eplb: bool = False,
+         is_profile: bool = False,
+@@ -3092,11 +3096,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+             if ubatch_slices is not None:
+                 attn_metadata = [dict() for _ in range(len(ubatch_slices))]
+ 
++            ucm_sparse_capture_seq_len = None
++            if (force_ucm_sparse_decode and uniform_decode and has_ucm_sparse()):
++                ucm_sparse = get_ucm_sparse()
++    
++                ucm_sparse_capture_seq_len = max(
++                        int(ucm_sparse.seq_len_threshold),
++                        int(ucm_sparse.hash_topk_tokens + ucm_sparse.block_size),
++                    )
++
+             if create_mixed_batch:
+                 # In the mixed batch mode (used for FI warmup), we use
+                 # shorter sequence lengths to run faster.
+                 # TODO(luka) better system for describing dummy batches
+                 seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
++            elif ucm_sparse_capture_seq_len is not None:
++                seq_lens = [ucm_sparse_capture_seq_len] * num_reqs
+             else:
+                 seq_lens = max_query_len
+             self.seq_lens.np[:num_reqs] = seq_lens
+@@ -3216,6 +3231,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+                     cudagraph_runtime_mode=cudagraph_runtime_mode,
+                     batch_descriptor=batch_descriptor,
+                     ubatch_slices=ubatch_slices):
++                if has_ucm_sparse():
++                    ucm_sparse = get_ucm_sparse()
++                   
++                    set_current_batch_descriptor_sparse_decode(False)
++
++                    if force_ucm_sparse_decode:
++                        prepared = getattr(
++                            ucm_sparse,
++                            "build_dummy_sparse_meta",
++                            lambda *_: False,
++                        )(attn_metadata)
++                        if prepared:
++                            update_current_batch_descriptor_for_ucm_sparse()
+                 outputs = self.model(
+                     input_ids=input_ids,
+                     positions=positions,
+@@ -3578,7 +3606,51 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+                     num_tokens=num_tokens,
+                     uniform_decode=uniform_decode,
+                 )
+-
++            if (uniform_decode
++                    and cudagraph_runtime_mode == CUDAGraphMode.FULL
++                    and os.getenv("VLLM_HASH_ATTENTION") == "1"
++                    and has_ucm_sparse()):
++                # ucm_sparse = get_ucm_sparse()
++                # if getattr(ucm_sparse, "is_cuda", False):
++                #     sparse_capture_num_reqs = cdiv(
++                #         num_tokens, self.uniform_decode_query_len
++                #     )
++                    # sparse_capture_enabled = (
++                    #     sparse_capture_num_reqs
++                    #     >= int(getattr(ucm_sparse, "concurrency_threshold", 1))
++                    # )
++                    # if not sparse_capture_enabled:
++                    #     logger.info(
++                    #         "[ucm_sparse-cg] skip sparse full capture: num_tokens=%s "
++                    #         "uniform_decode=%s num_reqs=%s concurrency_threshold=%s",
++                    #         num_tokens,
++                    #         uniform_decode,
++                    #         sparse_capture_num_reqs,
++                    #         getattr(ucm_sparse, "concurrency_threshold", 1),
++                    #     )
++                    # else:
++                for _ in range(
++                    self.compilation_config.cudagraph_num_of_warmups
++                ):
++                    self._dummy_run(
++                        num_tokens,
++                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
++                        force_attention=True,
++                        uniform_decode=uniform_decode,
++                        force_ucm_sparse_decode=True,
++                        allow_microbatching=allow_microbatching,
++                        skip_eplb=True,
++                        remove_lora=False,
++                    )
++                self._dummy_run(
++                    num_tokens,
++                    cudagraph_runtime_mode=cudagraph_runtime_mode,
++                    uniform_decode=uniform_decode,
++                    force_ucm_sparse_decode=True,
++                    allow_microbatching=allow_microbatching,
++                    skip_eplb=True,
++                    remove_lora=False,
++                )
+             for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
+                 # But be careful, warm up with `NONE`is orthogonal to
 -- 
 2.34.1
 
