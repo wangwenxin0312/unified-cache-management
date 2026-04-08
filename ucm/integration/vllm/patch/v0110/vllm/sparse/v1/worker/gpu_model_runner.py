@@ -160,6 +160,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class GsaBatchDescriptor(NamedTuple):
+    """
+    Extended BatchDescriptor that distinguishes GSA-enabled from GSA-disabled
+    decode graphs. The extra ``gsa_enabled`` field makes the hash/equality
+    differ from a plain BatchDescriptor, so CUDAGraphWrapper stores a separate
+    captured graph for each (num_tokens, uniform_decode, gsa_enabled) triple.
+    """
+    num_tokens: int
+    uniform_decode: bool = False
+    gsa_enabled: bool = False
+
+    @property
+    def non_uniform(self) -> "GsaBatchDescriptor":
+        return GsaBatchDescriptor(
+            self.num_tokens,
+            uniform_decode=False,
+            gsa_enabled=self.gsa_enabled,
+        )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
@@ -802,11 +822,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
                 num_scheduled_tokens == self.input_batch.num_reqs * max_query_len
             )
+
+            # Phase-1: compute gsa_enabled / has_decode BEFORE dispatch so we
+            # can route to the correct (GSA-on or GSA-off) CUDA graph.
+            self._ucm_sparse_build_meta(scheduler_output, attn_metadata)
+
             batch_descriptor = BatchDescriptor(
                 num_tokens=num_input_tokens, uniform_decode=uniform_decode
             )
+            # Wrap batch_descriptor with gsa_enabled flag when GSA is active so
+            # that a separate graph is captured/replayed for each mode.
+            gsa_batch_descriptor = self._make_gsa_batch_descriptor(batch_descriptor)
             cudagraph_runtime_mode, batch_descriptor = (
-                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+                self.cudagraph_dispatcher.dispatch(gsa_batch_descriptor)
+            )
+            # ── diagnostic: show dispatch decision ───────────────────────────
+            logger.info(
+                "[GSA-graph] dispatch | input=%s → mode=%s  dispatched_bd=%s",
+                gsa_batch_descriptor,
+                cudagraph_runtime_mode,
+                batch_descriptor,
             )
 
         # This is currently to get around the assert in the DPMetadata
@@ -830,7 +865,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
 
-            self.maybe_execute_ucm_sparse_begin(scheduler_output, attn_metadata)
+            # Phase-2: execute_begin only (build_sparse_meta already called).
+            self._ucm_sparse_execute_begin(scheduler_output)
 
             model_output = self.model(
                 input_ids=input_ids,
@@ -998,11 +1034,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             async_output_copy_stream=self.async_output_copy_stream,
         )
 
-    def maybe_execute_ucm_sparse_begin(
+    def _ucm_sparse_build_meta(
         self,
         scheduler_output: "SchedulerOutput",
         attn_metadata: CommonAttentionMetadata,
-    ):
+    ) -> None:
+        """Phase-1 sparse hook: run build_sparse_meta to determine gsa_enabled /
+        has_decode.  Must be called BEFORE cudagraph dispatch so the result can
+        influence which graph (GSA-on vs GSA-off) is selected."""
         if not has_ucm_sparse():
             return
         if has_kv_transfer_group():
@@ -1014,7 +1053,170 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ucm_sparse.build_sparse_meta(
             scheduler_output, self.requests, self.input_batch, attn_metadata
         )
-        ucm_sparse.execute_begin(scheduler_output)
+        # ── diagnostic: show what build_sparse_meta decided ──────────────────
+        logger.info(
+            "[GSA-graph] build_sparse_meta done | "
+            "gsa_enabled=%s  has_decode=%s  num_reqs=%s",
+            getattr(ucm_sparse, "gsa_enabled", "N/A"),
+            getattr(ucm_sparse, "has_decode", "N/A"),
+            getattr(ucm_sparse, "num_reqs", "N/A"),
+        )
+
+    def _ucm_sparse_execute_begin(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Phase-2 sparse hook: run execute_begin.  Must be called INSIDE
+        set_forward_context (after dispatch), just before model.forward()."""
+        if not has_ucm_sparse():
+            return
+        get_ucm_sparse().execute_begin(scheduler_output)
+
+    def _make_gsa_batch_descriptor(
+        self, bd: BatchDescriptor
+    ) -> BatchDescriptor:
+        """Return a GsaBatchDescriptor when GSA is active so that the
+        CUDAGraphWrapper captures/replays a separate graph for each mode.
+
+        Keys are registered lazily in the dispatcher on first encounter.
+        In eager mode (no full cudagraphs) the original descriptor is returned
+        unchanged so no graph machinery is touched.
+        """
+        if not has_ucm_sparse():
+            return bd
+        ucm_sparse = get_ucm_sparse()
+        if not ucm_sparse.gsa_enabled:
+            # GSA disabled this step – use the standard graph.
+            logger.debug(
+                "[GSA-graph] gsa_enabled=False → keeping plain BatchDescriptor "
+                "num_tokens=%d uniform_decode=%s",
+                bd.num_tokens, bd.uniform_decode,
+            )
+            return bd
+        if not self.cudagraph_dispatcher.cudagraph_mode.has_full_cudagraphs():
+            # enforce_eager=True or no full-graph mode – nothing to register.
+            logger.debug(
+                "[GSA-graph] full cudagraphs not active → skipping GsaBatchDescriptor"
+            )
+            return bd
+        gsa_bd = GsaBatchDescriptor(
+            bd.num_tokens, bd.uniform_decode, gsa_enabled=True
+        )
+        full_keys = self.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+        if gsa_bd not in full_keys:
+            # Lazily register so the dispatcher returns FULL mode and the
+            # CUDAGraphWrapper triggers a capture on first use.
+            logger.info(
+                "[GSA-graph] NEW key registered in dispatcher: %s", gsa_bd
+            )
+            self.cudagraph_dispatcher.add_cudagraph_key(CUDAGraphMode.FULL, gsa_bd)
+        else:
+            logger.debug("[GSA-graph] key already registered: %s", gsa_bd)
+        return gsa_bd
+
+    # ------------------------------------------------------------------
+    # CUDA-graph capture override: add a second pass for GSA-on graphs.
+    # ------------------------------------------------------------------
+
+    def _capture_cudagraphs(
+        self,
+        compilation_cases: list,
+        cudagraph_runtime_mode,
+        uniform_decode: bool,
+    ) -> None:
+        """Override: after the base GSA-off capture, capture GSA-on graphs.
+
+        For each uniform-decode batch size we patch the dispatcher so that
+        _dummy_run (which always builds a plain BatchDescriptor internally)
+        is routed to the GSA-on graph slot, then call
+        ucm_sparse.prepare_gsa_capture_state / reset_gsa_capture_state to
+        inject and clean up the required sparse state.
+        """
+        # -- GSA-off capture (base class) ------------------------------------
+        super()._capture_cudagraphs(
+            compilation_cases=compilation_cases,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            uniform_decode=uniform_decode,
+        )
+
+        # -- GSA-on capture: uniform-decode FULL graphs only -----------------
+        if not (uniform_decode and cudagraph_runtime_mode == CUDAGraphMode.FULL):
+            return
+        if not has_ucm_sparse():
+            return
+
+        ucm_sparse = get_ucm_sparse()
+        logger.info(
+            "[GSA-graph] starting GSA-on graph capture for %d batch sizes",
+            len(list(compilation_cases)),
+        )
+
+        for num_tokens in compilation_cases:
+            gsa_bd = GsaBatchDescriptor(num_tokens, True, gsa_enabled=True)
+            if gsa_bd not in self.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL]:
+                self.cudagraph_dispatcher.add_cudagraph_key(CUDAGraphMode.FULL, gsa_bd)
+                logger.info("[GSA-graph] registered capture key: %s", gsa_bd)
+
+            # Patch dispatch so _dummy_run's internal BatchDescriptor lookup
+            # hits the GSA-on slot instead of the GSA-off slot.
+            orig_dispatch = self.cudagraph_dispatcher.dispatch
+
+            def _patched(bd, _t=gsa_bd, _o=orig_dispatch):
+                if bd.num_tokens == _t.num_tokens and bd.uniform_decode == _t.uniform_decode:
+                    logger.debug("[GSA-graph] dispatch patched: %s → %s", bd, _t)
+                    return CUDAGraphMode.FULL, _t
+                return _o(bd)
+
+            self.cudagraph_dispatcher.dispatch = _patched
+            try:
+                # prepare_gsa_capture_state owns all GSA-internal state setup
+                if not ucm_sparse.prepare_gsa_capture_state(
+                    num_tokens, self.uniform_decode_query_len
+                ):
+                    continue  # not applicable (MLA / NPU)
+
+                for i in range(self.compilation_config.cudagraph_num_of_warmups):
+                    logger.debug(
+                        "[GSA-graph] GSA warmup %d/%d num_tokens=%d",
+                        i + 1, self.compilation_config.cudagraph_num_of_warmups,
+                        num_tokens,
+                    )
+                    self._dummy_run(
+                        num_tokens,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        force_attention=True,
+                        uniform_decode=True,
+                        skip_eplb=True,
+                        remove_lora=False,
+                    )
+
+                logger.info(
+                    "[GSA-graph] capturing GSA-on graph num_tokens=%d", num_tokens
+                )
+                self._dummy_run(
+                    num_tokens,
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    uniform_decode=True,
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
+                logger.info(
+                    "[GSA-graph] capture done num_tokens=%d", num_tokens
+                )
+            finally:
+                self.cudagraph_dispatcher.dispatch = orig_dispatch
+                ucm_sparse.reset_gsa_capture_state()
+
+        self.maybe_remove_all_loras(self.lora_config)
+
+    # Kept for backward compatibility with callers that still use the old name.
+    def maybe_execute_ucm_sparse_begin(
+        self,
+        scheduler_output: "SchedulerOutput",
+        attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        self._ucm_sparse_build_meta(scheduler_output, attn_metadata)
+        self._ucm_sparse_execute_begin(scheduler_output)
 
     def maybe_execute_ucm_sparse_finished(self, logits_indices):
         if not has_ucm_sparse():
