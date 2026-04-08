@@ -261,6 +261,11 @@ class GSAOnDevice(UcmSparseBase):
                 dtype=vllm_config.model_config.dtype,
                 device=self.device,
             )
+            self.cg_buf_topk_seq_lens_qwen = torch.zeros(
+                (self.max_batch_size,),
+                dtype=torch.int32,
+                device=self.device,
+            )
             self.has_decode = False
             self.decode_only = False
 
@@ -1259,11 +1264,15 @@ class GSAOnDevice(UcmSparseBase):
                 self.decode_req_ids_buf.copy_to_gpu(num_decodes)
                 self.decode_req_ids = self.decode_req_ids_buf.gpu[:num_decodes]
 
-            self.topk_seq_lens_qwen = update_seq_lens(
+            _topk = update_seq_lens(
                 attn_metadata.seq_lens,
                 topk_token=self.hash_topk_tokens,
                 block_size=self.block_size,
             )
+            self.cg_buf_topk_seq_lens_qwen[:self.num_reqs].copy_(_topk, True)
+
+            self.topk_seq_lens_qwen = self.cg_buf_topk_seq_lens_qwen[:self.num_reqs]
+             
 
             self.new_block_table = attn_metadata.block_table
             self.new_seq_lens = attn_metadata.seq_lens
