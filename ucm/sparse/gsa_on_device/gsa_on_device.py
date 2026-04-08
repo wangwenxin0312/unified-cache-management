@@ -247,6 +247,22 @@ class GSAOnDevice(UcmSparseBase):
                 device=self.device,
             )
 
+            self.cg_buf_new_block_table = torch.zeros(
+                (self.max_batch_size, max_block_per_seq),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cg_buf_new_seq_lens = torch.zeros(
+                (self.max_batch_size,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cg_buf_topk_seq_lens_qwen = torch.zeros(
+                (self.max_batch_size,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
             self.head_dim = vllm_config.model_config.get_head_size()
             self.hash_encoder = HashEncoder(
                 input_dim=self.head_dim,
@@ -994,6 +1010,74 @@ class GSAOnDevice(UcmSparseBase):
                         attn_metadata.seq_lens_list = self.ori_seq_lens_decode.tolist()
                     attn_metadata.seq_lens = self.ori_seq_lens_decode
 
+    # ------------------------------------------------------------------
+    # CUDA-graph capture helpers (called from GPUModelRunner override)
+    # ------------------------------------------------------------------
+
+    def prepare_gsa_capture_state(
+        self, num_tokens: int, uniform_decode_query_len: int
+    ) -> bool:
+        """Set up all internal GSA state required before a GSA-on graph
+        capture _dummy_run.
+        """
+        # Only GQA + CUDA is handled here; MLA / NPU have their own paths.
+
+        from ucm.sparse.gsa_on_device.hamming_topk import update_seq_lens
+        num_reqs = cdiv(num_tokens, uniform_decode_query_len)
+        
+        # ── flags checked by attention_begin ──────────────────────────────
+        self.num_reqs = num_reqs
+        self.gsa_enabled = True
+        self.has_decode = True
+        self.decode_only = True
+        self.has_pc_hit = False
+
+        # ── ori (full-table) buffers: use dummy large seq_lens ────────────
+        dummy_seq_len = self.seq_len_threshold + self.hash_topk_tokens
+        self.full_seq_lens[:num_reqs].fill_(dummy_seq_len)
+        self.ori_seq_lens_decode = self.full_seq_lens[:num_reqs]
+        self.ori_block_table_decode = self.full_block_table[:num_reqs]
+
+        # ── topk seq_lens derived from the dummy values ───────────────────
+        _topk = update_seq_lens(
+            self.ori_seq_lens_decode,
+            topk_token=self.hash_topk_tokens,
+            block_size=self.block_size,
+        )
+        
+        self.cg_buf_topk_seq_lens_qwen[:num_reqs].copy_(_topk)
+        self.topk_seq_lens_qwen = self.cg_buf_topk_seq_lens_qwen[:num_reqs]
+
+        # ── new_block_table / new_seq_lens → persistent CG buffers ────────
+        self.new_block_table = self.cg_buf_new_block_table[:num_reqs]
+        self.new_seq_lens = self.cg_buf_new_seq_lens[:num_reqs]
+        # self.new_seq_lens.copy_(self.topk_seq_lens_qwen[:num_reqs])
+
+        # skip-layer cache must also point at the persistent buffer
+        self.topk_block_table = self.new_block_table
+        self.topk_seq_lens = self.new_seq_lens
+
+        logger.info(
+            "[GSA-graph] prepare_gsa_capture_state | num_tokens=%d num_reqs=%d "
+            "dummy_seq_len=%d  ori_block_table ptr=0x%x  new_block_table ptr=0x%x",
+            num_tokens, num_reqs, dummy_seq_len,
+            self.ori_block_table_decode.data_ptr(),
+            self.new_block_table.data_ptr(),
+        )
+        return True
+
+    def reset_gsa_capture_state(self) -> None:
+        """Reset GSA flags after a capture (warmup or real) _dummy_run.
+
+        Does NOT touch buffer pointers – those remain valid for the next
+        replay since they point to pre-allocated persistent memory.
+        """
+        self.gsa_enabled = False
+        self.has_decode = False
+        self.decode_only = False
+        self.has_pc_hit = False
+        logger.debug("[GSA-graph] reset_gsa_capture_state done")
+
     def request_begin(self, request_id: ReqType, prompt_token_ids: List[int]):
         pass
 
@@ -1247,14 +1331,20 @@ class GSAOnDevice(UcmSparseBase):
             self.decode_req_ids_buf.copy_to_gpu(num_decodes)
             self.decode_req_ids = self.decode_req_ids_buf.gpu[:num_decodes]
 
-        self.topk_seq_lens_qwen = update_seq_lens(
+        _topk = update_seq_lens(
             attn_metadata.seq_lens,
             topk_token=self.hash_topk_tokens,
             block_size=self.block_size,
         )
+        self.cg_buf_topk_seq_lens_qwen[: self.num_reqs].copy_(_topk)
+        self.topk_seq_lens_qwen = self.cg_buf_topk_seq_lens_qwen[: self.num_reqs]
 
+        
         self.new_block_table = attn_metadata.block_table
         self.new_seq_lens = attn_metadata.seq_lens
+        # Pre-fill new_seq_lens with the topk values computed above so they are
+        # ready before the attention kernel runs (updated in-place per layer).
+        # self.new_seq_lens.copy_(self.topk_seq_lens_qwen[: self.num_reqs])
 
     def build_sparse_meta(
         self, scheduler_output, requests, input_batch, attn_metadata
@@ -1280,6 +1370,17 @@ class GSAOnDevice(UcmSparseBase):
         )
 
         self.gsa_enabled = num_long_reqs >= self.concurrency_threshold
+        logger.debug(
+            "[GSA-graph] build_sparse_meta threshold check | "
+            "num_reqs=%d  seq_lens[:4]=%s  seq_len_threshold=%d  "
+            "concurrency_threshold=%d  num_long_reqs=%d  → gsa_enabled=%s",
+            self.num_reqs,
+            seq_lens[: min(4, self.num_reqs)].tolist(),
+            self.seq_len_threshold,
+            self.concurrency_threshold,
+            num_long_reqs,
+            self.gsa_enabled,
+        )
 
         num_decodes = 0
         # for pc
