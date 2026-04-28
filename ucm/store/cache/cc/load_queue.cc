@@ -192,8 +192,9 @@ Status LoadQueue::HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream
 {
     const auto number = tensorSizes_.size();
     for (size_t i = 0, offset = 0; i < number; i++) {
-        auto pHost = (void*)(((int8_t*)host) + offset);
         auto pDevice = device[i];
+        if (!pDevice) { continue; }
+        auto pHost = (void*)(((int8_t*)host) + offset);
         auto size = tensorSizes_[i];
         auto s = stream->HostToDeviceAsync(pHost, pDevice, size);
         if (s.Failure()) [[unlikely]] {

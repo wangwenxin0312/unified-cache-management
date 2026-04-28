@@ -148,6 +148,7 @@ Status DumpQueue::DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream,
     const auto number = tensorSizes_.size();
     for (size_t i = 0, offset = 0; i < number; i++) {
         auto pDevice = device[i];
+        if (!pDevice) { continue; }
         auto pHost = (void*)(((int8_t*)host) + offset);
         auto size = tensorSizes_[i];
         auto s = stream->DeviceToHostAsync(pDevice, pHost, size);
