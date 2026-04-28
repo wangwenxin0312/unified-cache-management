@@ -5,6 +5,7 @@ import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
@@ -150,6 +151,18 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             self._vllm_config,
             ucm_config,
             getattr(self, "kv_cache_config", None),
+        )
+        layout_block_size = self.kv_cache_layout.block_size() * self.blocks_per_chunk
+        layout_shard_size = self.kv_cache_layout.shard_size() * self.blocks_per_chunk
+        layout_shards_per_block = layout_block_size // layout_shard_size
+        logger.info(
+            "UCM KV layout: block_size=%s, shard_size=%s, "
+            "shards_per_block=%s, layerwise=%s, hybrid=%s",
+            layout_block_size,
+            layout_shard_size,
+            layout_shards_per_block,
+            self.kv_cache_layout.use_layerwise,
+            self.kv_cache_layout.use_attn_mamba_hybrid,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -376,6 +389,159 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             target.extend(source)
 
+    def _get_mamba_load_target_idx(
+        self,
+        group_id: int,
+        scheduled_seq_len: int,
+        vllm_block_ids: list[int],
+    ) -> int:
+        """Match mamba_get_block_table_tensor(..., mamba_cache_mode='align')."""
+        if not vllm_block_ids:
+            return 0
+
+        group_spec = self.kv_cache_layout.groups[group_id].group_spec
+        mamba_spec = group_spec.kv_cache_spec if group_spec is not None else None
+        mamba_block_size = getattr(mamba_spec, "block_size", None)
+        if not mamba_block_size:
+            logger.warning(
+                "Cannot determine mamba block size for group %s; "
+                "falling back to the last allocated mamba block.",
+                group_id,
+            )
+            return len(vllm_block_ids) - 1
+
+        target_idx = max((scheduled_seq_len - 1) // mamba_block_size, 0)
+        if target_idx >= len(vllm_block_ids):
+            logger.warning(
+                "Mamba load target index %s is outside allocated block ids "
+                "(len=%s, scheduled_seq_len=%s, mamba_block_size=%s); "
+                "falling back to the last allocated mamba block.",
+                target_idx,
+                len(vllm_block_ids),
+                scheduled_seq_len,
+                mamba_block_size,
+            )
+            target_idx = len(vllm_block_ids) - 1
+
+        target_block_id = vllm_block_ids[target_idx]
+        if target_block_id == 0:
+            logger.warning(
+                "Mamba load target index %s maps to block 0 "
+                "(scheduled_seq_len=%s, mamba_block_size=%s, group=%s). "
+                "This matches mamba metadata but usually indicates an "
+                "unallocated/padded block table entry.",
+                target_idx,
+                scheduled_seq_len,
+                mamba_block_size,
+                group_id,
+            )
+        return target_idx
+
+    @staticmethod
+    def _format_block_pairs(
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+        limit: int = 4,
+    ) -> list[tuple[str, int]]:
+        return [
+            (ucm_id.hex(), vllm_id)
+            for ucm_id, vllm_id in zip(ucm_block_ids[:limit], vllm_block_ids[:limit])
+        ]
+
+    def _debug_tensor_dump_dir(self) -> Optional[Path]:
+        dump_dir = os.getenv("UCM_DEBUG_TENSOR_DUMP_DIR")
+        if not dump_dir:
+            return None
+        path = Path(dump_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _iter_group_kv_tensors(
+        self, group_id: int
+    ) -> list[tuple[str, int, torch.Tensor]]:
+        group = self.kv_cache_layout.groups[group_id]
+        if group.group_spec is not None:
+            layer_names = group.group_spec.layer_names
+        else:
+            layer_names = [
+                layer_name
+                for layer_name, gid in self.kv_cache_layout.layer_name_to_group_id.items()
+                if gid == group_id
+            ]
+
+        tensors: list[tuple[str, int, torch.Tensor]] = []
+        for layer_name in layer_names:
+            kv_layer = self.kv_caches.get(layer_name)
+            if kv_layer is None:
+                continue
+            if isinstance(kv_layer, torch.Tensor):
+                if kv_layer.dim() == 5 and kv_layer.shape[0] == 2:
+                    tensors.append((layer_name, 0, kv_layer[0]))
+                    tensors.append((layer_name, 1, kv_layer[1]))
+                else:
+                    tensors.append((layer_name, 0, kv_layer))
+            elif isinstance(kv_layer, (tuple, list)):
+                for tensor_idx, tensor in enumerate(kv_layer):
+                    tensors.append((layer_name, tensor_idx, tensor))
+        return tensors
+
+    def _dump_debug_tensors(
+        self,
+        phase: str,
+        request_id: str,
+        group_id: int,
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+    ) -> None:
+        dump_dir = self._debug_tensor_dump_dir()
+        if dump_dir is None or not ucm_block_ids or not vllm_block_ids:
+            return
+
+        limit = int(os.getenv("UCM_DEBUG_TENSOR_DUMP_LIMIT", "1"))
+        tensors = self._iter_group_kv_tensors(group_id)
+        if not tensors:
+            logger.warning(
+                "UCM tensor dump skipped: no kv tensors for group=%s phase=%s",
+                group_id,
+                phase,
+            )
+            return
+
+        for pair_idx, (ucm_id, vllm_block_id) in enumerate(
+            zip(ucm_block_ids[:limit], vllm_block_ids[:limit])
+        ):
+            data: dict[str, Any] = {
+                "phase": phase,
+                "request_id": request_id,
+                "rank": self.tp_rank,
+                "group_id": group_id,
+                "ucm_id": ucm_id.hex(),
+                "vllm_block_id": vllm_block_id,
+                "tensors": {},
+            }
+            for layer_name, tensor_idx, tensor in tensors:
+                if vllm_block_id >= tensor.shape[0]:
+                    logger.warning(
+                        "UCM tensor dump skipped tensor: phase=%s group=%s "
+                        "layer=%s tensor_idx=%s vllm_block=%s shape=%s",
+                        phase,
+                        group_id,
+                        layer_name,
+                        tensor_idx,
+                        vllm_block_id,
+                        tuple(tensor.shape),
+                    )
+                    continue
+                key = f"{layer_name}.tensor{tensor_idx}"
+                data["tensors"][key] = tensor[vllm_block_id].detach().cpu().clone()
+
+            filename = (
+                f"{phase}_rank{self.tp_rank}_req{request_id}_group{group_id}_"
+                f"pair{pair_idx}_block{vllm_block_id}_{ucm_id.hex()[:16]}.pt"
+            )
+            torch.save(data, dump_dir / filename)
+            logger.info("UCM tensor dump saved: %s", dump_dir / filename)
+
     def _generate_dispatch_meta(
         self,
         req_meta: RequestMeta,
@@ -419,14 +585,37 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         hbm_hit_block_num:total_hit_block_num
                     ]
                     load_vllm_block_ids = [block_id * kernel_block_scale for block_id in load_vllm_block_ids]
+                    logger.info(
+                        "UCM dispatch attention load: group=%s, hbm_hit=%s, "
+                        "total_hit=%s, pairs=%s",
+                        group_id,
+                        hbm_hit_block_num,
+                        total_hit_block_num,
+                        self._format_block_pairs(
+                            load_ucm_block_ids, load_vllm_block_ids
+                        ),
+                    )
                     load_pairs[group_id] = (load_ucm_block_ids, load_vllm_block_ids)
                 elif group_id in mamba_group_ids:
                     mamba_ucm_block_id = req_meta.mamba_block_ids.get(group_id)
                     if mamba_ucm_block_id is None:
                         continue
+                    scheduled_seq_len = req_meta.token_processed + new_tokens
+                    mamba_target_idx = self._get_mamba_load_target_idx(
+                        group_id, scheduled_seq_len, vllm_block_ids
+                    )
+                    logger.info(
+                        "UCM mamba load target: group=%s, scheduled_seq_len=%s, "
+                        "target_idx=%s, target_block=%s, ucm_id=%s",
+                        group_id,
+                        scheduled_seq_len,
+                        mamba_target_idx,
+                        vllm_block_ids[mamba_target_idx],
+                        mamba_ucm_block_id.hex(),
+                    )
                     load_pairs[group_id] = (
                         [mamba_ucm_block_id],
-                        [vllm_block_ids[-1]],
+                        [vllm_block_ids[mamba_target_idx]],
                     )
 
         if req_meta.token_processed < req_meta.num_token_ids:
@@ -446,6 +635,16 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     kernel_block_scale = self.kv_cache_layout.groups[group_id].kernel_block_scale
                     dump_vllm_block_ids = req_meta.vllm_block_ids_by_group[group_id][start_idx:end_idx]
                     dump_vllm_block_ids = [block_id * kernel_block_scale for block_id in dump_vllm_block_ids]
+                    logger.info(
+                        "UCM dispatch attention dump: group=%s, token_range=[%s,%s), "
+                        "pairs=%s",
+                        group_id,
+                        req_meta.token_processed,
+                        req_meta.token_processed + new_tokens,
+                        self._format_block_pairs(
+                            attn_dump_ucm_block_ids, dump_vllm_block_ids
+                        ),
+                    )
                     dump_pairs[group_id] = (
                         attn_dump_ucm_block_ids,
                         dump_vllm_block_ids,
@@ -454,6 +653,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     mamba_ucm_block_id = mamba_ucm_by_group.get(group_id)
                     if mamba_ucm_block_id is None:
                         continue
+                    logger.info(
+                        "UCM dispatch mamba dump: group=%s, ucm_id=%s, "
+                        "vllm_block=%s",
+                        group_id,
+                        mamba_ucm_block_id.hex(),
+                        vllm_block_ids[-1],
+                    )
                     dump_pairs[group_id] = (
                         [mamba_ucm_block_id],
                         [vllm_block_ids[-1]],
@@ -553,6 +759,16 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_idxs = [0] * len(load_ucm_ids)
+                logger.info(
+                    "UCM load submit: request_id=%s, rank=%s, group=%s, "
+                    "blocks=%s, pairs=%s, ptr_shape=%s",
+                    request_id,
+                    self.tp_rank,
+                    group_id,
+                    len(load_ucm_ids),
+                    self._format_block_pairs(load_ucm_ids, load_vllm_ids),
+                    total_ptrs.shape,
+                )
                 try:
                     task = self.store.load_data(load_ucm_ids, shard_idxs, total_ptrs)
                     request_to_task[request_id].append(task)
@@ -566,6 +782,16 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 for task in tasks:
                     self.store.wait(task)
+                for group_id, (load_ucm_ids, load_vllm_ids) in enumerate(
+                    metadata.request_meta[request_id].load_block_ids
+                ):
+                    self._dump_debug_tensors(
+                        "load_after",
+                        request_id,
+                        group_id,
+                        load_ucm_ids,
+                        load_vllm_ids,
+                    )
             except RuntimeError as e:
                 logger.error(f"request {request_id} wait load task error. {e}")
                 for _, load_vllm_ids in metadata.request_meta[
@@ -628,12 +854,19 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         num_saved_request = 0
         total_ucm_block_ids: dict[int, list[bytes]] = defaultdict(list)
         total_vllm_block_ids: dict[int, list[int]] = defaultdict(list)
-        for _, request in metadata.request_meta.items():
+        for request_id, request in metadata.request_meta.items():
             for group_id, (ucm_block_ids, vllm_block_ids) in enumerate(
                 request.dump_block_ids
             ):
                 if not ucm_block_ids or not vllm_block_ids:
                     continue
+                self._dump_debug_tensors(
+                    "dump_before",
+                    request_id,
+                    group_id,
+                    ucm_block_ids,
+                    vllm_block_ids,
+                )
                 is_save = True
                 num_saved_block += len(ucm_block_ids)
                 num_saved_request += 1
@@ -653,6 +886,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_indexs = [0] * len(ucm_block_ids)
+                logger.info(
+                    "UCM dump submit: rank=%s, group=%s, blocks=%s, "
+                    "pairs=%s, ptr_shape=%s",
+                    self.tp_rank,
+                    group_id,
+                    len(ucm_block_ids),
+                    self._format_block_pairs(ucm_block_ids, vllm_block_ids),
+                    total_ptrs.shape,
+                )
                 try:
                     event_handle = self._get_dump_event_handle()
                     task = self.store.dump_data(
@@ -668,6 +910,14 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 for task in dump_tasks:
                     self.store.wait(task)
                 save_end_time = time.perf_counter() * 1000
+                logger.info(
+                    "UCM dump wait success: rank=%s, tasks=%s, blocks=%s, "
+                    "groups=%s",
+                    self.tp_rank,
+                    len(dump_tasks),
+                    num_saved_block,
+                    sorted(total_ucm_block_ids.keys()),
+                )
             except RuntimeError as e:
                 logger.error(f"wait for dump kv cache failed.{e}")
                 return
