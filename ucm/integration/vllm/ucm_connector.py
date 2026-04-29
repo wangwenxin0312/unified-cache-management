@@ -854,24 +854,23 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         num_saved_request = 0
         total_ucm_block_ids: dict[int, list[bytes]] = defaultdict(list)
         total_vllm_block_ids: dict[int, list[int]] = defaultdict(list)
+        dump_debug_slices: dict[int, list[tuple[str, int, int]]] = defaultdict(list)
         for request_id, request in metadata.request_meta.items():
             for group_id, (ucm_block_ids, vllm_block_ids) in enumerate(
                 request.dump_block_ids
             ):
                 if not ucm_block_ids or not vllm_block_ids:
                     continue
-                self._dump_debug_tensors(
-                    "dump_before",
-                    request_id,
-                    group_id,
-                    ucm_block_ids,
-                    vllm_block_ids,
-                )
                 is_save = True
                 num_saved_block += len(ucm_block_ids)
                 num_saved_request += 1
+                start_idx = len(total_ucm_block_ids[group_id])
                 total_ucm_block_ids[group_id].extend(ucm_block_ids)
                 total_vllm_block_ids[group_id].extend(vllm_block_ids)
+                end_idx = len(total_ucm_block_ids[group_id])
+                dump_debug_slices[group_id].append(
+                    (request_id, start_idx, end_idx)
+                )
 
         if is_save:
             save_start_time = time.perf_counter() * 1000
@@ -881,6 +880,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         ucm_block_ids[i] = self.request_hasher(ucm_block_id)
 
                 vllm_block_ids = total_vllm_block_ids[group_id]
+                for request_id, start_idx, end_idx in dump_debug_slices[group_id]:
+                    self._dump_debug_tensors(
+                        "dump_before",
+                        request_id,
+                        group_id,
+                        ucm_block_ids[start_idx:end_idx],
+                        vllm_block_ids[start_idx:end_idx],
+                    )
+
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(
                     vllm_block_ids, group_id
                 )
