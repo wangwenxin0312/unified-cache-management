@@ -6,7 +6,7 @@ import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.model_executor.models.utils import extract_layer_index
@@ -168,9 +169,18 @@ class KVCacheLayout:
         self.tensor_size_lists = np.asarray(tensor_size_rows, dtype=np.uint64)
 
         logger.info(
-            f"base_ptrs: {self.base_ptrs.shape}, "
-            f"block_stride_lists: {self.block_stride_lists.shape}, "
-            f"tensor_size_lists: {self.tensor_size_lists.shape}"
+            f"KVCacheLayout built: "
+            f"base_ptrs shape={self.base_ptrs.shape}, "
+            f"block_stride_lists shape={self.block_stride_lists.shape}, "
+            f"tensor_size_lists shape={self.tensor_size_lists.shape}"
+        )
+        logger.info(
+            f"Logical tensor sizes  (tensor_size_lists): "
+            f"{self.tensor_size_lists.reshape(-1).tolist()}"
+        )
+        logger.info(
+            f"Physical block strides (block_stride_lists): "
+            f"{self.block_stride_lists.reshape(-1).tolist()}"
         )
 
     def extract_block_addrs(
@@ -194,8 +204,14 @@ class KVCacheLayout:
 
     @property
     def tensor_size_list(self) -> list[int]:
+        # Use block_stride_lists (physical stride per block) rather than
+        # tensor_size_lists (logical content size). On Ascend NPU, tensors are
+        # allocated with 262144-byte alignment so stride(0)*element_size equals
+        # the aligned size (e.g. 262144) for every tensor, even when the logical
+        # content is only 12288 or 65536 bytes. On CUDA with contiguous tensors,
+        # stride == logical size, so behaviour is unchanged.
         if self.use_layerwise and not np.all(
-            self.tensor_size_lists == self.tensor_size_lists[0]
+            self.block_stride_lists == self.block_stride_lists[0]
         ):
             raise RuntimeError(
                 "Layerwise UCM currently requires identical tensor sizes for "
@@ -203,25 +219,29 @@ class KVCacheLayout:
                 "should use use_layerwise=False so attention blocks and "
                 "conv/ssm Mamba blocks are dumped together."
             )
-        return (
-            self.tensor_size_lists.reshape(-1).tolist()
+        result = (
+            self.block_stride_lists.reshape(-1).tolist()
             if not self.use_layerwise
-            else self.tensor_size_lists[0].tolist()
+            else self.block_stride_lists[0].tolist()
         )
+        logger.info(
+            f"tensor_size_list (physical strides): {result}"
+        )
+        return result
 
     @property
     def shard_size(self) -> int:
         return int(
-            self.tensor_size_lists.sum()
+            self.block_stride_lists.sum()
             if not self.use_layerwise
-            else self.tensor_size_lists[0].sum()
+            else self.block_stride_lists[0].sum()
         )
 
     @property
     def block_size(self) -> int:
         if self.pp_size > 1:
-            return int(self.tensor_size_lists[0].sum() * self.num_hidden_layers)
-        return int(self.tensor_size_lists.sum())
+            return int(self.block_stride_lists[0].sum() * self.num_hidden_layers)
+        return int(self.block_stride_lists.sum())
 
 
 class HybridKVCacheLayout:
@@ -330,7 +350,7 @@ class RequestHasher:
         return h.digest()
 
 
-class UCMDirectConnector(KVConnectorBase_V1):
+class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
     """
     This connector means synchronize:
     load -> forward -> save
@@ -538,14 +558,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
         config["unique_id"] = f"{self.engine_id}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.local_rank
-            config["tensor_size_list"] = (
-                kv_cache_layout.tensor_size_list * self.blocks_per_chunk
-            )
+            tensor_size_list = kv_cache_layout.tensor_size_list * self.blocks_per_chunk
+            config["tensor_size_list"] = tensor_size_list
             config["shard_size"] = kv_cache_layout.shard_size * self.blocks_per_chunk
             config["block_size"] = kv_cache_layout.block_size * self.blocks_per_chunk
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
             if cpu_affinity_cores:
                 config["cpu_affinity_cores"] = list(cpu_affinity_cores)
+            logger.info(
+                f"Store worker config: "
+                f"TensorSizes={tensor_size_list}, "
+                f"shard_size={config['shard_size']}, "
+                f"block_size={config['block_size']}"
+            )
         else:
             config_base = self.block_size * self.element_size * self.head_size
             config["block_size"] = (
@@ -1103,6 +1128,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
         res = self._invalid_block_ids
         self._invalid_block_ids = set()
         return res
+    
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
 
 
 class UCMLayerWiseConnector(UCMDirectConnector):
@@ -1499,7 +1531,7 @@ class UCMLiteConnector(UCMDirectConnector):
         return 0, False
 
 
-class UCMConnector(KVConnectorBase_V1):
+class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole,
                  kv_cache_config=None):
         super().__init__(vllm_config=vllm_config, role=role)
@@ -1701,3 +1733,11 @@ class UCMConnector(KVConnectorBase_V1):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.connector.request_finished_all_groups(request, block_ids)
+    
