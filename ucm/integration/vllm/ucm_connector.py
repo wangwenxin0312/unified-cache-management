@@ -55,8 +55,6 @@ class RequestMeta:
     num_token_ids: int = 0
     vllm_block_ids: list[int] = field(default_factory=list)
     token_processed: int = 0
-    # Per mamba group: mamba_ucm_ids[k] is the hash list for mamba group k
-    mamba_ucm_ids: list[list[bytes]] = field(default_factory=list)
     # Per mamba group: mamba_vllm_ids[k] is the physical block list for group k
     mamba_vllm_ids: list[list[int]] = field(default_factory=list)
 
@@ -78,6 +76,7 @@ class KVCacheLayout:
     ) -> None:
         # each row is a layer, each column is a tensor_size/ptr in the layer (e.g., k, v, rope, k_index)
         self.base_ptrs: np.ndarray  # (n_layers, n_ptrs）
+        self.block_stride_lists: np.ndarray  # (n_layers, n_tensor_sizes)
         self.tensor_size_lists: np.ndarray  # (n_layers, n_tensor_sizes)
         self.use_layerwise = use_layerwise
         self.vllm_config = vllm_config
@@ -90,24 +89,35 @@ class KVCacheLayout:
         self.layer_name_to_id = {
             name: extract_layer_index(name) for name in kvcaches.keys()
         }
-        self.first_layer_id = next(iter(self.layer_name_to_id.values()))
+        self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        if not self.layer_ids:
+            raise ValueError("KV cache layout requires at least one layer.")
+        self.layer_id_to_row = {
+            layer_id: row for row, layer_id in enumerate(self.layer_ids)
+        }
+        self.first_layer_id = self.layer_ids[0]
         self._build_layout(kvcaches)
 
     def _build_layout(self, kvcaches):
 
-        num_rows = len(set(self.layer_name_to_id.values()))
+        num_rows = len(self.layer_ids)
         raw_ptr_rows = [[] for _ in range(num_rows)]
-        stride_rows = [[] for _ in range(num_rows)]
+        block_stride_rows = [[] for _ in range(num_rows)]
+        tensor_size_rows = [[] for _ in range(num_rows)]
 
         for layer_name, kv_layer in kvcaches.items():
             ptrs = []
-            strides = []
+            block_strides = []
+            tensor_sizes = []
 
             def handle_tensor(t: torch.Tensor, size_dims):
                 ptrs.append(t[0].data_ptr())
 
-                stride = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
-                strides.append(stride)
+                tensor_size = (
+                    math.prod([t.shape[i] for i in size_dims]) * t.element_size()
+                )
+                tensor_sizes.append(tensor_size)
+                block_strides.append(t.stride(0) * t.element_size())
 
             def handle_block_tensor(t: torch.Tensor):
                 if t.dim() < 1:
@@ -115,7 +125,8 @@ class KVCacheLayout:
                         f"Unsupported kv cache tensor shape: {t.shape}"
                     )
                 ptrs.append(t[0].data_ptr())
-                strides.append(math.prod(t.shape[1:]) * t.element_size())
+                tensor_sizes.append(math.prod(t.shape[1:]) * t.element_size())
+                block_strides.append(t.stride(0) * t.element_size())
 
             if isinstance(kv_layer, torch.Tensor):
                 if kv_layer.dim() == 5:
@@ -140,9 +151,10 @@ class KVCacheLayout:
             else:
                 raise TypeError(f"Unsupported kv cache type: {type(kv_layer)}")
 
-            local_layer_id = self.layer_name_to_id[layer_name] - self.first_layer_id
+            local_layer_id = self.layer_id_to_row[self.layer_name_to_id[layer_name]]
             raw_ptr_rows[local_layer_id].extend(ptrs)
-            stride_rows[local_layer_id].extend(strides)
+            block_stride_rows[local_layer_id].extend(block_strides)
+            tensor_size_rows[local_layer_id].extend(tensor_sizes)
 
         row_widths = {len(row) for row in raw_ptr_rows}
         if len(row_widths) != 1:
@@ -152,24 +164,31 @@ class KVCacheLayout:
             )
 
         self.base_ptrs = np.asarray(raw_ptr_rows, dtype=np.uint64)
-        self.tensor_size_lists = np.asarray(stride_rows, dtype=np.uint64)
+        self.block_stride_lists = np.asarray(block_stride_rows, dtype=np.uint64)
+        self.tensor_size_lists = np.asarray(tensor_size_rows, dtype=np.uint64)
 
         logger.info(
-            f"base_ptrs: {self.base_ptrs.shape}, tensor_size_lists: {self.tensor_size_lists.shape}"
+            f"base_ptrs: {self.base_ptrs.shape}, "
+            f"block_stride_lists: {self.block_stride_lists.shape}, "
+            f"tensor_size_lists: {self.tensor_size_lists.shape}"
         )
 
     def extract_block_addrs(
-        self, vllm_block_ids: List[int], layer_first: bool = False
+        self,
+        vllm_block_ids: List[int],
+        mamba_vllm_block_ids: Optional[list[list[int]]] = None,
+        layer_first: bool = False,
     ) -> np.ndarray:
         vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
         if layer_first:
             # (n_layers, num_blocks, n_ptrs)
             return (
-                self.tensor_size_lists[:, None, :] * vllm_block_ids_np[None, :, None]
+                self.block_stride_lists[:, None, :]
+                * vllm_block_ids_np[None, :, None]
                 + self.base_ptrs[:, None, :]
             )
         return (
-            vllm_block_ids_np[:, None, None] * self.tensor_size_lists[None, :, :]
+            vllm_block_ids_np[:, None, None] * self.block_stride_lists[None, :, :]
             + self.base_ptrs[None, :, :]
         )  # (num_blocks, n_layers, n_ptrs)
 
@@ -203,6 +222,90 @@ class KVCacheLayout:
         if self.pp_size > 1:
             return int(self.tensor_size_lists[0].sum() * self.num_hidden_layers)
         return int(self.tensor_size_lists.sum())
+
+
+class HybridKVCacheLayout:
+    """Single-store layout for attention + Mamba cache blocks.
+
+    Column order is attention K/V for all attention layers, then each Mamba
+    group's conv/ssm tensors. tensor_size_list describes how many bytes to copy;
+    each child KVCacheLayout still owns the correct per-block stride.
+    """
+
+    def __init__(
+        self,
+        attn_layout: KVCacheLayout,
+        mamba_layouts: list[Optional[KVCacheLayout]],
+    ) -> None:
+        self.attn_layout = attn_layout
+        self.mamba_layouts = mamba_layouts
+        self.use_layerwise = False
+        self.vllm_config = attn_layout.vllm_config
+        self.layer_name_to_id = attn_layout.layer_name_to_id
+        self.layer_ids = attn_layout.layer_ids
+        self.layer_id_to_row = attn_layout.layer_id_to_row
+        self.first_layer_id = attn_layout.first_layer_id
+
+    @property
+    def tensor_size_list(self) -> list[int]:
+        ret = self.attn_layout.tensor_size_list
+        for layout in self.mamba_layouts:
+            if layout is not None:
+                ret.extend(layout.tensor_size_list)
+        return ret
+
+    @property
+    def shard_size(self) -> int:
+        return int(sum(self.tensor_size_list))
+
+    @property
+    def block_size(self) -> int:
+        return self.shard_size
+
+    def extract_block_addrs(
+        self,
+        vllm_block_ids: List[int],
+        mamba_vllm_block_ids: Optional[list[list[int]]] = None,
+        layer_first: bool = False,
+    ) -> np.ndarray:
+        if layer_first:
+            raise RuntimeError(
+                "Hybrid attention/Mamba layout does not support layerwise "
+                "address extraction."
+            )
+
+        num_blocks = len(vllm_block_ids)
+        parts = [
+            self.attn_layout.extract_block_addrs(vllm_block_ids).reshape(
+                num_blocks, -1
+            )
+        ]
+
+        if not any(layout is not None for layout in self.mamba_layouts):
+            return parts[0]
+
+        if mamba_vllm_block_ids is None:
+            raise RuntimeError(
+                "Hybrid attention/Mamba layout requires mamba physical block ids."
+            )
+
+        for k, layout in enumerate(self.mamba_layouts):
+            if layout is None:
+                continue
+            if k >= len(mamba_vllm_block_ids):
+                raise RuntimeError(f"Missing mamba block ids for group {k}.")
+            group_block_ids = mamba_vllm_block_ids[k]
+            if len(group_block_ids) != num_blocks:
+                raise RuntimeError(
+                    f"Mamba group {k} block count {len(group_block_ids)} "
+                    f"does not match attention block count {num_blocks}."
+                )
+            group_ptrs = layout.extract_block_addrs(group_block_ids).reshape(
+                num_blocks, -1
+            )
+            parts.append(group_ptrs)
+
+        return np.concatenate(parts, axis=1)
 
 
 @dataclass
@@ -261,11 +364,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.mamba_group_layer_names: list[list[str]] = []
         # mamba_block_sizes[k] = token block_size for mamba group k
         self.mamba_block_sizes: list[int] = []
-        # mamba_seeds[k] = per-group hash seed bytes
-        self.mamba_seeds: list[bytes] = []
-        # Layouts and stores created in register_kv_caches
-        self.mamba_kv_cache_layouts: list["KVCacheLayout"] = []
-        self.mamba_stores: list[UcmKVStoreBaseV1] = []
+        # Mamba layouts are folded into self.store for hybrid models.
+        self.mamba_kv_cache_layouts: list[Optional["KVCacheLayout"]] = []
         self._pending_kv_cache_config = kv_cache_config  # deferred until hasher ready
 
         if current_platform.is_cuda_alike():
@@ -287,6 +387,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         # save block info, avoid hash request twice, and track them until request finished
         self.requests_meta: dict[str, RequestMeta] = {}
+        self.layer_id_to_row: dict[int, int] = {}
 
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
@@ -362,36 +463,38 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 continue
             self.mamba_group_layer_names.append(sorted(group_spec.layer_names))
             self.mamba_block_sizes.append(spec.block_size)
-            # Derive a per-group seed so hashes don't collide between groups.
-            seed_k = self.request_hasher(
-                (b"mamba_group", gid.to_bytes(4, "little"))
-            )
-            self.mamba_seeds.append(seed_k)
             logger.info(
                 f"Registered mamba group {gid}: "
                 f"{len(group_spec.layer_names)} layers, "
                 f"block_size={spec.block_size}"
             )
 
-    def _ensure_mamba_seeds(self) -> None:
-        """No-op: seeds are now set during _init_mamba_group_info."""
-        pass
+    def _validate_single_store_mamba_blocks(self) -> None:
+        for k, layout in enumerate(self.mamba_kv_cache_layouts):
+            if layout is None:
+                continue
+            mamba_block_size = self.mamba_block_sizes[k]
+            if mamba_block_size != self.hash_block_size:
+                raise RuntimeError(
+                    "Single-store hybrid UCM requires one attention block to "
+                    "map to one Mamba state block. "
+                    f"Mamba group {k} block_size={mamba_block_size}, "
+                    f"attention block_size={self.hash_block_size}. "
+                    "Use mamba_cache_mode='align' or set mamba_block_size to "
+                    "the attention block size."
+                )
+
+    def _mamba_vllm_ids_from_dispatch(
+        self, mamba_dispatch: list[tuple[list[bytes], list[int]]]
+    ) -> list[list[int]]:
+        return [
+            mamba_dispatch[k][1] if k < len(mamba_dispatch) else []
+            for k in range(len(self.mamba_kv_cache_layouts))
+        ]
 
     @property
     def num_mamba_groups(self) -> int:
         return len(self.mamba_group_layer_names)
-
-    def _generate_mamba_hashes(
-        self, token_ids: List[int]
-    ) -> list[list[bytes]]:
-        """Return per-group mamba hash lists derived from token_ids."""
-        result: list[list[bytes]] = []
-        for k, (block_size, seed) in enumerate(
-            zip(self.mamba_block_sizes, self.mamba_seeds)
-        ):
-            hashes = self.generate_hash(block_size, token_ids, seed)
-            result.append(hashes)
-        return result
 
     def generate_hash(
         self, block_size: int, token_ids: List[int], parent_block_hash_value: bytes
@@ -415,7 +518,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
     def _create_store(
         self,
-        kv_cache_layout: Optional[KVCacheLayout],
+        kv_cache_layout: Optional["KVCacheLayout | HybridKVCacheLayout"],
         cpu_affinity_cores: Optional[list[int]] = None,
     ) -> UcmKVStoreBaseV1:
         if len(self.connector_configs) != 1:
@@ -459,37 +562,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
         logger.info(f"create {name} with config: {config}")
         return UcmConnectorFactoryV1.create_connector(name, config, module_path)
 
-    def _create_mamba_store(
-        self,
-        group_idx: int,
-        kv_cache_layout: "KVCacheLayout",
-        cpu_affinity_cores: Optional[list[int]] = None,
-    ) -> UcmKVStoreBaseV1:
-        """Create a per-mamba-group store sharing the same backend config but
-        with a group-scoped unique_id so keys don't collide with attention."""
-        name = self.connector_configs[0]["ucm_connector_name"]
-        module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
-        config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
-        config.setdefault("share_buffer_enable", False)
-        if "storage_backends" in config:
-            config["storage_backends"] = [
-                p for p in config["storage_backends"].split(":")
-            ]
-        config["unique_id"] = f"{self.engine_id}_mamba{group_idx}"
-        config["device_id"] = self.local_rank
-        config["tensor_size_list"] = (
-            kv_cache_layout.tensor_size_list * self.blocks_per_chunk
-        )
-        config["shard_size"] = kv_cache_layout.shard_size * self.blocks_per_chunk
-        config["block_size"] = kv_cache_layout.block_size * self.blocks_per_chunk
-        config["local_rank_size"] = 1
-        if cpu_affinity_cores:
-            config["cpu_affinity_cores"] = list(cpu_affinity_cores)
-        dp_rank = self._vllm_config.parallel_config.data_parallel_rank
-        config["posix_gc_enable"] = dp_rank == 0
-        logger.info(f"create mamba{group_idx} store with config: {config}")
-        return UcmConnectorFactoryV1.create_connector(name, config, module_path)
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
             for layer_name, value in kv_caches.items():
@@ -513,6 +585,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         for names in self.mamba_group_layer_names:
             all_mamba_layer_names.update(names)
 
+        mamba_group_layer_names = self.mamba_group_layer_names
         if all_mamba_layer_names:
             attn_kv_caches = {
                 n: v for n, v in self.kv_caches.items()
@@ -521,16 +594,16 @@ class UCMDirectConnector(KVConnectorBase_V1):
             if not attn_kv_caches:
                 # Degenerate: all layers are mamba; fall back to combined layout
                 attn_kv_caches = self.kv_caches
-                all_mamba_layer_names = set()
+                mamba_group_layer_names = []
         else:
             attn_kv_caches = self.kv_caches
 
-        self.kv_cache_layout = KVCacheLayout(
+        attn_layout = KVCacheLayout(
             attn_kv_caches, self.use_layerwise, self._vllm_config
         )
-        self.block_data_size = self.kv_cache_layout.block_size
-        self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
-        self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        self.layer_name_to_id = attn_layout.layer_name_to_id
+        self.layer_ids = attn_layout.layer_ids
+        self.layer_id_to_row = attn_layout.layer_id_to_row
         self.first_layer_id = self.layer_ids[0]
 
         self.device = create_device()
@@ -542,13 +615,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
             else (None, None)
         )
 
-        self.store = self._create_store(self.kv_cache_layout, store_cores)
-
-        # Build per-mamba-group layouts and stores.
-        self._ensure_mamba_seeds()
+        # Build mamba layouts and fold them into the main store layout.
         self.mamba_kv_cache_layouts = []
-        self.mamba_stores = []
-        for k, group_layer_names in enumerate(self.mamba_group_layer_names):
+        for k, group_layer_names in enumerate(mamba_group_layer_names):
             mamba_kv = {
                 n: self.kv_caches[n]
                 for n in group_layer_names
@@ -559,17 +628,25 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     f"Mamba group {k} has no matching kv_cache entries; skipping."
                 )
                 self.mamba_kv_cache_layouts.append(None)
-                self.mamba_stores.append(None)
                 continue
             mamba_layout = KVCacheLayout(mamba_kv, False, self._vllm_config)
-            mamba_store = self._create_mamba_store(k, mamba_layout, store_cores)
             self.mamba_kv_cache_layouts.append(mamba_layout)
-            self.mamba_stores.append(mamba_store)
             logger.info(
                 f"Mamba group {k}: layout built for "
                 f"{len(mamba_kv)} layers, "
                 f"block_size={self.mamba_block_sizes[k]}"
             )
+
+        if any(layout is not None for layout in self.mamba_kv_cache_layouts):
+            self._validate_single_store_mamba_blocks()
+            self.kv_cache_layout = HybridKVCacheLayout(
+                attn_layout, self.mamba_kv_cache_layouts
+            )
+        else:
+            self.kv_cache_layout = attn_layout
+
+        self.block_data_size = self.kv_cache_layout.block_size
+        self.store = self._create_store(self.kv_cache_layout, store_cores)
 
         if worker_cores:
             try:
@@ -652,17 +729,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if num_total_hit_tokens == request.num_tokens:
             external_hit_tokens -= 1
 
-        # Generate per-mamba-group hashes for offloading (only if we have mamba
-        # groups registered; for pure attention models this is a no-op).
-        mamba_ucm_ids = self._generate_mamba_hashes(request.all_token_ids)
-
         self.requests_meta[request.request_id] = RequestMeta(
             ucm_block_ids=ucm_block_ids,
             hbm_hit_block_num=hbm_hit_block_num,
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
             token_processed=num_total_hit_tokens,
-            mamba_ucm_ids=mamba_ucm_ids,
         )
 
         return external_hit_tokens, False
@@ -719,11 +791,16 @@ class UCMDirectConnector(KVConnectorBase_V1):
             req_meta.token_processed += new_tokens
 
         # ---- Mamba per-group load / dump block IDs ----
+        # Single-store design: mamba uses the same UCM hash keys as attention
+        # (requires mamba_block_size == attention block_size via mamba_cache_mode='align').
         mamba_load: list[tuple[list[bytes], list[int]]] = []
         mamba_dump: list[tuple[list[bytes], list[int]]] = []
         for k, mamba_block_size in enumerate(self.mamba_block_sizes):
-            m_ucm = req_meta.mamba_ucm_ids[k] if k < len(req_meta.mamba_ucm_ids) else []
-            m_vllm = req_meta.mamba_vllm_ids[k] if k < len(req_meta.mamba_vllm_ids) else []
+            m_vllm = (
+                req_meta.mamba_vllm_ids[k]
+                if k < len(req_meta.mamba_vllm_ids)
+                else []
+            )
 
             # Load: mamba blocks whose corresponding token range was hit externally.
             total_hit_tokens = total_hit_block_num * self.block_size
@@ -733,7 +810,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             m_load_ucm: list[bytes] = []
             m_load_vllm: list[int] = []
             if need_load and m_total_hit > m_hbm_hit:
-                m_load_ucm = m_ucm[m_hbm_hit:m_total_hit]
+                m_load_ucm = load_ucm_block_ids
                 m_load_vllm = m_vllm[m_hbm_hit:m_total_hit]
             mamba_load.append((m_load_ucm, m_load_vllm))
 
@@ -743,7 +820,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 token_end_m = old_token_processed + new_tokens
                 m_start = token_start_m // mamba_block_size
                 m_end = token_end_m // mamba_block_size
-                m_dump_ucm = m_ucm[m_start:m_end]
+                m_dump_ucm = dump_ucm_block_ids
                 m_dump_vllm = m_vllm[m_start:m_end]
             else:
                 m_dump_ucm, m_dump_vllm = [], []
@@ -863,7 +940,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
             try:
-                total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
+                mamba_vllm_block_ids = self._mamba_vllm_ids_from_dispatch(
+                    request.mamba_load
+                )
+                total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                    vllm_block_ids, mamba_vllm_block_ids
+                )
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_indexs = [0] * len(ucm_block_ids)
                 task = self.store.load_data(ucm_block_ids, shard_indexs, total_ptrs)
@@ -891,9 +973,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     metadata.request_meta[request_id].load_block_ids[0]
                 )
 
-        # ---- Load mamba state for each group ----
-        self._load_mamba_blocks(metadata)
-
         load_end_time = time.perf_counter() * 1000
         load_speed = (
             num_loaded_block
@@ -911,39 +990,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     "load_speed": load_speed,
                 }
             )
-
-    def _load_mamba_blocks(self, metadata: "UCMConnectorMetadata") -> None:
-        """Load mamba conv/ssm states for all mamba groups."""
-        for k, (store, layout) in enumerate(
-            zip(self.mamba_stores, self.mamba_kv_cache_layouts)
-        ):
-            if store is None or layout is None:
-                continue
-            tasks: list[Task] = []
-            for request_id, req_dispatch in metadata.request_meta.items():
-                if k >= len(req_dispatch.mamba_load):
-                    continue
-                m_ucm, m_vllm = req_dispatch.mamba_load[k]
-                if not m_ucm:
-                    continue
-                try:
-                    ptrs = layout.extract_block_addrs(m_vllm)
-                    ptrs = ptrs.reshape(ptrs.shape[0], -1)
-                    shard_idxs = [0] * len(m_ucm)
-                    task = store.load_data(m_ucm, shard_idxs, ptrs)
-                    tasks.append(task)
-                except Exception as e:
-                    logger.error(
-                        f"mamba group {k} request {request_id} "
-                        f"load error. {type(e).__name__}: {e}"
-                    )
-            for task in tasks:
-                try:
-                    store.wait(task)
-                except Exception as e:
-                    logger.error(
-                        f"mamba group {k} wait load error. {type(e).__name__}: {e}"
-                    )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -980,6 +1026,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         num_saved_block = 0
         num_saved_request = 0
         total_ucm_block_ids, total_vllm_block_ids = [], []
+        total_mamba_vllm_block_ids: list[list[int]] = [
+            [] for _ in self.mamba_kv_cache_layouts
+        ]
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -993,11 +1042,15 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
+            for k, mamba_vllm_ids in enumerate(
+                self._mamba_vllm_ids_from_dispatch(request.mamba_dump)
+            ):
+                total_mamba_vllm_block_ids[k].extend(mamba_vllm_ids)
 
         if is_save:
             try:
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(
-                    total_vllm_block_ids
+                    total_vllm_block_ids, total_mamba_vllm_block_ids
                 )
                 total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                 shard_indexs = [0] * len(total_ucm_block_ids)
@@ -1034,44 +1087,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                         "save_duration": save_end_time - save_start_time,
                         "save_speed": save_speed,
                     },
-                )
-
-        # ---- Save mamba state for each group ----
-        self._save_mamba_blocks(metadata)
-
-    def _save_mamba_blocks(self, metadata: "UCMConnectorMetadata") -> None:
-        """Dump mamba conv/ssm states for all mamba groups."""
-        if self.is_mla and self.tp_rank != 0:
-            return
-        for k, (store, layout) in enumerate(
-            zip(self.mamba_stores, self.mamba_kv_cache_layouts)
-        ):
-            if store is None or layout is None:
-                continue
-            total_ucm: list[bytes] = []
-            total_vllm: list[int] = []
-            for req_dispatch in metadata.request_meta.values():
-                if k >= len(req_dispatch.mamba_dump):
-                    continue
-                m_ucm, m_vllm = req_dispatch.mamba_dump[k]
-                if not m_ucm:
-                    continue
-                if self.tp_rank != 0:
-                    m_ucm = [self.request_hasher(h) for h in m_ucm]
-                total_ucm.extend(m_ucm)
-                total_vllm.extend(m_vllm)
-            if not total_ucm:
-                continue
-            try:
-                ptrs = layout.extract_block_addrs(total_vllm)
-                ptrs = ptrs.reshape(ptrs.shape[0], -1)
-                shard_idxs = [0] * len(total_ucm)
-                event_handle = self._get_dump_event_handle()
-                task = store.dump_data(total_ucm, shard_idxs, ptrs, event_handle)
-                store.wait(task)
-            except Exception as e:
-                logger.error(
-                    f"mamba group {k} dump error. {type(e).__name__}: {e}"
                 )
 
     def clear_connector_metadata(self) -> None:
@@ -1157,7 +1172,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             self.request_data.append((request_id, ucm_block_ids, total_ptrs))
 
         if self.need_load:
-            self._submit_request_load_tasks_for_layer(self.first_layer_id, 0, metadata)
+            self._submit_request_load_tasks_for_layer(
+                self.first_layer_id,
+                self.layer_id_to_row[self.first_layer_id],
+                metadata,
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._connector_metadata:
@@ -1185,7 +1204,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         next_layer_id = current_layer_id + 1
         if next_layer_id not in self.layer_ids:
             return
-        next_local_row = next_layer_id - self.first_layer_id
+        next_local_row = self.layer_id_to_row[next_layer_id]
 
         self._submit_request_load_tasks_for_layer(
             next_layer_id, next_local_row, metadata
@@ -1207,7 +1226,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
         layer_id = self.layer_name_to_id[layer_name]
-        local_layer_id = layer_id - self.first_layer_id
+        local_layer_id = self.layer_id_to_row[layer_id]
         for _, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -1250,11 +1269,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.dump_total_ptrs = None
         if self.enable_event_sync:
             self.device.destroy_event_handles()
-        # Mamba state is coarse-grained (large block_size) so it is always
-        # dumped in one shot rather than layer-by-layer.
-        if self._connector_metadata:
-            metadata = self._get_connector_metadata()
-            self._save_mamba_blocks(metadata)
 
 
 class UCMCPConnector(UCMLayerWiseConnector):
