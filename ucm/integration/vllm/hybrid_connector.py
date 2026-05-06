@@ -6,7 +6,7 @@ import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -15,7 +15,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
-    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.model_executor.models.utils import extract_layer_index
@@ -250,12 +249,6 @@ class HybridKVCacheLayout:
     Column order is attention K/V for all attention layers, then each Mamba
     group's conv/ssm tensors. tensor_size_list describes how many bytes to copy;
     each child KVCacheLayout still owns the correct per-block stride.
-
-    On NPU hybrid layout the physical block granularity for ALL cache types is
-    aligned to the largest ssm block size (e.g. 262144 bytes). Attention blocks
-    whose logical content is smaller (e.g. 65536 bytes) must use this aligned
-    size as their physical stride so that UCM storage and address calculations
-    are consistent with the NPU allocator.
     """
 
     def __init__(
@@ -272,62 +265,12 @@ class HybridKVCacheLayout:
         self.layer_id_to_row = attn_layout.layer_id_to_row
         self.first_layer_id = attn_layout.first_layer_id
 
-    # ------------------------------------------------------------------
-    # NPU alignment helpers
-    # ------------------------------------------------------------------
-
-    def _npu_attn_aligned_stride(self) -> int:
-        """Physical stride to use for each attention tensor slot on NPU.
-
-        On NPU the block allocator aligns all cache types to the ssm block
-        size.  Attention tensors have smaller logical content
-        (stride(0)*element_size, e.g. 65536) but their physical slots are
-        spaced by the ssm block size (e.g. 262144).  We derive this target
-        from the maximum stride found across all mamba layouts.
-
-        Returns 0 when no mamba layouts are present (pure-attention model,
-        no alignment override needed).
-
-        # CONFIRM: verify that the NPU block allocator really places
-        # consecutive attention blocks 'max_mamba_stride' bytes apart.
-        # If attention blocks are truly 65536 bytes apart in physical memory
-        # this override will produce wrong addresses.
-        """
-        max_stride = 0
-        for layout in self.mamba_layouts:
-            if layout is not None:
-                candidate = int(layout.block_stride_lists.max())
-                if candidate > max_stride:
-                    max_stride = candidate
-        return max_stride
-
-    # ------------------------------------------------------------------
-    # Layout properties
-    # ------------------------------------------------------------------
-
     @property
     def tensor_size_list(self) -> list[int]:
-        # Retrieve the per-tensor strides from the attention sub-layout.
-        # This also triggers its internal log print.
-        attn_strides = self.attn_layout.tensor_size_list
-
-        aligned_stride = self._npu_attn_aligned_stride()
-        if aligned_stride > 0:
-            # On NPU each attention tensor slot must use the ssm-aligned
-            # physical stride so UCM storage granularity is consistent.
-            # CONFIRM: aligned_stride == max(ssm block strides) == 262144
-            # for Qwen3-style hybrid models on Ascend.
-            attn_strides = [aligned_stride] * len(attn_strides)
-            logger.info(
-                f"HybridKVCacheLayout: overriding attention tensor sizes "
-                f"to NPU-aligned stride {aligned_stride} bytes "
-                f"({len(attn_strides)} entries)"
-            )
-
-        ret = list(attn_strides)
+        ret = self.attn_layout.tensor_size_list
         for layout in self.mamba_layouts:
             if layout is not None:
-                ret = ret + layout.tensor_size_list
+                ret.extend(layout.tensor_size_list)
         return ret
 
     @property
@@ -351,28 +294,11 @@ class HybridKVCacheLayout:
             )
 
         num_blocks = len(vllm_block_ids)
-        aligned_stride = self._npu_attn_aligned_stride()
-
-        if aligned_stride > 0:
-            # On NPU attention blocks are physically spaced by aligned_stride
-            # (not by the smaller PyTorch-reported stride(0)*element_size).
-            # Recompute addresses using the aligned stride so that the pointer
-            # passed to UCM matches the physical NPU memory location.
-            #
-            # CONFIRM: if PyTorch stride(0)*element_size already equals the
-            # physical spacing (i.e. NPU stride IS 65536, not 262144), remove
-            # this branch and fall through to the else path.
-            vllm_ids_np = np.array(vllm_block_ids, np.uint64)
-            attn_part = (
-                vllm_ids_np[:, None, None] * np.uint64(aligned_stride)
-                + self.attn_layout.base_ptrs[None, :, :]
-            ).reshape(num_blocks, -1)
-        else:
-            attn_part = self.attn_layout.extract_block_addrs(vllm_block_ids).reshape(
+        parts = [
+            self.attn_layout.extract_block_addrs(vllm_block_ids).reshape(
                 num_blocks, -1
             )
-
-        parts = [attn_part]
+        ]
 
         if not any(layout is not None for layout in self.mamba_layouts):
             return parts[0]
@@ -423,7 +349,7 @@ class RequestHasher:
         return h.digest()
 
 
-class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
+class UCMDirectConnector(KVConnectorBase_V1):
     """
     This connector means synchronize:
     load -> forward -> save
@@ -585,59 +511,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             for k in range(len(self.mamba_kv_cache_layouts))
         ]
 
-    @staticmethod
-    def _filter_valid_hybrid_blocks(
-        attn_vllm_ids: list[int],
-        mamba_vllm_ids_per_group: list[list[int]],
-        ucm_block_ids: list[bytes],
-    ) -> tuple[list[int], list[list[int]], list[bytes]]:
-        """Remove positions where any mamba group has block_id == 0 (invalid/padding).
-
-        On NPU hybrid layout the mamba block ID list may contain zeros at
-        positions that have not yet been assigned a real mamba state block
-        (e.g. the leading blocks in a partially-filled request).  Writing to
-        or reading from block 0 corrupts the reserved mamba block, so those
-        positions must be excluded from both the attention and mamba lists
-        before calling extract_block_addrs / UCM store.
-
-        All three lists are filtered by the same valid-position mask so that
-        indices remain consistent across attention, mamba, and UCM key lists.
-
-        # CONFIRM: block_id == 0 is always invalid/padding in this model's
-        # NPU mamba allocator. If 0 can be a legitimate mamba block ID,
-        # use a different sentinel (e.g. -1) or check against the allocator's
-        # reserved-block constant.
-        """
-        if not mamba_vllm_ids_per_group:
-            return attn_vllm_ids, mamba_vllm_ids_per_group, ucm_block_ids
-
-        n = len(attn_vllm_ids)
-        valid = [True] * n
-        for group_ids in mamba_vllm_ids_per_group:
-            for i in range(min(n, len(group_ids))):
-                if group_ids[i] == 0:
-                    valid[i] = False
-
-        if all(valid):
-            return attn_vllm_ids, mamba_vllm_ids_per_group, ucm_block_ids
-
-        idx = [i for i, v in enumerate(valid) if v]
-        filtered_attn = [attn_vllm_ids[i] for i in idx]
-        filtered_mamba = [
-            [g[i] for i in idx if i < len(g)]
-            for g in mamba_vllm_ids_per_group
-        ]
-        filtered_ucm = [ucm_block_ids[i] for i in idx]
-
-        n_removed = n - len(idx)
-        if n_removed:
-            logger.debug(
-                f"_filter_valid_hybrid_blocks: removed {n_removed} "
-                f"block(s) with mamba block_id=0 (invalid/padding) "
-                f"out of {n} total"
-            )
-        return filtered_attn, filtered_mamba, filtered_ucm
-
     @property
     def num_mamba_groups(self) -> int:
         return len(self.mamba_group_layer_names)
@@ -664,7 +537,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _create_store(
         self,
-        kv_cache_layout: Optional["KVCacheLayout | HybridKVCacheLayout"],
+        kv_cache_layout: Optional[KVCacheLayout],
         cpu_affinity_cores: Optional[list[int]] = None,
     ) -> UcmKVStoreBaseV1:
         if len(self.connector_configs) != 1:
@@ -942,8 +815,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             req_meta.token_processed += new_tokens
 
         # ---- Mamba per-group load / dump block IDs ----
-        # Single-store design: mamba uses the same UCM hash keys as attention
-        # (requires mamba_block_size == attention block_size via mamba_cache_mode='align').
         mamba_load: list[tuple[list[bytes], list[int]]] = []
         mamba_dump: list[tuple[list[bytes], list[int]]] = []
         for k, mamba_block_size in enumerate(self.mamba_block_sizes):
@@ -1026,9 +897,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             for k in range(self.num_mamba_groups):
                                 if k + 1 < len(raw_new) and raw_new[k + 1]:
                                     if k >= len(req_meta.mamba_vllm_ids):
-                                        req_meta.mamba_vllm_ids.append(list(raw_new[k + 1]))
+                                        req_meta.mamba_vllm_ids.append(
+                                            list(raw_new[k + 1])
+                                        )
                                     else:
-                                        req_meta.mamba_vllm_ids[k].extend(raw_new[k + 1])
+                                        req_meta.mamba_vllm_ids[k].extend(
+                                            raw_new[k + 1]
+                                        )
                     if hasattr(scheduled_cached_reqs, "resumed_from_preemption"):
                         resumed_from_preemption = (
                             scheduled_cached_reqs.resumed_from_preemption[i]
@@ -1054,9 +929,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         for k in range(self.num_mamba_groups):
                             if k + 1 < len(raw_new) and raw_new[k + 1]:
                                 if k >= len(req_meta.mamba_vllm_ids):
-                                    req_meta.mamba_vllm_ids.append(list(raw_new[k + 1]))
+                                    req_meta.mamba_vllm_ids.append(
+                                        list(raw_new[k + 1])
+                                    )
                                 else:
-                                    req_meta.mamba_vllm_ids[k].extend(raw_new[k + 1])
+                                    req_meta.mamba_vllm_ids[k].extend(
+                                        raw_new[k + 1]
+                                    )
                     requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                         req_meta,
                         scheduler_output.num_scheduled_tokens[request_id],
@@ -1094,18 +973,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 mamba_vllm_block_ids = self._mamba_vllm_ids_from_dispatch(
                     request.mamba_load
                 )
-                # Filter out positions where any mamba group has block_id=0
-                # (padding/invalid blocks assigned by the NPU allocator).
-                # Loading into or from mamba block 0 would corrupt the
-                # reserved slot; skip such positions entirely.
-                if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
-                    vllm_block_ids, mamba_vllm_block_ids, ucm_block_ids = (
-                        self._filter_valid_hybrid_blocks(
-                            vllm_block_ids, mamba_vllm_block_ids, ucm_block_ids
-                        )
-                    )
-                if not vllm_block_ids:
-                    continue
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(
                     vllm_block_ids, mamba_vllm_block_ids
                 )
@@ -1212,22 +1079,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
         if is_save:
             try:
-                # On NPU hybrid layout, positions where any mamba group still
-                # holds block_id=0 (padding/not-yet-allocated) must be removed
-                # before address computation so we never write to the reserved
-                # mamba block 0 or store incomplete state into UCM.
-                if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
-                    (
-                        total_vllm_block_ids,
-                        total_mamba_vllm_block_ids,
-                        total_ucm_block_ids,
-                    ) = self._filter_valid_hybrid_blocks(
-                        total_vllm_block_ids,
-                        total_mamba_vllm_block_ids,
-                        total_ucm_block_ids,
-                    )
-                if not total_vllm_block_ids:
-                    return
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(
                     total_vllm_block_ids, total_mamba_vllm_block_ids
                 )
@@ -1282,13 +1133,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         res = self._invalid_block_ids
         self._invalid_block_ids = set()
         return res
-    
-    def request_finished_all_groups(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-    ) -> tuple[bool, dict[str, Any] | None]:
-        return False, None
 
 
 class UCMLayerWiseConnector(UCMDirectConnector):
@@ -1685,7 +1529,7 @@ class UCMLiteConnector(UCMDirectConnector):
         return 0, False
 
 
-class UCMConnector(KVConnectorBase_V1, SupportsHMA):
+class UCMConnector(KVConnectorBase_V1):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole,
                  kv_cache_config=None):
         super().__init__(vllm_config=vllm_config, role=role)
@@ -1887,11 +1731,3 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
-
-    def request_finished_all_groups(
-        self,
-        request: "Request",
-        block_ids: tuple[list[int], ...],
-    ) -> tuple[bool, dict[str, Any] | None]:
-        return self.connector.request_finished_all_groups(request, block_ids)
-    

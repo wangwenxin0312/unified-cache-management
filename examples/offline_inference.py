@@ -2,7 +2,7 @@ import contextlib
 import os
 import time
 from dataclasses import asdict
-
+import json
 from transformers import AutoTokenizer
 
 # Third Party
@@ -21,19 +21,24 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         kv_connector=name,
         kv_connector_module_path=module_path,
         kv_role="kv_both",
-        kv_connector_extra_config={"UCM_CONFIG_FILE": "./ucm_config_example.yaml"},
+        kv_connector_extra_config={"UCM_CONFIG_FILE": "./ucm_config_example.yaml",
+                                   "use_layerwise":False,
+        },
     )
 
     llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
-        max_model_len=5000,
-        gpu_memory_utilization=0.8,
+        max_model_len=30000,
+        gpu_memory_utilization=0.85,
         max_num_batched_tokens=30000,
         block_size=128,
         enforce_eager=True,
         trust_remote_code=True,
+        tensor_parallel_size=4,
         enable_prefix_caching=False,
+        mamba_cache_mode="align",
+        disable_hybrid_kv_cache_manager=False,
     )
 
     llm = LLM(**asdict(llm_args))
@@ -62,46 +67,39 @@ def print_output(
 def main():
     module_path = "ucm.integration.vllm.ucm_connector"
     name = "UCMConnector"
-    model = os.getenv("MODEL_PATH", "/home/models/DeepSeek-V2-Lite")
+    model = os.getenv("MODEL_PATH", "/home/models/Qwen3-Next-80B-A3B-Instruct/")
 
     tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=True)
-
-    with build_llm_with_uc(module_path, name, model) as llm:
+    
+    def get_prompt(prompt):
         messages = [
             {
                 "role": "system",
-                "content": "You are a highly specialized assistant whose mission is to faithfully reproduce English "
-                "literary texts verbatim, without any deviation, paraphrasing, or omission. Your primary "
-                "responsibility is accuracy: every word, every punctuation mark, and every line must "
-                "appear exactly as in the original source. Core Principles: Verbatim Reproduction: If the "
-                "user asks for a passage, you must output the text word-for-word. Do not alter spelling, "
-                "punctuation, capitalization, or line breaks. Do not paraphrase, summarize, modernize, "
-                "or “improve” the language. Consistency: The same input must always yield the same output. "
-                "Do not generate alternative versions or interpretations. Clarity of Scope: Your role is "
-                "not to explain, interpret, or critique. You are not a storyteller or commentator, "
-                "but a faithful copyist of English literary and cultural texts. Recognizability: Because "
-                "texts must be reproduced exactly, they will carry their own cultural recognition. You "
-                "should not add labels, introductions, or explanations before or after the text. Coverage: "
-                "You must handle passages from classic literature, poetry, speeches, or cultural texts. "
-                "Regardless of tone—solemn, visionary, poetic, persuasive—you must preserve the original "
-                "form, structure, and rhythm by reproducing it precisely. Success Criteria: A human reader "
-                "should be able to compare your output directly with the original and find zero "
-                "differences. The measure of success is absolute textual fidelity. Your function can be "
-                "summarized as follows: verbatim reproduction only, no paraphrase, no commentary, "
-                "no embellishment, no omission.",
+                "content": "先读问题，再根据下面的文章内容回答问题，不要进行分析，不要重复问题，用简短的语句给出答案。\n\n例如：“全国美国文学研究会的第十八届年会在哪所大学举办的？”\n回答应该为：“xx大学”。\n\n",
             },
-            {
-                "role": "user",
-                "content": "Please reproduce verbatim the opening sentence of the United States Declaration of "
-                "Independence (1776), starting with 'When in the Course of human events' and continuing "
-                "word-for-word without paraphrasing.",
-            },
+            {"role": "user", "content": prompt},
         ]
-
-        prompts = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=True,
         )
-        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=100)
+    
+    with build_llm_with_uc(module_path, name, model) as llm:
+        prompts = []
+        batch_size = 20
+        with open("/home/data/Longbench/data/multifieldqa_zh.jsonl", "r") as f:
+            lines = f.readlines()
+        for i in range(batch_size):
+            line = lines[i]
+            data = json.loads(line)
+            prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
+            prompts.append(get_prompt(prompt))
+
+        sampling_params = SamplingParams(
+            temperature=0, top_p=0.95, max_tokens=256, ignore_eos=False
+        )
 
         print_output(llm, prompts, sampling_params, "first")
         print_output(llm, prompts, sampling_params, "second")
