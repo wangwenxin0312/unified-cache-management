@@ -991,7 +991,29 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         if not external_block_ids:
             return 0, False
         try:
-            external_hit_blocks = self.store.lookup_on_prefix(external_block_ids) + 1
+            prefix_hit_index = self.store.lookup_on_prefix(external_block_ids)
+            external_hit_blocks = prefix_hit_index + 1
+            is_hybrid_model = self.num_mamba_groups > 0 or isinstance(
+                getattr(self, "kv_cache_layout", None), HybridKVCacheLayout
+            )
+            if external_hit_blocks == 0 and is_hybrid_model:
+                # Some store stacks can miss prefix lookup after hybrid
+                # physical-shard writes even though individual block keys exist.
+                # Fall back to lookup() so a saved attention shard still counts
+                # as a reusable prefix block.
+                lookup_hits = self.store.lookup(external_block_ids)
+                external_hit_blocks = 0
+                for hit in lookup_hits:
+                    if not hit:
+                        break
+                    external_hit_blocks += 1
+                logger.info(
+                    "Hybrid lookup fallback: "
+                    f"request_id={request.request_id}, "
+                    f"prefix_hit_index={prefix_hit_index}, "
+                    f"lookup_hits={[bool(x) for x in lookup_hits]}, "
+                    f"fallback_external_hit_blocks={external_hit_blocks}"
+                )
             external_hit_blocks //= self.cp_world_size
         except Exception as e:
             external_hit_blocks = 0
@@ -999,11 +1021,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 f"request {request.request_id} look up error. {type(e).__name__}: {e}"
             )
 
-        logger.info_once(
+        logger.info(
             f"request_id: {request.request_id}, "
             f"total_blocks_num: {len(ucm_block_ids)}, "
             f"hit hbm: {hbm_hit_block_num * self.cp_world_size}, "
-            f"hit external: {external_hit_blocks * self.cp_world_size}"
+            f"hit external: {external_hit_blocks * self.cp_world_size}, "
+            f"external_block_ids={[bid.hex() for bid in external_block_ids]}"
         )
         if self.metrics_config:
             ucmmetrics.update_stats(
