@@ -247,15 +247,15 @@ class KVCacheLayout:
 class HybridKVCacheLayout:
     """Single-store layout for attention + Mamba cache blocks.
 
-    Column order is attention K/V for all attention layers, then each Mamba
-    group's conv/ssm tensors. tensor_size_list describes how many bytes to copy;
-    each child KVCacheLayout still owns the correct per-block stride.
+    On Ascend hybrid KV cache, attention and Mamba layers can share the same
+    raw allocation with a physical page layout like:
 
-    On NPU hybrid layout the physical block granularity for ALL cache types is
-    aligned to the largest ssm block size (e.g. 262144 bytes). Attention blocks
-    whose logical content is smaller (e.g. 65536 bytes) must use this aligned
-    size as their physical stride so that UCM storage and address calculations
-    are consistent with the NPU allocator.
+        [conv_or_kv_padding, ssm_or_k, v_or_mamba_padding]
+
+    The store therefore uses the same tensor_size_list for each physical shard
+    type. Shard 0 stores the attention block, and shard k + 1 stores Mamba
+    group k. This lets attention blocks be saved/loaded even when the matching
+    Mamba physical block id is 0 (padding/invalid).
     """
 
     def __init__(
@@ -271,6 +271,37 @@ class HybridKVCacheLayout:
         self.layer_ids = attn_layout.layer_ids
         self.layer_id_to_row = attn_layout.layer_id_to_row
         self.first_layer_id = attn_layout.first_layer_id
+        self._reference_mamba_layout = next(
+            (layout for layout in self.mamba_layouts if layout is not None),
+            None,
+        )
+        self._use_npu_physical_shards = (
+            current_platform.device_type == "npu"
+            and self._reference_mamba_layout is not None
+            and self.attn_layout.base_ptrs.shape[1] >= 2
+            and self._reference_mamba_layout.base_ptrs.shape[1] >= 2
+        )
+        if self._use_npu_physical_shards:
+            ref_rows = self._reference_mamba_layout.base_ptrs.shape[0]
+            attn_rows = self.attn_layout.base_ptrs.shape[0]
+            if ref_rows != attn_rows:
+                raise RuntimeError(
+                    "NPU hybrid physical-shard layout requires matching "
+                    f"attention/Mamba row counts, got {attn_rows} and {ref_rows}."
+                )
+            for k, layout in enumerate(self.mamba_layouts):
+                if layout is None:
+                    continue
+                if (
+                    layout.base_ptrs.shape
+                    != self._reference_mamba_layout.base_ptrs.shape
+                ):
+                    raise RuntimeError(
+                        "NPU hybrid physical-shard layout requires identical "
+                        "Mamba group layouts, got group "
+                        f"{k} shape={layout.base_ptrs.shape}, "
+                        f"expected={self._reference_mamba_layout.base_ptrs.shape}."
+                    )
 
     # ------------------------------------------------------------------
     # NPU alignment helpers
@@ -301,12 +332,102 @@ class HybridKVCacheLayout:
                     max_stride = candidate
         return max_stride
 
+    @property
+    def uses_physical_shards(self) -> bool:
+        return self._use_npu_physical_shards
+
+    @property
+    def physical_shard_count(self) -> int:
+        return 1 + len(self.mamba_layouts)
+
+    def mamba_shard_index(self, group_index: int) -> int:
+        # Shard 0 is reserved for attention.
+        return group_index + 1
+
+    def _physical_tensor_size_list(self) -> list[int]:
+        assert self._reference_mamba_layout is not None
+        aligned_stride = self._npu_attn_aligned_stride()
+        tensor_sizes: list[int] = []
+        for row in range(self.attn_layout.base_ptrs.shape[0]):
+            conv_stride = int(
+                self._reference_mamba_layout.block_stride_lists[row, 0]
+            )
+            middle_stride = max(
+                int(self._reference_mamba_layout.block_stride_lists[row, 1]),
+                int(self.attn_layout.block_stride_lists[row, 0]),
+                aligned_stride,
+            )
+            value_stride = max(
+                int(self.attn_layout.block_stride_lists[row, 1]),
+                middle_stride,
+            )
+            tensor_sizes.extend([conv_stride, middle_stride, value_stride])
+        logger.info(
+            "HybridKVCacheLayout physical tensor sizes: "
+            f"{tensor_sizes}"
+        )
+        return tensor_sizes
+
+    def _extract_attention_physical_addrs(
+        self,
+        vllm_block_ids: List[int],
+    ) -> np.ndarray:
+        assert self._reference_mamba_layout is not None
+        vllm_ids_np = np.array(vllm_block_ids, np.uint64)
+        conv_strides = self._reference_mamba_layout.block_stride_lists[
+            None, :, 0
+        ]
+        conv_bases = self._reference_mamba_layout.base_ptrs[None, :, 0]
+        conv_padding = (
+            vllm_ids_np[:, None] * conv_strides
+            + conv_bases
+        )
+        k_part = (
+            vllm_ids_np[:, None] * np.uint64(self._npu_attn_aligned_stride())
+            + self.attn_layout.base_ptrs[None, :, 0]
+        )
+        v_part = (
+            vllm_ids_np[:, None] * np.uint64(self._npu_attn_aligned_stride())
+            + self.attn_layout.base_ptrs[None, :, 1]
+        )
+        return np.stack((conv_padding, k_part, v_part), axis=2).reshape(
+            len(vllm_block_ids), -1
+        )
+
+    def _extract_mamba_physical_addrs(
+        self,
+        group_index: int,
+        vllm_block_ids: List[int],
+    ) -> np.ndarray:
+        layout = self.mamba_layouts[group_index]
+        if layout is None:
+            raise RuntimeError(f"Mamba group {group_index} has no KV cache layout.")
+        vllm_ids_np = np.array(vllm_block_ids, np.uint64)
+        conv_part = (
+            vllm_ids_np[:, None] * layout.block_stride_lists[None, :, 0]
+            + layout.base_ptrs[None, :, 0]
+        )
+        ssm_part = (
+            vllm_ids_np[:, None] * layout.block_stride_lists[None, :, 1]
+            + layout.base_ptrs[None, :, 1]
+        )
+        v_padding = (
+            vllm_ids_np[:, None] * np.uint64(self._npu_attn_aligned_stride())
+            + self.attn_layout.base_ptrs[None, :, 1]
+        )
+        return np.stack((conv_part, ssm_part, v_padding), axis=2).reshape(
+            len(vllm_block_ids), -1
+        )
+
     # ------------------------------------------------------------------
     # Layout properties
     # ------------------------------------------------------------------
 
     @property
     def tensor_size_list(self) -> list[int]:
+        if self.uses_physical_shards:
+            return self._physical_tensor_size_list()
+
         # Retrieve the per-tensor strides from the attention sub-layout.
         # This also triggers its internal log print.
         attn_strides = self.attn_layout.tensor_size_list
@@ -336,7 +457,30 @@ class HybridKVCacheLayout:
 
     @property
     def block_size(self) -> int:
+        if self.uses_physical_shards:
+            return self.shard_size * self.physical_shard_count
         return self.shard_size
+
+    def extract_attention_block_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
+        if self.uses_physical_shards:
+            return self._extract_attention_physical_addrs(vllm_block_ids)
+        return self.attn_layout.extract_block_addrs(vllm_block_ids).reshape(
+            len(vllm_block_ids), -1
+        )
+
+    def extract_mamba_block_addrs(
+        self,
+        group_index: int,
+        vllm_block_ids: List[int],
+    ) -> np.ndarray:
+        if self.uses_physical_shards:
+            return self._extract_mamba_physical_addrs(group_index, vllm_block_ids)
+        layout = self.mamba_layouts[group_index]
+        if layout is None:
+            raise RuntimeError(f"Mamba group {group_index} has no KV cache layout.")
+        return layout.extract_block_addrs(vllm_block_ids).reshape(
+            len(vllm_block_ids), -1
+        )
 
     def extract_block_addrs(
         self,
@@ -586,57 +730,38 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         ]
 
     @staticmethod
-    def _filter_valid_hybrid_blocks(
-        attn_vllm_ids: list[int],
-        mamba_vllm_ids_per_group: list[list[int]],
+    def _filter_nonzero_mamba_blocks(
         ucm_block_ids: list[bytes],
-    ) -> tuple[list[int], list[list[int]], list[bytes]]:
-        """Remove positions where any mamba group has block_id == 0 (invalid/padding).
+        mamba_vllm_ids: list[int],
+    ) -> tuple[list[bytes], list[int]]:
+        if not ucm_block_ids or not mamba_vllm_ids:
+            return [], []
 
-        On NPU hybrid layout the mamba block ID list may contain zeros at
-        positions that have not yet been assigned a real mamba state block
-        (e.g. the leading blocks in a partially-filled request).  Writing to
-        or reading from block 0 corrupts the reserved mamba block, so those
-        positions must be excluded from both the attention and mamba lists
-        before calling extract_block_addrs / UCM store.
-
-        All three lists are filtered by the same valid-position mask so that
-        indices remain consistent across attention, mamba, and UCM key lists.
-
-        # CONFIRM: block_id == 0 is always invalid/padding in this model's
-        # NPU mamba allocator. If 0 can be a legitimate mamba block ID,
-        # use a different sentinel (e.g. -1) or check against the allocator's
-        # reserved-block constant.
-        """
-        if not mamba_vllm_ids_per_group:
-            return attn_vllm_ids, mamba_vllm_ids_per_group, ucm_block_ids
-
-        n = len(attn_vllm_ids)
-        valid = [True] * n
-        for group_ids in mamba_vllm_ids_per_group:
-            for i in range(min(n, len(group_ids))):
-                if group_ids[i] == 0:
-                    valid[i] = False
-
-        if all(valid):
-            return attn_vllm_ids, mamba_vllm_ids_per_group, ucm_block_ids
-
-        idx = [i for i, v in enumerate(valid) if v]
-        filtered_attn = [attn_vllm_ids[i] for i in idx]
-        filtered_mamba = [
-            [g[i] for i in idx if i < len(g)]
-            for g in mamba_vllm_ids_per_group
-        ]
-        filtered_ucm = [ucm_block_ids[i] for i in idx]
-
-        n_removed = n - len(idx)
-        if n_removed:
+        n = min(len(ucm_block_ids), len(mamba_vllm_ids))
+        filtered_ucm: list[bytes] = []
+        filtered_vllm: list[int] = []
+        for i in range(n):
+            block_id = mamba_vllm_ids[i]
+            if block_id == 0:
+                continue
+            filtered_ucm.append(ucm_block_ids[i])
+            filtered_vllm.append(block_id)
+        skipped = n - len(filtered_vllm)
+        if skipped:
             logger.debug(
-                f"_filter_valid_hybrid_blocks: removed {n_removed} "
-                f"block(s) with mamba block_id=0 (invalid/padding) "
-                f"out of {n} total"
+                f"_filter_nonzero_mamba_blocks: skipped {skipped} "
+                "padding/invalid Mamba block(s)."
             )
-        return filtered_attn, filtered_mamba, filtered_ucm
+        return filtered_ucm, filtered_vllm
+
+    def _hash_ucm_ids_for_transfer(
+        self,
+        ucm_block_ids: list[bytes],
+        skip_mla: bool = False,
+    ) -> list[bytes]:
+        if self.tp_rank == 0 or (skip_mla and self.is_mla):
+            return list(ucm_block_ids)
+        return [self.request_hasher(block_id) for block_id in ucm_block_ids]
 
     @property
     def num_mamba_groups(self) -> int:
@@ -1074,7 +1199,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
-        request_to_task: dict[str, Task] = {}
+        request_tasks: list[tuple[str, Task]] = []
         is_load = False
         num_loaded_block = 0
         num_loaded_request = 0
@@ -1086,33 +1211,64 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             num_loaded_block += len(request.load_block_ids[0])
             num_loaded_request += 1
 
-            ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.tp_rank != 0 and not self.is_mla:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            raw_ucm_block_ids, vllm_block_ids = request.load_block_ids
+            ucm_block_ids = self._hash_ucm_ids_for_transfer(
+                raw_ucm_block_ids, skip_mla=True
+            )
             try:
                 mamba_vllm_block_ids = self._mamba_vllm_ids_from_dispatch(
                     request.mamba_load
                 )
-                # Filter out positions where any mamba group has block_id=0
-                # (padding/invalid blocks assigned by the NPU allocator).
-                # Loading into or from mamba block 0 would corrupt the
-                # reserved slot; skip such positions entirely.
-                if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
-                    vllm_block_ids, mamba_vllm_block_ids, ucm_block_ids = (
-                        self._filter_valid_hybrid_blocks(
-                            vllm_block_ids, mamba_vllm_block_ids, ucm_block_ids
+                if (
+                    isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+                    and self.kv_cache_layout.uses_physical_shards
+                ):
+                    if vllm_block_ids:
+                        attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
+                            vllm_block_ids
                         )
+                        shard_indexs = [0] * len(ucm_block_ids)
+                        task = self.store.load_data(
+                            ucm_block_ids, shard_indexs, attn_ptrs
+                        )
+                        request_tasks.append((request_id, task))
+
+                    for k, mamba_vllm_ids in enumerate(mamba_vllm_block_ids):
+                        m_ucm_ids = (
+                            request.mamba_load[k][0]
+                            if k < len(request.mamba_load)
+                            else []
+                        )
+                        m_ucm_ids = self._hash_ucm_ids_for_transfer(
+                            m_ucm_ids, skip_mla=True
+                        )
+                        m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                            m_ucm_ids, mamba_vllm_ids
+                        )
+                        if not m_vllm_ids:
+                            continue
+                        m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
+                            k, m_vllm_ids
+                        )
+                        shard_indexs = [
+                            self.kv_cache_layout.mamba_shard_index(k)
+                        ] * len(m_ucm_ids)
+                        task = self.store.load_data(
+                            m_ucm_ids, shard_indexs, m_ptrs
+                        )
+                        request_tasks.append((request_id, task))
+                else:
+                    if not vllm_block_ids:
+                        continue
+                    total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                        vllm_block_ids, mamba_vllm_block_ids
                     )
-                if not vllm_block_ids:
-                    continue
-                total_ptrs = self.kv_cache_layout.extract_block_addrs(
-                    vllm_block_ids, mamba_vllm_block_ids
-                )
-                total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
-                shard_indexs = [0] * len(ucm_block_ids)
-                task = self.store.load_data(ucm_block_ids, shard_indexs, total_ptrs)
-                request_to_task[request_id] = task
+                    total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+                    shard_indexs = [0] * len(ucm_block_ids)
+                    task = self.store.load_data(
+                        ucm_block_ids, shard_indexs, total_ptrs
+                    )
+                    request_tasks.append((request_id, task))
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit load task error. {type(e).__name__}: {e}"
@@ -1122,7 +1278,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 num_loaded_block -= len(request.load_block_ids[0])
 
-        for request_id, task in request_to_task.items():
+        for request_id, task in request_tasks:
             try:
                 self.store.wait(task)
             except Exception as e:
@@ -1192,6 +1348,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         total_mamba_vllm_block_ids: list[list[int]] = [
             [] for _ in self.mamba_kv_cache_layouts
         ]
+        total_mamba_ucm_block_ids: list[list[bytes]] = [
+            [] for _ in self.mamba_kv_cache_layouts
+        ]
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -1199,46 +1358,74 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             num_saved_block += len(request.dump_block_ids[0])
             num_saved_request += 1
 
-            ucm_block_ids, vllm_block_ids = request.dump_block_ids
-            if self.tp_rank != 0:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            raw_ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            ucm_block_ids = self._hash_ucm_ids_for_transfer(raw_ucm_block_ids)
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
             for k, mamba_vllm_ids in enumerate(
                 self._mamba_vllm_ids_from_dispatch(request.mamba_dump)
             ):
+                m_ucm_ids = (
+                    request.mamba_dump[k][0] if k < len(request.mamba_dump) else []
+                )
+                m_ucm_ids = self._hash_ucm_ids_for_transfer(m_ucm_ids)
+                total_mamba_ucm_block_ids[k].extend(m_ucm_ids)
                 total_mamba_vllm_block_ids[k].extend(mamba_vllm_ids)
 
         if is_save:
             try:
-                # On NPU hybrid layout, positions where any mamba group still
-                # holds block_id=0 (padding/not-yet-allocated) must be removed
-                # before address computation so we never write to the reserved
-                # mamba block 0 or store incomplete state into UCM.
-                if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
-                    (
-                        total_vllm_block_ids,
-                        total_mamba_vllm_block_ids,
-                        total_ucm_block_ids,
-                    ) = self._filter_valid_hybrid_blocks(
-                        total_vllm_block_ids,
-                        total_mamba_vllm_block_ids,
-                        total_ucm_block_ids,
+                if (
+                    isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+                    and self.kv_cache_layout.uses_physical_shards
+                ):
+                    event_handle = self._get_dump_event_handle()
+                    save_start_time = time.perf_counter() * 1000
+                    if total_vllm_block_ids:
+                        attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
+                            total_vllm_block_ids
+                        )
+                        shard_indexs = [0] * len(total_ucm_block_ids)
+                        task = self.store.dump_data(
+                            total_ucm_block_ids,
+                            shard_indexs,
+                            attn_ptrs,
+                            event_handle,
+                        )
+                        dump_tasks.append(task)
+
+                    for k, mamba_vllm_ids in enumerate(total_mamba_vllm_block_ids):
+                        m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                            total_mamba_ucm_block_ids[k], mamba_vllm_ids
+                        )
+                        if not m_vllm_ids:
+                            continue
+                        m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
+                            k, m_vllm_ids
+                        )
+                        shard_indexs = [
+                            self.kv_cache_layout.mamba_shard_index(k)
+                        ] * len(m_ucm_ids)
+                        task = self.store.dump_data(
+                            m_ucm_ids,
+                            shard_indexs,
+                            m_ptrs,
+                            event_handle,
+                        )
+                        dump_tasks.append(task)
+                else:
+                    if not total_vllm_block_ids:
+                        return
+                    total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                        total_vllm_block_ids, total_mamba_vllm_block_ids
                     )
-                if not total_vllm_block_ids:
-                    return
-                total_ptrs = self.kv_cache_layout.extract_block_addrs(
-                    total_vllm_block_ids, total_mamba_vllm_block_ids
-                )
-                total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
-                shard_indexs = [0] * len(total_ucm_block_ids)
-                event_handle = self._get_dump_event_handle()
-                save_start_time = time.perf_counter() * 1000
-                task = self.store.dump_data(
-                    total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
-                )
-                dump_tasks.append(task)
+                    total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+                    shard_indexs = [0] * len(total_ucm_block_ids)
+                    event_handle = self._get_dump_event_handle()
+                    save_start_time = time.perf_counter() * 1000
+                    task = self.store.dump_data(
+                        total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
+                    )
+                    dump_tasks.append(task)
             except Exception as e:
                 logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
                 return
@@ -1282,7 +1469,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         res = self._invalid_block_ids
         self._invalid_block_ids = set()
         return res
-    
+
     def request_finished_all_groups(
         self,
         request: "Request",
@@ -1894,4 +2081,3 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         return self.connector.request_finished_all_groups(request, block_ids)
-    
