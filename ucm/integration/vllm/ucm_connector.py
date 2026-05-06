@@ -1511,6 +1511,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 ):
                     event_handle = self._get_dump_event_handle()
                     save_start_time = time.perf_counter() * 1000
+                    commit_shard = self.kv_cache_layout.physical_shard_count - 1
+                    hybrid_ucm_block_ids: list[bytes] = []
+                    hybrid_shard_indexs: list[int] = []
+                    hybrid_ptrs: list[np.ndarray] = []
+                    max_shard_by_block: dict[bytes, int] = {}
+                    commit_ptr_by_block: dict[bytes, np.ndarray] = {}
                     logger.info(
                         "Hybrid save split: "
                         f"attention_blocks={len(total_vllm_block_ids)}, "
@@ -1523,14 +1529,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
                             total_vllm_block_ids
                         )
-                        shard_indexs = [0] * len(total_ucm_block_ids)
-                        task = self.store.dump_data(
-                            total_ucm_block_ids,
-                            shard_indexs,
-                            attn_ptrs,
-                            event_handle,
-                        )
-                        dump_tasks.append(task)
+                        for i, block_id in enumerate(total_ucm_block_ids):
+                            ptr_row = np.ascontiguousarray(attn_ptrs[i])
+                            hybrid_ucm_block_ids.append(block_id)
+                            hybrid_shard_indexs.append(0)
+                            hybrid_ptrs.append(ptr_row)
+                            max_shard_by_block[block_id] = max(
+                                max_shard_by_block.get(block_id, -1), 0
+                            )
+                            commit_ptr_by_block[block_id] = ptr_row
 
                     for k, mamba_vllm_ids in enumerate(total_mamba_vllm_block_ids):
                         raw_mamba_count = min(
@@ -1555,13 +1562,42 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
-                        shard_indexs = [
-                            self.kv_cache_layout.mamba_shard_index(k)
-                        ] * len(m_ucm_ids)
+                        shard_index = self.kv_cache_layout.mamba_shard_index(k)
+                        for i, block_id in enumerate(m_ucm_ids):
+                            ptr_row = np.ascontiguousarray(m_ptrs[i])
+                            hybrid_ucm_block_ids.append(block_id)
+                            hybrid_shard_indexs.append(shard_index)
+                            hybrid_ptrs.append(ptr_row)
+                            max_shard_by_block[block_id] = max(
+                                max_shard_by_block.get(block_id, -1), shard_index
+                            )
+                            commit_ptr_by_block.setdefault(block_id, ptr_row)
+
+                    commit_marker_ids: list[str] = []
+                    for block_id, max_shard in max_shard_by_block.items():
+                        if max_shard >= commit_shard:
+                            continue
+                        ptr_row = commit_ptr_by_block.get(block_id)
+                        if ptr_row is None:
+                            continue
+                        hybrid_ucm_block_ids.append(block_id)
+                        hybrid_shard_indexs.append(commit_shard)
+                        hybrid_ptrs.append(ptr_row)
+                        commit_marker_ids.append(block_id.hex())
+
+                    if commit_marker_ids:
+                        logger.warning(
+                            "Hybrid save split: added commit marker shard(s) "
+                            "for attention-only blocks, "
+                            f"commit_shard={commit_shard}, "
+                            f"block_ids={commit_marker_ids}"
+                        )
+
+                    if hybrid_ucm_block_ids:
                         task = self.store.dump_data(
-                            m_ucm_ids,
-                            shard_indexs,
-                            m_ptrs,
+                            hybrid_ucm_block_ids,
+                            hybrid_shard_indexs,
+                            np.asarray(hybrid_ptrs, dtype=np.uint64),
                             event_handle,
                         )
                         dump_tasks.append(task)
@@ -1587,6 +1623,20 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 for task in dump_tasks:
                     self.store.wait(task)
                 save_end_time = time.perf_counter() * 1000
+                if total_ucm_block_ids:
+                    try:
+                        post_save_hits = self.store.lookup(total_ucm_block_ids)
+                        logger.info(
+                            "Hybrid save verify: "
+                            f"attention_ucm_block_ids="
+                            f"{[bid.hex() for bid in total_ucm_block_ids]}, "
+                            f"lookup_hits={[bool(x) for x in post_save_hits]}"
+                        )
+                    except Exception as lookup_e:
+                        logger.error(
+                            "Hybrid save verify lookup failed. "
+                            f"{type(lookup_e).__name__}: {lookup_e}"
+                        )
             except Exception as e:
                 logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
                 return
