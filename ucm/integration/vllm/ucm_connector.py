@@ -302,6 +302,22 @@ class HybridKVCacheLayout:
                         f"{k} shape={layout.base_ptrs.shape}, "
                         f"expected={self._reference_mamba_layout.base_ptrs.shape}."
                     )
+            logger.info(
+                "HybridKVCacheLayout: enabled NPU physical-shard mode, "
+                f"attn_rows={attn_rows}, "
+                f"attn_ptrs_per_row={self.attn_layout.base_ptrs.shape[1]}, "
+                f"mamba_groups={len(self.mamba_layouts)}, "
+                f"mamba_ptrs_per_row={self._reference_mamba_layout.base_ptrs.shape[1]}, "
+                f"aligned_stride={self._npu_attn_aligned_stride()}, "
+                f"physical_shard_count={self.physical_shard_count}"
+            )
+        else:
+            logger.info(
+                "HybridKVCacheLayout: using concatenated layout mode, "
+                f"platform={current_platform.device_type}, "
+                f"attn_shape={self.attn_layout.base_ptrs.shape}, "
+                f"has_mamba_layout={self._reference_mamba_layout is not None}"
+            )
 
     # ------------------------------------------------------------------
     # NPU alignment helpers
@@ -703,7 +719,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             logger.info(
                 f"Registered mamba group {gid}: "
                 f"{len(group_spec.layer_names)} layers, "
-                f"block_size={spec.block_size}"
+                f"block_size={spec.block_size}, "
+                f"page_size_bytes={spec.page_size_bytes}, "
+                f"page_size_padded={getattr(spec, 'page_size_padded', None)}, "
+                f"shapes={spec.shapes}, "
+                f"dtypes={[str(dtype) for dtype in spec.dtypes]}"
             )
 
     def _validate_single_store_mamba_blocks(self) -> None:
@@ -1223,6 +1243,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     isinstance(self.kv_cache_layout, HybridKVCacheLayout)
                     and self.kv_cache_layout.uses_physical_shards
                 ):
+                    logger.info(
+                        "Hybrid load split: "
+                        f"request_id={request_id}, "
+                        f"attention_blocks={len(vllm_block_ids)}, "
+                        f"attention_shard=0, "
+                        f"mamba_groups={len(mamba_vllm_block_ids)}"
+                    )
                     if vllm_block_ids:
                         attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
                             vllm_block_ids
@@ -1242,8 +1269,18 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         m_ucm_ids = self._hash_ucm_ids_for_transfer(
                             m_ucm_ids, skip_mla=True
                         )
+                        raw_mamba_count = min(len(m_ucm_ids), len(mamba_vllm_ids))
                         m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             m_ucm_ids, mamba_vllm_ids
+                        )
+                        logger.info(
+                            "Hybrid load split: "
+                            f"request_id={request_id}, "
+                            f"mamba_group={k}, "
+                            f"mamba_shard={self.kv_cache_layout.mamba_shard_index(k)}, "
+                            f"raw_mamba_blocks={raw_mamba_count}, "
+                            f"valid_mamba_blocks={len(m_vllm_ids)}, "
+                            f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}"
                         )
                         if not m_vllm_ids:
                             continue
@@ -1380,6 +1417,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 ):
                     event_handle = self._get_dump_event_handle()
                     save_start_time = time.perf_counter() * 1000
+                    logger.info(
+                        "Hybrid save split: "
+                        f"attention_blocks={len(total_vllm_block_ids)}, "
+                        f"attention_shard=0, "
+                        f"mamba_groups={len(total_mamba_vllm_block_ids)}"
+                    )
                     if total_vllm_block_ids:
                         attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
                             total_vllm_block_ids
@@ -1394,8 +1437,20 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         dump_tasks.append(task)
 
                     for k, mamba_vllm_ids in enumerate(total_mamba_vllm_block_ids):
+                        raw_mamba_count = min(
+                            len(total_mamba_ucm_block_ids[k]),
+                            len(mamba_vllm_ids),
+                        )
                         m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             total_mamba_ucm_block_ids[k], mamba_vllm_ids
+                        )
+                        logger.info(
+                            "Hybrid save split: "
+                            f"mamba_group={k}, "
+                            f"mamba_shard={self.kv_cache_layout.mamba_shard_index(k)}, "
+                            f"raw_mamba_blocks={raw_mamba_count}, "
+                            f"valid_mamba_blocks={len(m_vllm_ids)}, "
+                            f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}"
                         )
                         if not m_vllm_ids:
                             continue
