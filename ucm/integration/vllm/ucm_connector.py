@@ -50,6 +50,8 @@ logger = init_logger(__name__)
 @dataclass
 class RequestMeta:
     ucm_block_ids: list[bytes] = field(default_factory=list)
+    lookup_block_ids: list[bytes] = field(default_factory=list)
+    lookup_block_ids_hashed: bool = False
     hbm_hit_block_num: int = 0
     # local_computed_block + external_computed_block
     total_hit_block_num: int = 0
@@ -66,6 +68,7 @@ class RequestDispatchMeta:
         list[bytes], list[int]
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
+    load_block_ids_hashed: bool = False
     # Per mamba group: (ucm_ids, vllm_ids) for load and dump
     mamba_load: list[tuple[list[bytes], list[int]]] = field(default_factory=list)
     mamba_dump: list[tuple[list[bytes], list[int]]] = field(default_factory=list)
@@ -695,6 +698,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         self.cp_world_size = 1
         self.hash_block_size = self.block_size
         self.block_size *= self.cp_world_size
+        self._rank_request_hashers: dict[int, RequestHasher] = {}
 
     # ------------------------------------------------------------------
     # Hybrid-model helpers
@@ -782,6 +786,45 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         if self.tp_rank == 0 or (skip_mla and self.is_mla):
             return list(ucm_block_ids)
         return [self.request_hasher(block_id) for block_id in ucm_block_ids]
+
+    def _hash_ucm_ids_for_rank(
+        self,
+        ucm_block_ids: list[bytes],
+        rank_id: int,
+    ) -> list[bytes]:
+        if rank_id == 0:
+            return list(ucm_block_ids)
+        hasher = self._rank_request_hashers.get(rank_id)
+        if hasher is None:
+            hasher = RequestHasher(self._vllm_config, rank_id)
+            self._rank_request_hashers[rank_id] = hasher
+        return [hasher(block_id) for block_id in ucm_block_ids]
+
+    def _lookup_prefix_blocks(
+        self,
+        block_ids: list[bytes],
+        request_id: str,
+        label: str,
+    ) -> int:
+        if not block_ids:
+            return 0
+        prefix_hit_index = self.store.lookup_on_prefix(block_ids)
+        hit_blocks = prefix_hit_index + 1
+        if hit_blocks == 0:
+            lookup_hits = self.store.lookup(block_ids)
+            for hit in lookup_hits:
+                if not hit:
+                    break
+                hit_blocks += 1
+            logger.info(
+                "Hybrid lookup fallback: "
+                f"request_id={request_id}, "
+                f"label={label}, "
+                f"prefix_hit_index={prefix_hit_index}, "
+                f"lookup_hits={[bool(x) for x in lookup_hits]}, "
+                f"fallback_external_hit_blocks={hit_blocks}"
+            )
+        return hit_blocks
 
     @property
     def num_mamba_groups(self) -> int:
@@ -990,30 +1033,45 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         external_block_ids = ucm_block_ids[hbm_hit_block_num * self.cp_world_size :]
         if not external_block_ids:
             return 0, False
+        lookup_block_ids = ucm_block_ids
+        lookup_block_ids_hashed = False
         try:
-            prefix_hit_index = self.store.lookup_on_prefix(external_block_ids)
-            external_hit_blocks = prefix_hit_index + 1
             is_hybrid_model = self.num_mamba_groups > 0 or isinstance(
                 getattr(self, "kv_cache_layout", None), HybridKVCacheLayout
             )
-            if external_hit_blocks == 0 and is_hybrid_model:
-                # Some store stacks can miss prefix lookup after hybrid
-                # physical-shard writes even though individual block keys exist.
-                # Fall back to lookup() so a saved attention shard still counts
-                # as a reusable prefix block.
-                lookup_hits = self.store.lookup(external_block_ids)
-                external_hit_blocks = 0
-                for hit in lookup_hits:
-                    if not hit:
-                        break
-                    external_hit_blocks += 1
-                logger.info(
-                    "Hybrid lookup fallback: "
-                    f"request_id={request.request_id}, "
-                    f"prefix_hit_index={prefix_hit_index}, "
-                    f"lookup_hits={[bool(x) for x in lookup_hits]}, "
-                    f"fallback_external_hit_blocks={external_hit_blocks}"
+            if is_hybrid_model:
+                external_hit_blocks = self._lookup_prefix_blocks(
+                    external_block_ids, request.request_id, "base"
                 )
+                if external_hit_blocks == 0 and self.tp_size > 1:
+                    for rank_id in range(1, self.tp_size):
+                        rank_lookup_block_ids = self._hash_ucm_ids_for_rank(
+                            ucm_block_ids, rank_id
+                        )
+                        rank_external_block_ids = rank_lookup_block_ids[
+                            hbm_hit_block_num * self.cp_world_size :
+                        ]
+                        rank_hit_blocks = self._lookup_prefix_blocks(
+                            rank_external_block_ids,
+                            request.request_id,
+                            f"tp_rank_{rank_id}",
+                        )
+                        if rank_hit_blocks > 0:
+                            external_hit_blocks = rank_hit_blocks
+                            lookup_block_ids = rank_lookup_block_ids
+                            lookup_block_ids_hashed = True
+                            logger.warning(
+                                "Hybrid lookup matched rank-specific keys; "
+                                "using them for this request. "
+                                f"request_id={request.request_id}, "
+                                f"matched_rank={rank_id}, "
+                                f"external_hit_blocks={external_hit_blocks}"
+                            )
+                            break
+            else:
+                external_hit_blocks = self.store.lookup_on_prefix(
+                    external_block_ids
+                ) + 1
             external_hit_blocks //= self.cp_world_size
         except Exception as e:
             external_hit_blocks = 0
@@ -1050,6 +1108,8 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.requests_meta[request.request_id] = RequestMeta(
             ucm_block_ids=ucm_block_ids,
+            lookup_block_ids=lookup_block_ids,
+            lookup_block_ids_hashed=lookup_block_ids_hashed,
             hbm_hit_block_num=hbm_hit_block_num,
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
@@ -1085,12 +1145,17 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         hbm_hit_block_num = req_meta.hbm_hit_block_num
         total_hit_block_num = req_meta.total_hit_block_num
         ucm_block_ids = req_meta.ucm_block_ids
+        lookup_block_ids = (
+            req_meta.lookup_block_ids
+            if req_meta.lookup_block_ids
+            else req_meta.ucm_block_ids
+        )
         req_meta.vllm_block_ids.extend(vllm_block_ids)
 
         load_ucm_block_ids, load_vllm_block_ids = [], []
         dump_ucm_block_ids, dump_vllm_block_ids = [], []
         if need_load:
-            load_ucm_block_ids = ucm_block_ids[
+            load_ucm_block_ids = lookup_block_ids[
                 hbm_hit_block_num
                 * self.cp_world_size : total_hit_block_num
                 * self.cp_world_size
@@ -1148,6 +1213,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
+            load_block_ids_hashed=req_meta.lookup_block_ids_hashed,
             mamba_load=mamba_load,
             mamba_dump=mamba_dump,
         )
@@ -1255,8 +1321,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             num_loaded_request += 1
 
             raw_ucm_block_ids, vllm_block_ids = request.load_block_ids
-            ucm_block_ids = self._hash_ucm_ids_for_transfer(
-                raw_ucm_block_ids, skip_mla=True
+            ucm_block_ids = (
+                list(raw_ucm_block_ids)
+                if request.load_block_ids_hashed
+                else self._hash_ucm_ids_for_transfer(
+                    raw_ucm_block_ids, skip_mla=True
+                )
             )
             try:
                 mamba_vllm_block_ids = self._mamba_vllm_ids_from_dispatch(
@@ -1289,9 +1359,10 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             if k < len(request.mamba_load)
                             else []
                         )
-                        m_ucm_ids = self._hash_ucm_ids_for_transfer(
-                            m_ucm_ids, skip_mla=True
-                        )
+                        if not request.load_block_ids_hashed:
+                            m_ucm_ids = self._hash_ucm_ids_for_transfer(
+                                m_ucm_ids, skip_mla=True
+                            )
                         raw_mamba_count = min(len(m_ucm_ids), len(mamba_vllm_ids))
                         m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             m_ucm_ids, mamba_vllm_ids
@@ -1444,7 +1515,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         "Hybrid save split: "
                         f"attention_blocks={len(total_vllm_block_ids)}, "
                         f"attention_shard=0, "
-                        f"mamba_groups={len(total_mamba_vllm_block_ids)}"
+                        f"mamba_groups={len(total_mamba_vllm_block_ids)}, "
+                        f"attention_ucm_block_ids="
+                        f"{[bid.hex() for bid in total_ucm_block_ids]}"
                     )
                     if total_vllm_block_ids:
                         attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
@@ -1473,7 +1546,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             f"mamba_shard={self.kv_cache_layout.mamba_shard_index(k)}, "
                             f"raw_mamba_blocks={raw_mamba_count}, "
                             f"valid_mamba_blocks={len(m_vllm_ids)}, "
-                            f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}"
+                            f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}, "
+                            f"mamba_ucm_block_ids="
+                            f"{[bid.hex() for bid in m_ucm_ids]}"
                         )
                         if not m_vllm_ids:
                             continue
