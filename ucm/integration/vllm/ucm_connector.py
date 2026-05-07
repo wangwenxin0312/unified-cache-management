@@ -833,21 +833,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return [], []
 
-        target_vllm_id = mamba_vllm_ids[target_idx]
-        logger.info(
-            "Hybrid mamba align load remap: "
-            f"dispatch_step={dispatch_step}, "
-            f"dispatch_source={dispatch_source}, "
-            f"request_id={request_id}, "
-            f"mamba_group={group_index}, "
-            f"source_prefix_idx={source_prefix_idx}, "
-            f"source_ucm_block_id={source_ucm_id.hex()}, "
-            f"target_state_idx={target_idx}, "
-            f"target_vllm_block_id={target_vllm_id}, "
-            f"total_hit_blocks={total_hit_block_num}, "
-            f"new_tokens={new_tokens}"
-        )
-        return [source_ucm_id], [target_vllm_id]
+        return [source_ucm_id], [mamba_vllm_ids[target_idx]]
 
     def _select_mamba_dump_blocks(
         self,
@@ -883,20 +869,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             )
             return [], []
 
-        source_vllm_id = mamba_vllm_ids[target_idx]
-        boundary_ucm_id = dump_ucm_block_ids[-1]
-        logger.info(
-            "Hybrid mamba align dump remap: "
-            f"dispatch_step={dispatch_step}, "
-            f"dispatch_source={dispatch_source}, "
-            f"request_id={request_id}, "
-            f"mamba_group={group_index}, "
-            f"boundary_ucm_block_id={boundary_ucm_id.hex()}, "
-            f"source_state_idx={target_idx}, "
-            f"source_vllm_block_id={source_vllm_id}, "
-            f"token_end={token_end}"
-        )
-        return [boundary_ucm_id], [source_vllm_id]
+        return [dump_ucm_block_ids[-1]], [mamba_vllm_ids[target_idx]]
 
     @staticmethod
     def _filter_nonzero_mamba_blocks(
@@ -924,12 +897,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             filtered_ucm.append(ucm_block_ids[i])
             filtered_vllm.append(block_id)
-        skipped = n - len(filtered_vllm)
-        if skipped:
-            logger.debug(
-                f"_filter_nonzero_mamba_blocks: skipped {skipped} "
-                "padding/invalid Mamba block(s)."
-            )
         return filtered_ucm, filtered_vllm
 
     def _hash_ucm_ids_for_transfer(
@@ -1003,14 +970,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 if not hit:
                     break
                 hit_blocks += 1
-            logger.info(
-                "Hybrid lookup fallback: "
-                f"request_id={request_id}, "
-                f"label={label}, "
-                f"prefix_hit_index={prefix_hit_index}, "
-                f"lookup_hits={[bool(x) for x in lookup_hits]}, "
-                f"fallback_external_hit_blocks={hit_blocks}"
-            )
         return hit_blocks
 
     def _lookup_hybrid_prefix_blocks(
@@ -1027,7 +986,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             return attention_hit_blocks
 
         hybrid_hit_blocks = 0
-        mamba_boundary_hits: list[tuple[int, list[bool]]] = []
         for hit_blocks in range(attention_hit_blocks, 0, -1):
             boundary_block_id = block_ids[hit_blocks - 1]
             boundary_mamba_ids = [
@@ -1039,20 +997,10 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             boundary_hits = [
                 bool(hit) for hit in self.store.lookup(boundary_mamba_ids)
             ]
-            mamba_boundary_hits.append((hit_blocks, boundary_hits))
             if all(boundary_hits):
                 hybrid_hit_blocks = hit_blocks
                 break
 
-        if hybrid_hit_blocks != attention_hit_blocks:
-            logger.info(
-                "Hybrid lookup reduced by Mamba blocks: "
-                f"request_id={request_id}, "
-                f"label={label}, "
-                f"attention_hit_blocks={attention_hit_blocks}, "
-                f"mamba_boundary_hits={mamba_boundary_hits}, "
-                f"hybrid_hit_blocks={hybrid_hit_blocks}"
-            )
         return hybrid_hit_blocks
 
     @property
@@ -1471,27 +1419,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 m_dump_ucm, m_dump_vllm = [], []
             mamba_dump.append((m_dump_ucm, m_dump_vllm))
 
-        if self.num_mamba_groups:
-            logger.info(
-                "Hybrid dispatch meta: "
-                f"dispatch_step={dispatch_step}, "
-                f"dispatch_source={dispatch_source}, "
-                f"request_id={request_id}, "
-                f"hbm_hit_blocks={hbm_hit_block_num}, "
-                f"total_hit_blocks={total_hit_block_num}, "
-                f"new_tokens={new_tokens}, "
-                f"need_load={need_load}, "
-                f"load_hashed={req_meta.lookup_block_ids_hashed}, "
-                f"attn_load_ucm={self._format_bytes_ids(load_ucm_block_ids)}, "
-                f"attn_load_vllm={self._format_int_ids(load_vllm_block_ids)}, "
-                f"attn_dump_ucm={self._format_bytes_ids(dump_ucm_block_ids)}, "
-                f"attn_dump_vllm={self._format_int_ids(dump_vllm_block_ids)}, "
-                f"mamba_load="
-                f"{[(self._format_bytes_ids(ids), self._format_int_ids(vllm_ids)) for ids, vllm_ids in mamba_load]}, "
-                f"mamba_dump="
-                f"{[(self._format_bytes_ids(ids), self._format_int_ids(vllm_ids)) for ids, vllm_ids in mamba_dump]}"
-            )
-
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
@@ -1509,20 +1436,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         self._dispatch_step += 1
         dispatch_step = self._dispatch_step
         requests_dispatch_meta = {}
-        if self.num_mamba_groups:
-            cached_reqs = scheduler_output.scheduled_cached_reqs
-            cached_count = (
-                len(cached_reqs)
-                if isinstance(cached_reqs, list)
-                else len(cached_reqs.req_ids)
-            )
-            logger.info(
-                "Hybrid build_connector_meta: "
-                f"dispatch_step={dispatch_step}, "
-                f"scheduled_new={len(scheduler_output.scheduled_new_reqs)}, "
-                f"scheduled_cached={cached_count}, "
-                f"finished={len(scheduler_output.finished_req_ids)}"
-            )
 
         # for new request, we need to load and dump
         for request in scheduler_output.scheduled_new_reqs:
@@ -1641,14 +1554,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         f"mamba_load="
                         f"{[(self._format_bytes_ids(ids), self._format_int_ids(m_ids)) for ids, m_ids in request.mamba_load]}"
                     )
-                elif self.num_mamba_groups:
-                    logger.info(
-                        "Hybrid load skipped: "
-                        f"dispatch_step={request.dispatch_step}, "
-                        f"dispatch_source={request.dispatch_source}, "
-                        f"request_id={request_id}, "
-                        "need_load=False"
-                    )
                 continue
             if len(request.load_block_ids[0]) == 0:
                 if has_mamba_load:
@@ -1673,22 +1578,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     raw_ucm_block_ids, skip_mla=True
                 )
             )
-            if self.num_mamba_groups:
-                logger.info(
-                    "Hybrid load collect: "
-                    f"dispatch_step={request.dispatch_step}, "
-                    f"dispatch_source={request.dispatch_source}, "
-                    f"request_id={request_id}, "
-                    f"need_load={request.need_load}, "
-                    f"load_block_ids_hashed={request.load_block_ids_hashed}, "
-                    f"raw_ucm_block_ids="
-                    f"{self._format_bytes_ids(raw_ucm_block_ids)}, "
-                    f"transfer_ucm_block_ids="
-                    f"{self._format_bytes_ids(ucm_block_ids)}, "
-                    f"vllm_block_ids={self._format_int_ids(vllm_block_ids)}, "
-                    f"mamba_load="
-                    f"{[(self._format_bytes_ids(ids), self._format_int_ids(m_ids)) for ids, m_ids in request.mamba_load]}"
-                )
             try:
                 mamba_vllm_block_ids = self._mamba_vllm_ids_from_dispatch(
                     request.mamba_load
@@ -1697,31 +1586,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     isinstance(self.kv_cache_layout, HybridKVCacheLayout)
                     and self.kv_cache_layout.uses_physical_shards
                 ):
-                    logger.info(
-                        "Hybrid load split: "
-                        f"dispatch_step={request.dispatch_step}, "
-                        f"dispatch_source={request.dispatch_source}, "
-                        f"request_id={request_id}, "
-                        f"attention_blocks={len(vllm_block_ids)}, "
-                        f"attention_shard=0, "
-                        f"mamba_groups={len(mamba_vllm_block_ids)}"
-                    )
                     if vllm_block_ids:
                         attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
                             vllm_block_ids
                         )
                         shard_indexs = [0] * len(ucm_block_ids)
-                        logger.info(
-                            "Hybrid load detail: "
-                            f"dispatch_step={request.dispatch_step}, "
-                            f"dispatch_source={request.dispatch_source}, "
-                            f"request_id={request_id}, "
-                            f"part=attention, "
-                            f"ucm_block_ids={self._format_bytes_ids(ucm_block_ids)}, "
-                            f"vllm_block_ids={self._format_int_ids(vllm_block_ids)}, "
-                            f"shard_indexs={shard_indexs}, "
-                            f"ptrs={self._format_ptrs(attn_ptrs)}"
-                        )
                         task = self.store.load_data(
                             ucm_block_ids, shard_indexs, attn_ptrs
                         )
@@ -1744,7 +1613,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             m_ucm_ids = self._hash_ucm_ids_for_transfer(
                                 m_ucm_ids, skip_mla=True
                             )
-                        raw_mamba_count = min(len(m_ucm_ids), len(mamba_vllm_ids))
                         m_storage_ucm_ids = self._rehash_mamba_ucm_ids(
                             m_ucm_ids,
                             k,
@@ -1753,17 +1621,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         _, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             m_ucm_ids, mamba_vllm_ids
                         )
-                        logger.info(
-                            "Hybrid load split: "
-                            f"dispatch_step={request.dispatch_step}, "
-                            f"dispatch_source={request.dispatch_source}, "
-                            f"request_id={request_id}, "
-                            f"mamba_group={k}, "
-                            f"mamba_shard=0, "
-                            f"raw_mamba_blocks={raw_mamba_count}, "
-                            f"valid_mamba_blocks={len(m_vllm_ids)}, "
-                            f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}"
-                        )
                         if not m_vllm_ids:
                             continue
                         m_ucm_ids = m_storage_ucm_ids
@@ -1771,18 +1628,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             k, m_vllm_ids
                         )
                         shard_indexs = [0] * len(m_ucm_ids)
-                        logger.info(
-                            "Hybrid load detail: "
-                            f"dispatch_step={request.dispatch_step}, "
-                            f"dispatch_source={request.dispatch_source}, "
-                            f"request_id={request_id}, "
-                            f"part=mamba, "
-                            f"mamba_group={k}, "
-                            f"storage_ucm_block_ids={self._format_bytes_ids(m_ucm_ids)}, "
-                            f"vllm_block_ids={self._format_int_ids(m_vllm_ids)}, "
-                            f"shard_indexs={shard_indexs}, "
-                            f"ptrs={self._format_ptrs(m_ptrs)}"
-                        )
                         task = self.store.load_data(
                             m_ucm_ids, shard_indexs, m_ptrs
                         )
@@ -1802,20 +1647,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                     shard_indexs = [0] * len(ucm_block_ids)
-                    if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
-                        logger.info(
-                            "Hybrid load detail: "
-                            f"dispatch_step={request.dispatch_step}, "
-                            f"dispatch_source={request.dispatch_source}, "
-                            f"request_id={request_id}, "
-                            f"part=combined, "
-                            f"ucm_block_ids={self._format_bytes_ids(ucm_block_ids)}, "
-                            f"vllm_block_ids={self._format_int_ids(vllm_block_ids)}, "
-                            f"mamba_vllm_block_ids="
-                            f"{[self._format_int_ids(ids) for ids in mamba_vllm_block_ids]}, "
-                            f"shard_indexs={shard_indexs}, "
-                            f"ptrs={self._format_ptrs(total_ptrs)}"
-                        )
                     task = self.store.load_data(
                         ucm_block_ids, shard_indexs, total_ptrs
                     )
@@ -1839,12 +1670,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         for request_id, dispatch_step, dispatch_source, task in request_tasks:
             try:
                 self.store.wait(task)
-                logger.info(
-                    "Hybrid load wait done: "
-                    f"dispatch_step={dispatch_step}, "
-                    f"dispatch_source={dispatch_source}, "
-                    f"request_id={request_id}, task={task}"
-                )
             except Exception as e:
                 logger.error(
                     f"request {request_id} wait load task error. {type(e).__name__}: {e}"
@@ -1915,34 +1740,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         total_mamba_ucm_block_ids: list[list[bytes]] = [
             [] for _ in self.mamba_kv_cache_layouts
         ]
-        dispatch_labels: list[str] = []
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
             is_save = True
             num_saved_block += len(request.dump_block_ids[0])
             num_saved_request += 1
-            dispatch_labels.append(
-                f"{request_id}@{request.dispatch_step}/{request.dispatch_source}"
-            )
 
             raw_ucm_block_ids, vllm_block_ids = request.dump_block_ids
             ucm_block_ids = self._hash_ucm_ids_for_transfer(raw_ucm_block_ids)
-            if self.num_mamba_groups:
-                logger.info(
-                    "Hybrid dump collect: "
-                    f"dispatch_step={request.dispatch_step}, "
-                    f"dispatch_source={request.dispatch_source}, "
-                    f"request_id={request_id}, "
-                    f"need_load={request.need_load}, "
-                    f"raw_ucm_block_ids="
-                    f"{self._format_bytes_ids(raw_ucm_block_ids)}, "
-                    f"transfer_ucm_block_ids="
-                    f"{self._format_bytes_ids(ucm_block_ids)}, "
-                    f"vllm_block_ids={self._format_int_ids(vllm_block_ids)}, "
-                    f"mamba_dump="
-                    f"{[(self._format_bytes_ids(ids), self._format_int_ids(m_ids)) for ids, m_ids in request.mamba_dump]}"
-                )
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
             for k, mamba_vllm_ids in enumerate(
@@ -1966,29 +1772,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     hybrid_ucm_block_ids: list[bytes] = []
                     hybrid_shard_indexs: list[int] = []
                     hybrid_ptrs: list[np.ndarray] = []
-                    logger.info(
-                        "Hybrid save split: "
-                        f"dispatch_labels={dispatch_labels}, "
-                        f"attention_blocks={len(total_vllm_block_ids)}, "
-                        f"attention_shard=0, "
-                        f"mamba_groups={len(total_mamba_vllm_block_ids)}, "
-                        f"attention_ucm_block_ids="
-                        f"{[bid.hex() for bid in total_ucm_block_ids]}"
-                    )
                     if total_vllm_block_ids:
                         attn_ptrs = self.kv_cache_layout.extract_attention_block_addrs(
                             total_vllm_block_ids
-                        )
-                        logger.info(
-                            "Hybrid dump detail: "
-                            f"dispatch_labels={dispatch_labels}, "
-                            f"part=attention, "
-                            f"ucm_block_ids="
-                            f"{self._format_bytes_ids(total_ucm_block_ids)}, "
-                            f"vllm_block_ids="
-                            f"{self._format_int_ids(total_vllm_block_ids)}, "
-                            f"shard_index=0, "
-                            f"ptrs={self._format_ptrs(attn_ptrs)}"
                         )
                         for i, block_id in enumerate(total_ucm_block_ids):
                             ptr_row = np.ascontiguousarray(attn_ptrs[i])
@@ -1997,27 +1783,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             hybrid_ptrs.append(ptr_row)
 
                     for k, mamba_vllm_ids in enumerate(total_mamba_vllm_block_ids):
-                        raw_mamba_count = min(
-                            len(total_mamba_ucm_block_ids[k]),
-                            len(mamba_vllm_ids),
-                        )
                         m_storage_ucm_ids = self._rehash_mamba_ucm_ids(
                             total_mamba_ucm_block_ids[k],
                             k,
                             mamba_vllm_ids=mamba_vllm_ids,
                         )
-                        m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                        _, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             total_mamba_ucm_block_ids[k], mamba_vllm_ids
-                        )
-                        logger.info(
-                            "Hybrid save split: "
-                            f"mamba_group={k}, "
-                            f"mamba_shard=0, "
-                            f"raw_mamba_blocks={raw_mamba_count}, "
-                            f"valid_mamba_blocks={len(m_vllm_ids)}, "
-                            f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}, "
-                            f"mamba_ucm_block_ids="
-                            f"{[bid.hex() for bid in m_ucm_ids]}"
                         )
                         if not m_vllm_ids:
                             continue
@@ -2026,16 +1798,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             k, m_vllm_ids
                         )
                         shard_index = 0
-                        logger.info(
-                            "Hybrid dump detail: "
-                            f"dispatch_labels={dispatch_labels}, "
-                            f"part=mamba, "
-                            f"mamba_group={k}, "
-                            f"storage_ucm_block_ids={self._format_bytes_ids(m_ucm_ids)}, "
-                            f"vllm_block_ids={self._format_int_ids(m_vllm_ids)}, "
-                            f"shard_index={shard_index}, "
-                            f"ptrs={self._format_ptrs(m_ptrs)}"
-                        )
                         for i, block_id in enumerate(m_ucm_ids):
                             ptr_row = np.ascontiguousarray(m_ptrs[i])
                             hybrid_ucm_block_ids.append(block_id)
@@ -2043,17 +1805,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             hybrid_ptrs.append(ptr_row)
 
                     if hybrid_ucm_block_ids:
-                        logger.info(
-                            "Hybrid dump submit: "
-                            f"dispatch_labels={dispatch_labels}, "
-                            f"blocks={len(hybrid_ucm_block_ids)}, "
-                            f"ucm_block_ids="
-                            f"{self._format_bytes_ids(hybrid_ucm_block_ids)}, "
-                            f"shard_indexs={hybrid_shard_indexs[:64]}"
-                            f"{'...' if len(hybrid_shard_indexs) > 64 else ''}, "
-                            f"ptrs={self._format_ptrs(np.asarray(hybrid_ptrs, dtype=np.uint64))}, "
-                            f"event_handle={event_handle}"
-                        )
                         task = self.store.dump_data(
                             hybrid_ucm_block_ids,
                             hybrid_shard_indexs,
@@ -2071,21 +1822,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     shard_indexs = [0] * len(total_ucm_block_ids)
                     event_handle = self._get_dump_event_handle()
                     save_start_time = time.perf_counter() * 1000
-                    if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
-                        logger.info(
-                            "Hybrid dump detail: "
-                            f"dispatch_labels={dispatch_labels}, "
-                            f"part=combined, "
-                            f"ucm_block_ids="
-                            f"{self._format_bytes_ids(total_ucm_block_ids)}, "
-                            f"vllm_block_ids="
-                            f"{self._format_int_ids(total_vllm_block_ids)}, "
-                            f"mamba_vllm_block_ids="
-                            f"{[self._format_int_ids(ids) for ids in total_mamba_vllm_block_ids]}, "
-                            f"shard_indexs={shard_indexs}, "
-                            f"ptrs={self._format_ptrs(total_ptrs)}, "
-                            f"event_handle={event_handle}"
-                        )
                     task = self.store.dump_data(
                         total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
                     )
@@ -2097,22 +1833,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 for task in dump_tasks:
                     self.store.wait(task)
-                    logger.info(f"Hybrid dump wait done: task={task}")
                 save_end_time = time.perf_counter() * 1000
-                if total_ucm_block_ids:
-                    try:
-                        post_save_hits = self.store.lookup(total_ucm_block_ids)
-                        logger.info(
-                            "Hybrid save verify: "
-                            f"attention_ucm_block_ids="
-                            f"{[bid.hex() for bid in total_ucm_block_ids]}, "
-                            f"lookup_hits={[bool(x) for x in post_save_hits]}"
-                        )
-                    except Exception as lookup_e:
-                        logger.error(
-                            "Hybrid save verify lookup failed. "
-                            f"{type(lookup_e).__name__}: {lookup_e}"
-                        )
             except Exception as e:
                 logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
                 return
@@ -2179,6 +1900,15 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._failure_req_ids: set[str] = set()
         logger.info("Init UCMLayerWiseConnector.")
 
+    def _get_registered_layer_id(self, layer_name: str) -> Optional[int]:
+        layer_id = self.layer_name_to_id.get(layer_name)
+        if layer_id is None:
+            logger.warning_once(
+                "UCMLayerWiseConnector skipping unregistered KV layer: "
+                f"layer_name={layer_name!r}"
+            )
+        return layer_id
+
     def _submit_request_load_tasks_for_layer(
         self,
         layer_id: int,
@@ -2236,7 +1966,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         if not self.need_load:
             return
         metadata = self._get_connector_metadata()
-        current_layer_id = self.layer_name_to_id[layer_name]
+        current_layer_id = self._get_registered_layer_id(layer_name)
+        if current_layer_id is None:
+            return
 
         # Pop before wait so MTP / rollback paths that revisit the same layer_name
         # do not call store.wait() again on already-completed handles.
@@ -2277,7 +2009,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
-        layer_id = self.layer_name_to_id[layer_name]
+        layer_id = self._get_registered_layer_id(layer_name)
+        if layer_id is None:
+            return
         local_layer_id = self.layer_id_to_row[layer_id]
         for _, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
