@@ -892,6 +892,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             return list(ucm_block_ids)
         return [self.request_hasher(block_id) for block_id in ucm_block_ids]
 
+    def _get_request_hasher_for_rank(self, rank_id: int) -> RequestHasher:
+        if rank_id == 0:
+            return self.request_hasher
+        hasher = self._rank_request_hashers.get(rank_id)
+        if hasher is None:
+            hasher = RequestHasher(self._vllm_config, rank_id)
+            self._rank_request_hashers[rank_id] = hasher
+        return hasher
+
     def _hash_ucm_ids_for_rank(
         self,
         ucm_block_ids: list[bytes],
@@ -899,19 +908,19 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> list[bytes]:
         if rank_id == 0:
             return list(ucm_block_ids)
-        hasher = self._rank_request_hashers.get(rank_id)
-        if hasher is None:
-            hasher = RequestHasher(self._vllm_config, rank_id)
-            self._rank_request_hashers[rank_id] = hasher
+        hasher = self._get_request_hasher_for_rank(rank_id)
         return [hasher(block_id) for block_id in ucm_block_ids]
 
     def _rehash_mamba_ucm_ids(
         self,
         ucm_block_ids: list[bytes],
         group_index: int,
+        hasher: Optional[RequestHasher] = None,
     ) -> list[bytes]:
+        if hasher is None:
+            hasher = self.request_hasher
         return [
-            self.request_hasher(("UCM_MAMBA_BLOCK", group_index, block_id))
+            hasher(("UCM_MAMBA_BLOCK", group_index, block_id))
             for block_id in ucm_block_ids
         ]
 
@@ -940,6 +949,42 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 f"fallback_external_hit_blocks={hit_blocks}"
             )
         return hit_blocks
+
+    def _lookup_hybrid_prefix_blocks(
+        self,
+        block_ids: list[bytes],
+        request_id: str,
+        label: str,
+        hasher: Optional[RequestHasher] = None,
+    ) -> int:
+        attention_hit_blocks = self._lookup_prefix_blocks(
+            block_ids, request_id, f"{label}:attention"
+        )
+        if attention_hit_blocks == 0 or self.num_mamba_groups == 0:
+            return attention_hit_blocks
+
+        candidate_block_ids = block_ids[:attention_hit_blocks]
+        mamba_hit_blocks: list[int] = []
+        for group_index in range(self.num_mamba_groups):
+            mamba_block_ids = self._rehash_mamba_ucm_ids(
+                candidate_block_ids, group_index, hasher
+            )
+            group_hit_blocks = self._lookup_prefix_blocks(
+                mamba_block_ids, request_id, f"{label}:mamba_{group_index}"
+            )
+            mamba_hit_blocks.append(group_hit_blocks)
+
+        hybrid_hit_blocks = min([attention_hit_blocks, *mamba_hit_blocks])
+        if hybrid_hit_blocks != attention_hit_blocks:
+            logger.info(
+                "Hybrid lookup reduced by Mamba blocks: "
+                f"request_id={request_id}, "
+                f"label={label}, "
+                f"attention_hit_blocks={attention_hit_blocks}, "
+                f"mamba_hit_blocks={mamba_hit_blocks}, "
+                f"hybrid_hit_blocks={hybrid_hit_blocks}"
+            )
+        return hybrid_hit_blocks
 
     @property
     def num_mamba_groups(self) -> int:
@@ -1155,22 +1200,24 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 getattr(self, "kv_cache_layout", None), HybridKVCacheLayout
             )
             if is_hybrid_model:
-                external_hit_blocks = self._lookup_prefix_blocks(
+                external_hit_blocks = self._lookup_hybrid_prefix_blocks(
                     external_block_ids, request.request_id, "base"
                 )
                 if external_hit_blocks == 0 and self.tp_size > 1:
                     rank_probe_hits: dict[int, int] = {}
                     for rank_id in range(1, self.tp_size):
+                        rank_hasher = self._get_request_hasher_for_rank(rank_id)
                         rank_lookup_block_ids = self._hash_ucm_ids_for_rank(
                             ucm_block_ids, rank_id
                         )
                         rank_external_block_ids = rank_lookup_block_ids[
                             hbm_hit_block_num * self.cp_world_size :
                         ]
-                        rank_hit_blocks = self._lookup_prefix_blocks(
+                        rank_hit_blocks = self._lookup_hybrid_prefix_blocks(
                             rank_external_block_ids,
                             request.request_id,
                             f"tp_rank_{rank_id}",
+                            rank_hasher,
                         )
                         if rank_hit_blocks > 0:
                             rank_probe_hits[rank_id] = rank_hit_blocks
