@@ -789,6 +789,68 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> bool:
         return any(ids or vllm_ids for ids, vllm_ids in mamba_dispatch)
 
+    def _select_mamba_load_blocks(
+        self,
+        group_index: int,
+        load_ucm_block_ids: list[bytes],
+        mamba_vllm_ids: list[int],
+        total_hit_block_num: int,
+        new_tokens: int,
+        mamba_block_size: int,
+        request_id: str,
+        dispatch_step: int,
+        dispatch_source: str,
+    ) -> tuple[list[bytes], list[int]]:
+        """Return source UCM ids and destination Mamba block ids for load.
+
+        In mamba_cache_mode="align", vLLM kernels read the running-state block
+        selected by mamba_get_block_table_tensor(), i.e. the block containing
+        the last scheduled token. KV connector load runs after preprocess_mamba,
+        so we must load the cached prefix state directly into that block.
+        """
+        if self._vllm_config.cache_config.mamba_cache_mode != "align":
+            return load_ucm_block_ids, mamba_vllm_ids
+
+        if not load_ucm_block_ids or not mamba_vllm_ids:
+            return [], []
+
+        source_ucm_id = load_ucm_block_ids[-1]
+        target_tokens = total_hit_block_num * self.block_size + max(new_tokens, 1)
+        target_idx = max((target_tokens - 1) // mamba_block_size, 0)
+        source_prefix_idx = max(total_hit_block_num - 1, 0)
+
+        if target_idx >= len(mamba_vllm_ids):
+            logger.warning(
+                "Hybrid mamba align load skipped: target block index out of "
+                "range. "
+                f"dispatch_step={dispatch_step}, "
+                f"dispatch_source={dispatch_source}, "
+                f"request_id={request_id}, "
+                f"mamba_group={group_index}, "
+                f"source_prefix_idx={source_prefix_idx}, "
+                f"target_state_idx={target_idx}, "
+                f"mamba_vllm_len={len(mamba_vllm_ids)}, "
+                f"load_ucm_block_ids={self._format_bytes_ids(load_ucm_block_ids)}, "
+                f"mamba_vllm_ids={self._format_int_ids(mamba_vllm_ids)}"
+            )
+            return [], []
+
+        target_vllm_id = mamba_vllm_ids[target_idx]
+        logger.info(
+            "Hybrid mamba align load remap: "
+            f"dispatch_step={dispatch_step}, "
+            f"dispatch_source={dispatch_source}, "
+            f"request_id={request_id}, "
+            f"mamba_group={group_index}, "
+            f"source_prefix_idx={source_prefix_idx}, "
+            f"source_ucm_block_id={source_ucm_id.hex()}, "
+            f"target_state_idx={target_idx}, "
+            f"target_vllm_block_id={target_vllm_id}, "
+            f"total_hit_blocks={total_hit_block_num}, "
+            f"new_tokens={new_tokens}"
+        )
+        return [source_ucm_id], [target_vllm_id]
+
     @staticmethod
     def _filter_nonzero_mamba_blocks(
         ucm_block_ids: list[bytes],
@@ -1245,6 +1307,17 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             if need_load and m_total_hit > m_hbm_hit:
                 m_load_ucm = load_ucm_block_ids
                 m_load_vllm = m_vllm[m_hbm_hit:m_total_hit]
+                m_load_ucm, m_load_vllm = self._select_mamba_load_blocks(
+                    k,
+                    m_load_ucm,
+                    m_vllm,
+                    total_hit_block_num,
+                    new_tokens,
+                    mamba_block_size,
+                    request_id,
+                    dispatch_step,
+                    dispatch_source,
+                )
             mamba_load.append((m_load_ucm, m_load_vllm))
 
             # Dump: mamba blocks newly covered by the tokens processed this step.
