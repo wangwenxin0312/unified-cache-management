@@ -258,10 +258,10 @@ class HybridKVCacheLayout:
 
         [conv_or_kv_padding, ssm_or_k, v_or_mamba_padding]
 
-    The store therefore uses the same tensor_size_list for each physical shard
-    type. Shard 0 stores the attention block, and shard k + 1 stores Mamba
-    group k. This lets attention blocks be saved/loaded even when the matching
-    Mamba physical block id is 0 (padding/invalid).
+    The store therefore uses the same physical tensor_size_list for both
+    attention and Mamba cache blocks. Mamba blocks are stored under rehashed
+    per-group block ids instead of separate physical shards, so one stored
+    block remains exactly one shard_size.
     """
 
     def __init__(
@@ -315,7 +315,7 @@ class HybridKVCacheLayout:
                 f"mamba_groups={len(self.mamba_layouts)}, "
                 f"mamba_ptrs_per_row={self._reference_mamba_layout.base_ptrs.shape[1]}, "
                 f"aligned_stride={self._npu_attn_aligned_stride()}, "
-                f"physical_shard_count={self.physical_shard_count}"
+                f"storage_shard_count={self.physical_shard_count}"
             )
         else:
             logger.info(
@@ -360,11 +360,11 @@ class HybridKVCacheLayout:
 
     @property
     def physical_shard_count(self) -> int:
-        return 1 + len(self.mamba_layouts)
+        return 1
 
     def mamba_shard_index(self, group_index: int) -> int:
-        # Shard 0 is reserved for attention.
-        return group_index + 1
+        # Mamba groups use rehashed block ids, so they share the only store shard.
+        return 0
 
     def _physical_tensor_size_list(self) -> list[int]:
         assert self._reference_mamba_layout is not None
@@ -479,8 +479,6 @@ class HybridKVCacheLayout:
 
     @property
     def block_size(self) -> int:
-        if self.uses_physical_shards:
-            return self.shard_size * self.physical_shard_count
         return self.shard_size
 
     def extract_attention_block_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
@@ -906,6 +904,16 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             hasher = RequestHasher(self._vllm_config, rank_id)
             self._rank_request_hashers[rank_id] = hasher
         return [hasher(block_id) for block_id in ucm_block_ids]
+
+    def _rehash_mamba_ucm_ids(
+        self,
+        ucm_block_ids: list[bytes],
+        group_index: int,
+    ) -> list[bytes]:
+        return [
+            self.request_hasher(("UCM_MAMBA_BLOCK", group_index, block_id))
+            for block_id in ucm_block_ids
+        ]
 
     def _lookup_prefix_blocks(
         self,
@@ -1615,19 +1623,18 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             f"dispatch_source={request.dispatch_source}, "
                             f"request_id={request_id}, "
                             f"mamba_group={k}, "
-                            f"mamba_shard={self.kv_cache_layout.mamba_shard_index(k)}, "
+                            f"mamba_shard=0, "
                             f"raw_mamba_blocks={raw_mamba_count}, "
                             f"valid_mamba_blocks={len(m_vllm_ids)}, "
                             f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}"
                         )
                         if not m_vllm_ids:
                             continue
+                        m_ucm_ids = self._rehash_mamba_ucm_ids(m_ucm_ids, k)
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
-                        shard_indexs = [
-                            self.kv_cache_layout.mamba_shard_index(k)
-                        ] * len(m_ucm_ids)
+                        shard_indexs = [0] * len(m_ucm_ids)
                         logger.info(
                             "Hybrid load detail: "
                             f"dispatch_step={request.dispatch_step}, "
@@ -1635,7 +1642,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             f"request_id={request_id}, "
                             f"part=mamba, "
                             f"mamba_group={k}, "
-                            f"ucm_block_ids={self._format_bytes_ids(m_ucm_ids)}, "
+                            f"storage_ucm_block_ids={self._format_bytes_ids(m_ucm_ids)}, "
                             f"vllm_block_ids={self._format_int_ids(m_vllm_ids)}, "
                             f"shard_indexs={shard_indexs}, "
                             f"ptrs={self._format_ptrs(m_ptrs)}"
@@ -1820,12 +1827,9 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 ):
                     event_handle = self._get_dump_event_handle()
                     save_start_time = time.perf_counter() * 1000
-                    commit_shard = self.kv_cache_layout.physical_shard_count - 1
                     hybrid_ucm_block_ids: list[bytes] = []
                     hybrid_shard_indexs: list[int] = []
                     hybrid_ptrs: list[np.ndarray] = []
-                    max_shard_by_block: dict[bytes, int] = {}
-                    commit_ptr_by_block: dict[bytes, np.ndarray] = {}
                     logger.info(
                         "Hybrid save split: "
                         f"dispatch_labels={dispatch_labels}, "
@@ -1855,10 +1859,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             hybrid_ucm_block_ids.append(block_id)
                             hybrid_shard_indexs.append(0)
                             hybrid_ptrs.append(ptr_row)
-                            max_shard_by_block[block_id] = max(
-                                max_shard_by_block.get(block_id, -1), 0
-                            )
-                            commit_ptr_by_block[block_id] = ptr_row
 
                     for k, mamba_vllm_ids in enumerate(total_mamba_vllm_block_ids):
                         raw_mamba_count = min(
@@ -1871,7 +1871,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         logger.info(
                             "Hybrid save split: "
                             f"mamba_group={k}, "
-                            f"mamba_shard={self.kv_cache_layout.mamba_shard_index(k)}, "
+                            f"mamba_shard=0, "
                             f"raw_mamba_blocks={raw_mamba_count}, "
                             f"valid_mamba_blocks={len(m_vllm_ids)}, "
                             f"skipped_zero_blocks={raw_mamba_count - len(m_vllm_ids)}, "
@@ -1880,16 +1880,17 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                         if not m_vllm_ids:
                             continue
+                        m_ucm_ids = self._rehash_mamba_ucm_ids(m_ucm_ids, k)
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
-                        shard_index = self.kv_cache_layout.mamba_shard_index(k)
+                        shard_index = 0
                         logger.info(
                             "Hybrid dump detail: "
                             f"dispatch_labels={dispatch_labels}, "
                             f"part=mamba, "
                             f"mamba_group={k}, "
-                            f"ucm_block_ids={self._format_bytes_ids(m_ucm_ids)}, "
+                            f"storage_ucm_block_ids={self._format_bytes_ids(m_ucm_ids)}, "
                             f"vllm_block_ids={self._format_int_ids(m_vllm_ids)}, "
                             f"shard_index={shard_index}, "
                             f"ptrs={self._format_ptrs(m_ptrs)}"
@@ -1899,30 +1900,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             hybrid_ucm_block_ids.append(block_id)
                             hybrid_shard_indexs.append(shard_index)
                             hybrid_ptrs.append(ptr_row)
-                            max_shard_by_block[block_id] = max(
-                                max_shard_by_block.get(block_id, -1), shard_index
-                            )
-                            commit_ptr_by_block.setdefault(block_id, ptr_row)
-
-                    commit_marker_ids: list[str] = []
-                    for block_id, max_shard in max_shard_by_block.items():
-                        if max_shard >= commit_shard:
-                            continue
-                        ptr_row = commit_ptr_by_block.get(block_id)
-                        if ptr_row is None:
-                            continue
-                        hybrid_ucm_block_ids.append(block_id)
-                        hybrid_shard_indexs.append(commit_shard)
-                        hybrid_ptrs.append(ptr_row)
-                        commit_marker_ids.append(block_id.hex())
-
-                    if commit_marker_ids:
-                        logger.warning(
-                            "Hybrid save split: added commit marker shard(s) "
-                            "for attention-only blocks, "
-                            f"commit_shard={commit_shard}, "
-                            f"block_ids={commit_marker_ids}"
-                        )
 
                     if hybrid_ucm_block_ids:
                         logger.info(
