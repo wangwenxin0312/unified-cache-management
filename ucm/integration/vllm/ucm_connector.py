@@ -37,12 +37,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from ucm.sparse.state import has_ucm_sparse
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
-try:
-    from vllm.v1.core.kv_cache_utils import KVCacheConfig, MambaSpec
-    _HAS_KV_CACHE_CONFIG = True
-except ImportError:
-    _HAS_KV_CACHE_CONFIG = False
 
 logger = init_logger(__name__)
 
@@ -72,9 +68,19 @@ class RequestDispatchMeta:
     need_load: bool = True
     dispatch_step: int = 0
     dispatch_source: str = ""
-    # Per mamba group: (ucm_ids, vllm_ids) for load and dump
+    # Per mamba group: (storage ucm_ids, vllm_ids) for load and dump
     mamba_load: list[tuple[list[bytes], list[int]]] = field(default_factory=list)
     mamba_dump: list[tuple[list[bytes], list[int]]] = field(default_factory=list)
+
+
+@dataclass
+class LayerwiseRequestData:
+    request_id: str
+    ucm_block_ids: list[bytes] = field(default_factory=list)
+    vllm_block_ids: list[int] = field(default_factory=list)
+    total_ptrs: Optional[np.ndarray] = None
+    mamba_ucm_block_ids: list[list[bytes]] = field(default_factory=list)
+    mamba_vllm_block_ids: list[list[int]] = field(default_factory=list)
 
 
 class KVCacheLayout:
@@ -271,7 +277,7 @@ class HybridKVCacheLayout:
     ) -> None:
         self.attn_layout = attn_layout
         self.mamba_layouts = mamba_layouts
-        self.use_layerwise = False
+        self.use_layerwise = attn_layout.use_layerwise
         self.vllm_config = attn_layout.vllm_config
         self.layer_name_to_id = attn_layout.layer_name_to_id
         self.layer_ids = attn_layout.layer_ids
@@ -366,10 +372,10 @@ class HybridKVCacheLayout:
         # Mamba groups use rehashed block ids, so they share the only store shard.
         return 0
 
-    def _physical_tensor_size_list(self) -> list[int]:
+    def _physical_tensor_size_rows(self) -> list[list[int]]:
         assert self._reference_mamba_layout is not None
         aligned_stride = self._npu_attn_aligned_stride()
-        tensor_sizes: list[int] = []
+        rows: list[list[int]] = []
         for row in range(self.attn_layout.base_ptrs.shape[0]):
             conv_stride = int(
                 self._reference_mamba_layout.block_stride_lists[row, 0]
@@ -383,7 +389,21 @@ class HybridKVCacheLayout:
                 int(self.attn_layout.block_stride_lists[row, 1]),
                 middle_stride,
             )
-            tensor_sizes.extend([conv_stride, middle_stride, value_stride])
+            rows.append([conv_stride, middle_stride, value_stride])
+        return rows
+
+    def _physical_tensor_size_list(self) -> list[int]:
+        rows = self._physical_tensor_size_rows()
+        if self.use_layerwise:
+            row_widths = {tuple(row) for row in rows}
+            if len(row_widths) != 1:
+                raise RuntimeError(
+                    "Layerwise hybrid UCM requires identical physical tensor "
+                    f"sizes for every attention/Mamba row, got {rows}."
+                )
+            tensor_sizes = rows[0] if rows else []
+        else:
+            tensor_sizes = [size for row in rows for size in row]
         logger.info(
             "HybridKVCacheLayout physical tensor sizes: "
             f"{tensor_sizes}"
@@ -416,6 +436,19 @@ class HybridKVCacheLayout:
             len(vllm_block_ids), -1
         )
 
+    def extract_attention_layer_block_addrs(
+        self,
+        local_row: int,
+        vllm_block_ids: List[int],
+    ) -> np.ndarray:
+        if self.uses_physical_shards:
+            return self._extract_attention_physical_addrs(vllm_block_ids).reshape(
+                len(vllm_block_ids), self.attn_layout.base_ptrs.shape[0], -1
+            )[:, local_row, :]
+        return self.attn_layout.extract_block_addrs(
+            vllm_block_ids, layer_first=True
+        )[local_row]
+
     def _extract_mamba_physical_addrs(
         self,
         group_index: int,
@@ -440,6 +473,30 @@ class HybridKVCacheLayout:
         return np.stack((conv_part, ssm_part, v_padding), axis=2).reshape(
             len(vllm_block_ids), -1
         )
+
+    def extract_mamba_layer_block_addrs(
+        self,
+        group_index: int,
+        local_row: int,
+        vllm_block_ids: List[int],
+    ) -> np.ndarray:
+        if self.uses_physical_shards:
+            layout = self.mamba_layouts[group_index]
+            if layout is None:
+                raise RuntimeError(
+                    f"Mamba group {group_index} has no KV cache layout."
+                )
+            return self._extract_mamba_physical_addrs(
+                group_index, vllm_block_ids
+            ).reshape(len(vllm_block_ids), layout.base_ptrs.shape[0], -1)[
+                :, local_row, :
+            ]
+        layout = self.mamba_layouts[group_index]
+        if layout is None:
+            raise RuntimeError(f"Mamba group {group_index} has no KV cache layout.")
+        return layout.extract_block_addrs(
+            vllm_block_ids, layer_first=True
+        )[local_row]
 
     # ------------------------------------------------------------------
     # Layout properties
@@ -479,6 +536,13 @@ class HybridKVCacheLayout:
 
     @property
     def block_size(self) -> int:
+        if self.use_layerwise:
+            layer_count = (
+                self.attn_layout.num_hidden_layers
+                if self.attn_layout.pp_size > 1
+                else max(self.layer_ids) + 1
+            )
+            return self.shard_size * layer_count
         return self.shard_size
 
     def extract_attention_block_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
@@ -623,7 +687,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         self.mamba_block_sizes: list[int] = []
         # Mamba layouts are folded into self.store for hybrid models.
         self.mamba_kv_cache_layouts: list[Optional["KVCacheLayout"]] = []
-        self._pending_kv_cache_config = kv_cache_config  # deferred until hasher ready
 
         if current_platform.is_cuda_alike():
             logger.info("CUDA device is available.")
@@ -670,9 +733,8 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
         # Now that request_hasher is ready, initialise mamba group info.
-        if _HAS_KV_CACHE_CONFIG and self._pending_kv_cache_config is not None:
-            self._init_mamba_group_info(self._pending_kv_cache_config)
-        self._pending_kv_cache_config = None
+        if kv_cache_config is not None:
+            self._init_mamba_group_info(kv_cache_config)
 
         self.metrics_config = self.launch_config.get("metrics_config_path", "")
         if self.metrics_config:
@@ -954,6 +1016,28 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             for block_id in ucm_block_ids
         ]
 
+    def _prepare_mamba_dispatch_block_ids(
+        self,
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+        group_index: int,
+        *,
+        ucm_block_ids_hashed: bool = False,
+        skip_mla: bool = False,
+    ) -> tuple[list[bytes], list[int]]:
+        if not ucm_block_ids or not vllm_block_ids:
+            return [], []
+
+        transfer_ucm_ids = (
+            list(ucm_block_ids)
+            if ucm_block_ids_hashed
+            else self._hash_ucm_ids_for_transfer(ucm_block_ids, skip_mla=skip_mla)
+        )
+        storage_ucm_ids = self._rehash_mamba_ucm_ids(
+            transfer_ucm_ids, group_index
+        )
+        return storage_ucm_ids, list(vllm_block_ids)
+
     def _lookup_prefix_blocks(
         self,
         block_ids: list[bytes],
@@ -1158,6 +1242,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             self.kv_cache_layout = HybridKVCacheLayout(
                 attn_layout, self.mamba_kv_cache_layouts
             )
+            if (
+                self.use_layerwise
+                and not self.kv_cache_layout.uses_physical_shards
+            ):
+                raise RuntimeError(
+                    "Layerwise hybrid UCM currently requires NPU physical-shard "
+                    "layout so attention and Mamba rows share the same tensor "
+                    "shape."
+                )
         else:
             self.kv_cache_layout = attn_layout
 
@@ -1390,6 +1483,13 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     dispatch_step,
                     dispatch_source,
                 )
+                m_load_ucm, m_load_vllm = self._prepare_mamba_dispatch_block_ids(
+                    m_load_ucm,
+                    m_load_vllm,
+                    k,
+                    ucm_block_ids_hashed=req_meta.lookup_block_ids_hashed,
+                    skip_mla=True,
+                )
             mamba_load.append((m_load_ucm, m_load_vllm))
 
             # Dump: mamba blocks newly covered by the tokens processed this step.
@@ -1414,6 +1514,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     request_id,
                     dispatch_step,
                     dispatch_source,
+                )
+                m_dump_ucm, m_dump_vllm = self._prepare_mamba_dispatch_block_ids(
+                    m_dump_ucm,
+                    m_dump_vllm,
+                    k,
                 )
             else:
                 m_dump_ucm, m_dump_vllm = [], []
@@ -1609,21 +1714,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             if k < len(request.mamba_load)
                             else []
                         )
-                        if not request.load_block_ids_hashed:
-                            m_ucm_ids = self._hash_ucm_ids_for_transfer(
-                                m_ucm_ids, skip_mla=True
-                            )
-                        m_storage_ucm_ids = self._rehash_mamba_ucm_ids(
-                            m_ucm_ids,
-                            k,
-                            mamba_vllm_ids=mamba_vllm_ids,
-                        )
-                        _, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                        m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             m_ucm_ids, mamba_vllm_ids
                         )
-                        if not m_vllm_ids:
+                        if not m_ucm_ids or not m_vllm_ids:
                             continue
-                        m_ucm_ids = m_storage_ucm_ids
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
@@ -1757,7 +1852,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 m_ucm_ids = (
                     request.mamba_dump[k][0] if k < len(request.mamba_dump) else []
                 )
-                m_ucm_ids = self._hash_ucm_ids_for_transfer(m_ucm_ids)
                 total_mamba_ucm_block_ids[k].extend(m_ucm_ids)
                 total_mamba_vllm_block_ids[k].extend(mamba_vllm_ids)
 
@@ -1783,17 +1877,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             hybrid_ptrs.append(ptr_row)
 
                     for k, mamba_vllm_ids in enumerate(total_mamba_vllm_block_ids):
-                        m_storage_ucm_ids = self._rehash_mamba_ucm_ids(
-                            total_mamba_ucm_block_ids[k],
-                            k,
-                            mamba_vllm_ids=mamba_vllm_ids,
+                        m_ucm_ids = total_mamba_ucm_block_ids[k]
+                        m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                            m_ucm_ids, mamba_vllm_ids
                         )
-                        _, m_vllm_ids = self._filter_nonzero_mamba_blocks(
-                            total_mamba_ucm_block_ids[k], mamba_vllm_ids
-                        )
-                        if not m_vllm_ids:
+                        if not m_ucm_ids or not m_vllm_ids:
                             continue
-                        m_ucm_ids = m_storage_ucm_ids
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
@@ -1896,18 +1985,94 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.is_save = False
         self.need_load = False
         self.dump_total_ptrs: np.ndarray | None = None
-        self.request_data: list[tuple[str, list, np.ndarray]] = []
+        self.request_data: list[LayerwiseRequestData] = []
         self._failure_req_ids: set[str] = set()
         logger.info("Init UCMLayerWiseConnector.")
 
     def _get_registered_layer_id(self, layer_name: str) -> Optional[int]:
         layer_id = self.layer_name_to_id.get(layer_name)
         if layer_id is None:
-            logger.warning_once(
-                "UCMLayerWiseConnector skipping unregistered KV layer: "
-                f"layer_name={layer_name!r}"
-            )
+            if self._get_mamba_layer_row(layer_name) is None:
+                logger.warning_once(
+                    "UCMLayerWiseConnector skipping unregistered KV layer: "
+                    f"layer_name={layer_name!r}"
+                )
         return layer_id
+
+    def _is_hybrid_layerwise_physical(self) -> bool:
+        return (
+            isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+            and self.kv_cache_layout.uses_physical_shards
+        )
+
+    def _get_mamba_layer_row(
+        self, layer_name: str
+    ) -> Optional[tuple[int, int, int]]:
+        for group_index, layout in enumerate(self.mamba_kv_cache_layouts):
+            if layout is None:
+                continue
+            layer_id = layout.layer_name_to_id.get(layer_name)
+            if layer_id is None:
+                continue
+            local_row = layout.layer_id_to_row[layer_id]
+            if local_row >= len(self.layer_ids):
+                logger.warning(
+                    "UCMLayerWiseConnector skipping mamba KV layer with no "
+                    "matching attention storage row: "
+                    f"layer_name={layer_name!r}, local_row={local_row}, "
+                    f"attention_rows={len(self.layer_ids)}"
+                )
+                return None
+            return group_index, local_row, self.layer_ids[local_row]
+        return None
+
+    def _get_next_registered_layer_id(self, layer_id: int) -> Optional[int]:
+        try:
+            index = self.layer_ids.index(layer_id)
+        except ValueError:
+            return None
+        if index + 1 >= len(self.layer_ids):
+            return None
+        return self.layer_ids[index + 1]
+
+    def _prepare_layerwise_hybrid_load_data(
+        self,
+        request: RequestDispatchMeta,
+        request_id: str,
+    ) -> LayerwiseRequestData:
+        raw_ucm_block_ids, vllm_block_ids = request.load_block_ids
+        ucm_block_ids = (
+            list(raw_ucm_block_ids)
+            if request.load_block_ids_hashed
+            else self._hash_ucm_ids_for_transfer(raw_ucm_block_ids, skip_mla=True)
+        )
+        mamba_ucm_block_ids: list[list[bytes]] = [
+            [] for _ in self.mamba_kv_cache_layouts
+        ]
+        mamba_vllm_block_ids: list[list[int]] = [
+            [] for _ in self.mamba_kv_cache_layouts
+        ]
+        for k, mamba_vllm_ids in enumerate(
+            self._mamba_vllm_ids_from_dispatch(request.mamba_load)
+        ):
+            m_ucm_ids = (
+                request.mamba_load[k][0] if k < len(request.mamba_load) else []
+            )
+            m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                m_ucm_ids, mamba_vllm_ids
+            )
+            if not m_ucm_ids or not m_vllm_ids:
+                continue
+            mamba_ucm_block_ids[k] = list(m_ucm_ids)
+            mamba_vllm_block_ids[k] = list(m_vllm_ids)
+
+        return LayerwiseRequestData(
+            request_id=request_id,
+            ucm_block_ids=ucm_block_ids,
+            vllm_block_ids=vllm_block_ids,
+            mamba_ucm_block_ids=mamba_ucm_block_ids,
+            mamba_vllm_block_ids=mamba_vllm_block_ids,
+        )
 
     def _submit_request_load_tasks_for_layer(
         self,
@@ -1915,17 +2080,107 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         local_row: int,
         metadata: "UCMConnectorMetadata",
     ) -> None:
-        for request_id, ucm_block_ids, total_ptrs in self.request_data:
+        for request_data in self.request_data:
+            request_id = request_data.request_id
             if request_id in self._failure_req_ids:
                 continue
             try:
-                shard_indexs = [layer_id] * len(ucm_block_ids)
-                layer_ptrs = total_ptrs[local_row]
-                task = self.store.load_data(ucm_block_ids, shard_indexs, layer_ptrs)
+                if self._is_hybrid_layerwise_physical():
+                    assert isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+                    layer_ucm_block_ids: list[bytes] = []
+                    layer_ptrs: list[np.ndarray] = []
+                    if request_data.vllm_block_ids:
+                        attn_ptrs = (
+                            self.kv_cache_layout.extract_attention_layer_block_addrs(
+                                local_row, request_data.vllm_block_ids
+                            )
+                        )
+                        for i, block_id in enumerate(request_data.ucm_block_ids):
+                            layer_ucm_block_ids.append(block_id)
+                            layer_ptrs.append(np.ascontiguousarray(attn_ptrs[i]))
+
+                    if not layer_ucm_block_ids:
+                        continue
+                    shard_indexs = [layer_id] * len(layer_ucm_block_ids)
+                    task = self.store.load_data(
+                        layer_ucm_block_ids,
+                        shard_indexs,
+                        np.asarray(layer_ptrs, dtype=np.uint64),
+                    )
+                else:
+                    assert request_data.total_ptrs is not None
+                    shard_indexs = [layer_id] * len(request_data.ucm_block_ids)
+                    layer_ptrs = request_data.total_ptrs[local_row]
+                    task = self.store.load_data(
+                        request_data.ucm_block_ids, shard_indexs, layer_ptrs
+                    )
                 self.load_tasks[layer_id][request_id] = task
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit load task error. {type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
+
+    def _load_mamba_layers_for_hybrid(
+        self,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        if not self._is_hybrid_layerwise_physical():
+            return
+        assert isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+
+        tasks: list[tuple[str, Task]] = []
+        for request_data in self.request_data:
+            request_id = request_data.request_id
+            try:
+                for local_row, layer_id in enumerate(self.layer_ids):
+                    layer_ucm_block_ids: list[bytes] = []
+                    layer_ptrs: list[np.ndarray] = []
+                    for k, mamba_vllm_ids in enumerate(
+                        request_data.mamba_vllm_block_ids
+                    ):
+                        if not mamba_vllm_ids:
+                            continue
+                        m_ptrs = (
+                            self.kv_cache_layout.extract_mamba_layer_block_addrs(
+                                k, local_row, mamba_vllm_ids
+                            )
+                        )
+                        for i, block_id in enumerate(
+                            request_data.mamba_ucm_block_ids[k]
+                        ):
+                            layer_ucm_block_ids.append(block_id)
+                            layer_ptrs.append(np.ascontiguousarray(m_ptrs[i]))
+
+                    if not layer_ucm_block_ids:
+                        continue
+                    shard_indexs = [layer_id] * len(layer_ucm_block_ids)
+                    task = self.store.load_data(
+                        layer_ucm_block_ids,
+                        shard_indexs,
+                        np.asarray(layer_ptrs, dtype=np.uint64),
+                    )
+                    tasks.append((request_id, task))
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit mamba load task error. "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
+
+        for request_id, task in tasks:
+            try:
+                self.store.wait(task)
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} wait mamba load failed. "
+                    f"{type(e).__name__}: {e}"
                 )
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
@@ -1940,18 +2195,63 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.need_load = False
 
         for request_id, request in metadata.request_meta.items():
-            if len(request.load_block_ids[0]) == 0:
+            has_mamba_load = self._has_any_mamba_ids(request.mamba_load)
+            if not request.need_load:
+                if request.load_block_ids[0] or has_mamba_load:
+                    logger.warning(
+                        "Hybrid layerwise load skipped inconsistent metadata: "
+                        f"dispatch_step={request.dispatch_step}, "
+                        f"dispatch_source={request.dispatch_source}, "
+                        f"request_id={request_id}, "
+                        f"need_load={request.need_load}"
+                    )
+                continue
+            if len(request.load_block_ids[0]) == 0 and not has_mamba_load:
                 continue
 
-            self.need_load = True
-            ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.tp_rank % self.tp_size != 0 and not self.is_mla:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
-            total_ptrs = self.kv_cache_layout.extract_block_addrs(
-                vllm_block_ids, layer_first=True
+            if self._is_hybrid_layerwise_physical():
+                request_data = self._prepare_layerwise_hybrid_load_data(
+                    request, request_id
+                )
+                if (
+                    request_data.vllm_block_ids
+                    or any(request_data.mamba_vllm_block_ids)
+                ):
+                    self.request_data.append(request_data)
+            else:
+                if has_mamba_load:
+                    logger.warning(
+                        "Layerwise hybrid load requires physical-shard layout; "
+                        f"request_id={request_id}"
+                    )
+                    continue
+                ucm_block_ids, vllm_block_ids = request.load_block_ids
+                if request.load_block_ids_hashed:
+                    ucm_block_ids = list(ucm_block_ids)
+                else:
+                    ucm_block_ids = self._hash_ucm_ids_for_transfer(
+                        ucm_block_ids, skip_mla=True
+                    )
+                total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                    vllm_block_ids, layer_first=True
+                )
+                self.request_data.append(
+                    LayerwiseRequestData(
+                        request_id=request_id,
+                        ucm_block_ids=ucm_block_ids,
+                        vllm_block_ids=vllm_block_ids,
+                        total_ptrs=total_ptrs,
+                    )
+                )
+                self.need_load = True
+
+        if self._is_hybrid_layerwise_physical() and self.request_data:
+            self._load_mamba_layers_for_hybrid(metadata)
+            self.need_load = any(
+                request_data.vllm_block_ids
+                and request_data.request_id not in self._failure_req_ids
+                for request_data in self.request_data
             )
-            self.request_data.append((request_id, ucm_block_ids, total_ptrs))
 
         if self.need_load:
             self._submit_request_load_tasks_for_layer(
@@ -1985,8 +2285,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 )
                 self._failure_req_ids.add(request_id)
 
-        next_layer_id = current_layer_id + 1
-        if next_layer_id not in self.layer_ids:
+        next_layer_id = self._get_next_registered_layer_id(current_layer_id)
+        if next_layer_id is None:
             return
         next_local_row = self.layer_id_to_row[next_layer_id]
 
@@ -2008,6 +2308,69 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         metadata = self._get_connector_metadata()
 
+        if self._is_hybrid_layerwise_physical():
+            assert isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+            hybrid_ucm_block_ids: list[bytes] = []
+            hybrid_ptrs: list[np.ndarray] = []
+
+            layer_id = self.layer_name_to_id.get(layer_name)
+            if layer_id is not None:
+                local_layer_id = self.layer_id_to_row[layer_id]
+                for _, request in metadata.request_meta.items():
+                    if len(request.dump_block_ids[0]) == 0:
+                        continue
+                    raw_ucm_block_ids, vllm_block_ids = request.dump_block_ids
+                    ucm_block_ids = self._hash_ucm_ids_for_transfer(
+                        raw_ucm_block_ids
+                    )
+                    attn_ptrs = (
+                        self.kv_cache_layout.extract_attention_layer_block_addrs(
+                            local_layer_id, vllm_block_ids
+                        )
+                    )
+                    for i, block_id in enumerate(ucm_block_ids):
+                        hybrid_ucm_block_ids.append(block_id)
+                        hybrid_ptrs.append(np.ascontiguousarray(attn_ptrs[i]))
+            else:
+                mamba_row = self._get_mamba_layer_row(layer_name)
+                if mamba_row is None:
+                    return
+                group_index, local_layer_id, layer_id = mamba_row
+                for _, request in metadata.request_meta.items():
+                    if group_index >= len(request.mamba_dump):
+                        continue
+                    m_ucm_ids, mamba_vllm_ids = request.mamba_dump[group_index]
+                    if not m_ucm_ids:
+                        continue
+                    m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                        m_ucm_ids, mamba_vllm_ids
+                    )
+                    if not m_ucm_ids or not m_vllm_ids:
+                        continue
+                    m_ptrs = self.kv_cache_layout.extract_mamba_layer_block_addrs(
+                        group_index, local_layer_id, m_vllm_ids
+                    )
+                    for i, block_id in enumerate(m_ucm_ids):
+                        hybrid_ucm_block_ids.append(block_id)
+                        hybrid_ptrs.append(np.ascontiguousarray(m_ptrs[i]))
+
+            if not hybrid_ucm_block_ids:
+                return
+            self.is_save = True
+            shard_indexs = [layer_id] * len(hybrid_ucm_block_ids)
+            try:
+                event_handle = self._get_dump_event_handle()
+                task = self.store.dump_data(
+                    hybrid_ucm_block_ids,
+                    shard_indexs,
+                    np.asarray(hybrid_ptrs, dtype=np.uint64),
+                    event_handle,
+                )
+                self.dump_tasks[layer_name] = task
+            except Exception as e:
+                logger.error(f"submit dump task failed. {type(e).__name__}: {e}")
+            return
+
         total_ucm_block_ids, total_vllm_block_ids = [], []
         layer_id = self._get_registered_layer_id(layer_name)
         if layer_id is None:
@@ -2019,13 +2382,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
             self.is_save = True
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
-            if self.tp_rank % self.tp_size != 0 and local_layer_id == 0:
-                for i, ucm_block_id in enumerate(ucm_block_ids):
-                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            ucm_block_ids = self._hash_ucm_ids_for_transfer(ucm_block_ids)
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
 
-        if self.is_save:
+        if self.is_save and total_vllm_block_ids:
             if self.dump_total_ptrs is None:
                 self.dump_total_ptrs = self.kv_cache_layout.extract_block_addrs(
                     total_vllm_block_ids, layer_first=True
