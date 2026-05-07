@@ -849,6 +849,55 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return [source_ucm_id], [target_vllm_id]
 
+    def _select_mamba_dump_blocks(
+        self,
+        group_index: int,
+        dump_ucm_block_ids: list[bytes],
+        mamba_vllm_ids: list[int],
+        token_end: int,
+        mamba_block_size: int,
+        request_id: str,
+        dispatch_step: int,
+        dispatch_source: str,
+    ) -> tuple[list[bytes], list[int]]:
+        """Return destination UCM ids and source Mamba block ids for dump."""
+        if self._vllm_config.cache_config.mamba_cache_mode != "align":
+            return dump_ucm_block_ids, mamba_vllm_ids
+
+        if not dump_ucm_block_ids or not mamba_vllm_ids:
+            return [], []
+
+        target_idx = max((token_end - 1) // mamba_block_size, 0)
+        if target_idx >= len(mamba_vllm_ids):
+            logger.warning(
+                "Hybrid mamba align dump skipped: source block index out of "
+                "range. "
+                f"dispatch_step={dispatch_step}, "
+                f"dispatch_source={dispatch_source}, "
+                f"request_id={request_id}, "
+                f"mamba_group={group_index}, "
+                f"source_state_idx={target_idx}, "
+                f"mamba_vllm_len={len(mamba_vllm_ids)}, "
+                f"dump_ucm_block_ids={self._format_bytes_ids(dump_ucm_block_ids)}, "
+                f"mamba_vllm_ids={self._format_int_ids(mamba_vllm_ids)}"
+            )
+            return [], []
+
+        source_vllm_id = mamba_vllm_ids[target_idx]
+        boundary_ucm_id = dump_ucm_block_ids[-1]
+        logger.info(
+            "Hybrid mamba align dump remap: "
+            f"dispatch_step={dispatch_step}, "
+            f"dispatch_source={dispatch_source}, "
+            f"request_id={request_id}, "
+            f"mamba_group={group_index}, "
+            f"boundary_ucm_block_id={boundary_ucm_id.hex()}, "
+            f"source_state_idx={target_idx}, "
+            f"source_vllm_block_id={source_vllm_id}, "
+            f"token_end={token_end}"
+        )
+        return [boundary_ucm_id], [source_vllm_id]
+
     @staticmethod
     def _filter_nonzero_mamba_blocks(
         ucm_block_ids: list[bytes],
@@ -916,9 +965,23 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         ucm_block_ids: list[bytes],
         group_index: int,
         hasher: Optional[RequestHasher] = None,
+        mamba_vllm_ids: Optional[list[int]] = None,
     ) -> list[bytes]:
+        """Derive storage keys for Mamba state blocks.
+
+        The key is based on the logical token-hash boundary, not on vLLM
+        physical block ids. Physical Mamba block ids are only used to skip
+        padding/invalid block 0 before hashing.
+        """
         if hasher is None:
             hasher = self.request_hasher
+        if mamba_vllm_ids is not None:
+            n = min(len(ucm_block_ids), len(mamba_vllm_ids))
+            ucm_block_ids = [
+                ucm_block_ids[i]
+                for i in range(n)
+                if int(mamba_vllm_ids[i]) != 0
+            ]
         return [
             hasher(("UCM_MAMBA_BLOCK", group_index, block_id))
             for block_id in ucm_block_ids
@@ -963,19 +1026,21 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         if attention_hit_blocks == 0 or self.num_mamba_groups == 0:
             return attention_hit_blocks
 
-        candidate_block_ids = block_ids[:attention_hit_blocks]
-        mamba_lookup_hits: list[list[bool]] = []
-        for group_index in range(self.num_mamba_groups):
-            mamba_block_ids = self._rehash_mamba_ucm_ids(
-                candidate_block_ids, group_index, hasher
-            )
-            group_hits = [bool(hit) for hit in self.store.lookup(mamba_block_ids)]
-            mamba_lookup_hits.append(group_hits)
-
         hybrid_hit_blocks = 0
+        mamba_boundary_hits: list[tuple[int, list[bool]]] = []
         for hit_blocks in range(attention_hit_blocks, 0, -1):
-            boundary_index = hit_blocks - 1
-            if all(hits[boundary_index] for hits in mamba_lookup_hits):
+            boundary_block_id = block_ids[hit_blocks - 1]
+            boundary_mamba_ids = [
+                self._rehash_mamba_ucm_ids(
+                    [boundary_block_id], group_index, hasher
+                )[0]
+                for group_index in range(self.num_mamba_groups)
+            ]
+            boundary_hits = [
+                bool(hit) for hit in self.store.lookup(boundary_mamba_ids)
+            ]
+            mamba_boundary_hits.append((hit_blocks, boundary_hits))
+            if all(boundary_hits):
                 hybrid_hit_blocks = hit_blocks
                 break
 
@@ -985,7 +1050,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 f"request_id={request_id}, "
                 f"label={label}, "
                 f"attention_hit_blocks={attention_hit_blocks}, "
-                f"mamba_lookup_hits={mamba_lookup_hits}, "
+                f"mamba_boundary_hits={mamba_boundary_hits}, "
                 f"hybrid_hit_blocks={hybrid_hit_blocks}"
             )
         return hybrid_hit_blocks
@@ -1345,8 +1410,8 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             req_meta.token_processed += new_tokens
 
         # ---- Mamba per-group load / dump block IDs ----
-        # Single-store design: mamba uses the same UCM hash keys as attention
-        # (requires mamba_block_size == attention block_size via mamba_cache_mode='align').
+        # Single-store design: Mamba state uses the same logical token boundary
+        # as attention, then rehashes that boundary into a separate storage key.
         mamba_load: list[tuple[list[bytes], list[int]]] = []
         mamba_dump: list[tuple[list[bytes], list[int]]] = []
         for k, mamba_block_size in enumerate(self.mamba_block_sizes):
@@ -1387,6 +1452,21 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 m_end = token_end_m // mamba_block_size
                 m_dump_ucm = dump_ucm_block_ids
                 m_dump_vllm = m_vllm[m_start:m_end]
+                m_source_vllm = (
+                    m_vllm
+                    if self._vllm_config.cache_config.mamba_cache_mode == "align"
+                    else m_dump_vllm
+                )
+                m_dump_ucm, m_dump_vllm = self._select_mamba_dump_blocks(
+                    k,
+                    m_dump_ucm,
+                    m_source_vllm,
+                    token_end_m,
+                    mamba_block_size,
+                    request_id,
+                    dispatch_step,
+                    dispatch_source,
+                )
             else:
                 m_dump_ucm, m_dump_vllm = [], []
             mamba_dump.append((m_dump_ucm, m_dump_vllm))
@@ -1665,7 +1745,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                                 m_ucm_ids, skip_mla=True
                             )
                         raw_mamba_count = min(len(m_ucm_ids), len(mamba_vllm_ids))
-                        m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                        m_storage_ucm_ids = self._rehash_mamba_ucm_ids(
+                            m_ucm_ids,
+                            k,
+                            mamba_vllm_ids=mamba_vllm_ids,
+                        )
+                        _, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             m_ucm_ids, mamba_vllm_ids
                         )
                         logger.info(
@@ -1681,7 +1766,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                         if not m_vllm_ids:
                             continue
-                        m_ucm_ids = self._rehash_mamba_ucm_ids(m_ucm_ids, k)
+                        m_ucm_ids = m_storage_ucm_ids
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
@@ -1916,6 +2001,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             len(total_mamba_ucm_block_ids[k]),
                             len(mamba_vllm_ids),
                         )
+                        m_storage_ucm_ids = self._rehash_mamba_ucm_ids(
+                            total_mamba_ucm_block_ids[k],
+                            k,
+                            mamba_vllm_ids=mamba_vllm_ids,
+                        )
                         m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                             total_mamba_ucm_block_ids[k], mamba_vllm_ids
                         )
@@ -1931,7 +2021,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                         if not m_vllm_ids:
                             continue
-                        m_ucm_ids = self._rehash_mamba_ucm_ids(m_ucm_ids, k)
+                        m_ucm_ids = m_storage_ucm_ids
                         m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
                             k, m_vllm_ids
                         )
