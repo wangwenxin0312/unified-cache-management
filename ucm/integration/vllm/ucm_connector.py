@@ -964,24 +964,28 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             return attention_hit_blocks
 
         candidate_block_ids = block_ids[:attention_hit_blocks]
-        mamba_hit_blocks: list[int] = []
+        mamba_lookup_hits: list[list[bool]] = []
         for group_index in range(self.num_mamba_groups):
             mamba_block_ids = self._rehash_mamba_ucm_ids(
                 candidate_block_ids, group_index, hasher
             )
-            group_hit_blocks = self._lookup_prefix_blocks(
-                mamba_block_ids, request_id, f"{label}:mamba_{group_index}"
-            )
-            mamba_hit_blocks.append(group_hit_blocks)
+            group_hits = [bool(hit) for hit in self.store.lookup(mamba_block_ids)]
+            mamba_lookup_hits.append(group_hits)
 
-        hybrid_hit_blocks = min([attention_hit_blocks, *mamba_hit_blocks])
+        hybrid_hit_blocks = 0
+        for hit_blocks in range(attention_hit_blocks, 0, -1):
+            boundary_index = hit_blocks - 1
+            if all(hits[boundary_index] for hits in mamba_lookup_hits):
+                hybrid_hit_blocks = hit_blocks
+                break
+
         if hybrid_hit_blocks != attention_hit_blocks:
             logger.info(
                 "Hybrid lookup reduced by Mamba blocks: "
                 f"request_id={request_id}, "
                 f"label={label}, "
                 f"attention_hit_blocks={attention_hit_blocks}, "
-                f"mamba_hit_blocks={mamba_hit_blocks}, "
+                f"mamba_lookup_hits={mamba_lookup_hits}, "
                 f"hybrid_hit_blocks={hybrid_hit_blocks}"
             )
         return hybrid_hit_blocks
