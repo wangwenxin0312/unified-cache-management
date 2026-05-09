@@ -843,6 +843,45 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             ]
         return {"shape": list(arr.shape), "sample": sample}
 
+    def _log_load_mapping(
+        self,
+        request_id: str,
+        cache_kind: str,
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+        *,
+        dispatch_step: Optional[int] = None,
+        dispatch_source: str = "",
+        group_index: Optional[int] = None,
+        layer_id: Optional[int] = None,
+        local_row: Optional[int] = None,
+        shard_indexs: Optional[list[int]] = None,
+    ) -> None:
+        if not ucm_block_ids and not vllm_block_ids:
+            return
+
+        fields = [
+            f"request_id={request_id}",
+            f"cache={cache_kind}",
+            f"num_hashes={len(ucm_block_ids)}",
+            f"num_vllm_blocks={len(vllm_block_ids)}",
+            f"ucm_hashes={self._format_bytes_ids(ucm_block_ids)}",
+            f"vllm_block_ids={self._format_int_ids(vllm_block_ids)}",
+        ]
+        if dispatch_step is not None:
+            fields.append(f"dispatch_step={dispatch_step}")
+        if dispatch_source:
+            fields.append(f"dispatch_source={dispatch_source}")
+        if group_index is not None:
+            fields.append(f"mamba_group={group_index}")
+        if layer_id is not None:
+            fields.append(f"layer_id={layer_id}")
+        if local_row is not None:
+            fields.append(f"local_row={local_row}")
+        if shard_indexs is not None:
+            fields.append(f"shard_indexs={self._format_int_ids(shard_indexs)}")
+        logger.info("UCM load mapping: " + ", ".join(fields))
+
     @staticmethod
     def _has_any_mamba_ids(
         mamba_dispatch: list[tuple[list[bytes], list[int]]]
@@ -1757,6 +1796,15 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             vllm_block_ids
                         )
                         shard_indexs = [0] * len(ucm_block_ids)
+                        self._log_load_mapping(
+                            request_id,
+                            "attention",
+                            ucm_block_ids,
+                            vllm_block_ids,
+                            dispatch_step=request.dispatch_step,
+                            dispatch_source=request.dispatch_source,
+                            shard_indexs=shard_indexs,
+                        )
                         task = self.store.load_data(
                             ucm_block_ids, shard_indexs, attn_ptrs
                         )
@@ -1784,6 +1832,16 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             k, m_vllm_ids
                         )
                         shard_indexs = [0] * len(m_ucm_ids)
+                        self._log_load_mapping(
+                            request_id,
+                            "mamba",
+                            m_ucm_ids,
+                            m_vllm_ids,
+                            dispatch_step=request.dispatch_step,
+                            dispatch_source=request.dispatch_source,
+                            group_index=k,
+                            shard_indexs=shard_indexs,
+                        )
                         task = self.store.load_data(
                             m_ucm_ids, shard_indexs, m_ptrs
                         )
@@ -1803,6 +1861,32 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
                     shard_indexs = [0] * len(ucm_block_ids)
+                    self._log_load_mapping(
+                        request_id,
+                        "attention",
+                        ucm_block_ids,
+                        vllm_block_ids,
+                        dispatch_step=request.dispatch_step,
+                        dispatch_source=request.dispatch_source,
+                        shard_indexs=shard_indexs,
+                    )
+                    for k, mamba_vllm_ids in enumerate(mamba_vllm_block_ids):
+                        m_ucm_ids = (
+                            request.mamba_load[k][0]
+                            if k < len(request.mamba_load)
+                            else []
+                        )
+                        if m_ucm_ids or mamba_vllm_ids:
+                            self._log_load_mapping(
+                                request_id,
+                                "mamba_combined",
+                                ucm_block_ids,
+                                list(mamba_vllm_ids),
+                                dispatch_step=request.dispatch_step,
+                                dispatch_source=request.dispatch_source,
+                                group_index=k,
+                                shard_indexs=shard_indexs,
+                            )
                     task = self.store.load_data(
                         ucm_block_ids, shard_indexs, total_ptrs
                     )
@@ -2163,6 +2247,22 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     if not layer_ucm_block_ids:
                         continue
                     shard_indexs = [local_row] * len(layer_ucm_block_ids)
+                    request_meta = metadata.request_meta.get(request_id)
+                    self._log_load_mapping(
+                        request_id,
+                        "attention_layer",
+                        layer_ucm_block_ids,
+                        request_data.vllm_block_ids,
+                        dispatch_step=(
+                            request_meta.dispatch_step if request_meta else None
+                        ),
+                        dispatch_source=(
+                            request_meta.dispatch_source if request_meta else ""
+                        ),
+                        layer_id=layer_id,
+                        local_row=local_row,
+                        shard_indexs=shard_indexs,
+                    )
                     task = self.store.load_data(
                         layer_ucm_block_ids,
                         shard_indexs,
@@ -2172,6 +2272,22 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     assert request_data.total_ptrs is not None
                     shard_indexs = [layer_id] * len(request_data.ucm_block_ids)
                     layer_ptrs = request_data.total_ptrs[local_row]
+                    request_meta = metadata.request_meta.get(request_id)
+                    self._log_load_mapping(
+                        request_id,
+                        "attention_layer",
+                        request_data.ucm_block_ids,
+                        request_data.vllm_block_ids,
+                        dispatch_step=(
+                            request_meta.dispatch_step if request_meta else None
+                        ),
+                        dispatch_source=(
+                            request_meta.dispatch_source if request_meta else ""
+                        ),
+                        layer_id=layer_id,
+                        local_row=local_row,
+                        shard_indexs=shard_indexs,
+                    )
                     task = self.store.load_data(
                         request_data.ucm_block_ids, shard_indexs, layer_ptrs
                     )
@@ -2219,6 +2335,33 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     if not layer_ucm_block_ids:
                         continue
                     shard_indexs = [local_row] * len(layer_ucm_block_ids)
+                    request_meta = metadata.request_meta.get(request_id)
+                    for k, mamba_vllm_ids in enumerate(
+                        request_data.mamba_vllm_block_ids
+                    ):
+                        if not mamba_vllm_ids:
+                            continue
+                        self._log_load_mapping(
+                            request_id,
+                            "mamba_layer",
+                            request_data.mamba_ucm_block_ids[k],
+                            mamba_vllm_ids,
+                            dispatch_step=(
+                                request_meta.dispatch_step
+                                if request_meta
+                                else None
+                            ),
+                            dispatch_source=(
+                                request_meta.dispatch_source
+                                if request_meta
+                                else ""
+                            ),
+                            group_index=k,
+                            layer_id=layer_id,
+                            local_row=local_row,
+                            shard_indexs=[local_row]
+                            * len(request_data.mamba_ucm_block_ids[k]),
+                        )
                     task = self.store.load_data(
                         layer_ucm_block_ids,
                         shard_indexs,
