@@ -537,12 +537,12 @@ class HybridKVCacheLayout:
     @property
     def block_size(self) -> int:
         if self.use_layerwise:
-            layer_count = (
-                self.attn_layout.num_hidden_layers
-                if self.attn_layout.pp_size > 1
-                else max(self.layer_ids) + 1
-            )
-            return self.shard_size * layer_count
+            # In physical-shard hybrid mode, each storage shard is a dense
+            # local layout row, not the model's sparse layer id.  Qwen3-Next
+            # may interleave full-attention and linear-attention layers, so
+            # using max(layer_id)+1 creates unwritten shard holes and makes
+            # lookup_on_prefix report misses for fully dumped blocks.
+            return self.shard_size * len(self.layer_ids)
         return self.shard_size
 
     def extract_attention_block_addrs(self, vllm_block_ids: List[int]) -> np.ndarray:
@@ -1111,6 +1111,24 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
 
         return ret
 
+    def _get_ucm_block_ids(self, request: "Request") -> list[bytes]:
+        return self.generate_hash(
+            self.hash_block_size, request.all_token_ids, self._seed
+        )
+
+    def _get_vllm_ucm_block_ids(self, request: "Request") -> list[bytes]:
+        num_full_blocks = len(request.all_token_ids) // self.hash_block_size
+        request_block_hashes = getattr(request, "block_hashes", None)
+        if (
+            request_block_hashes is None
+            or len(request_block_hashes) < num_full_blocks
+        ):
+            return []
+        return [
+            self.request_hasher(bytes(block_hash))
+            for block_hash in request_block_hashes[:num_full_blocks]
+        ]
+
     def _create_store(
         self,
         kv_cache_layout: Optional["KVCacheLayout | HybridKVCacheLayout"],
@@ -1275,9 +1293,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         assert num_computed_tokens % self.block_size == 0
         hbm_hit_block_num = num_computed_tokens // self.block_size
 
-        ucm_block_ids = self.generate_hash(
-            self.hash_block_size, request.all_token_ids, self._seed
-        )
+        ucm_block_ids = self._get_ucm_block_ids(request)
 
         if (
             self.enable_record_traces
@@ -1305,6 +1321,12 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
         lookup_block_ids = ucm_block_ids
         lookup_block_ids_hashed = False
+        vllm_ucm_block_ids = self._get_vllm_ucm_block_ids(request)
+        vllm_external_block_ids = (
+            vllm_ucm_block_ids[hbm_hit_block_num * self.cp_world_size :]
+            if vllm_ucm_block_ids and vllm_ucm_block_ids != ucm_block_ids
+            else []
+        )
         try:
             is_hybrid_model = self.num_mamba_groups > 0 or isinstance(
                 getattr(self, "kv_cache_layout", None), HybridKVCacheLayout
@@ -1341,10 +1363,49 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                             f"base_external_block_ids="
                             f"{self._format_bytes_ids(external_block_ids)}"
                         )
+                vllm_hit_blocks = 0
+                if external_hit_blocks == 0 and vllm_external_block_ids:
+                    vllm_hit_blocks = self._lookup_hybrid_prefix_blocks(
+                        vllm_external_block_ids,
+                        request.request_id,
+                        "vllm_block_hash",
+                    )
+                    if vllm_hit_blocks > 0:
+                        external_hit_blocks = vllm_hit_blocks
+                        ucm_block_ids = vllm_ucm_block_ids
+                        lookup_block_ids = vllm_ucm_block_ids
+                        external_block_ids = vllm_external_block_ids
+                        logger.info(
+                            "Hybrid lookup hit with vLLM block hashes after "
+                            "UCM token-hash miss. "
+                            f"request_id={request.request_id}, "
+                            f"hit_blocks={vllm_hit_blocks}, "
+                            f"vllm_external_block_ids="
+                            f"{self._format_bytes_ids(vllm_external_block_ids)}"
+                        )
             else:
                 external_hit_blocks = self.store.lookup_on_prefix(
                     external_block_ids
                 ) + 1
+                if external_hit_blocks == 0 and vllm_external_block_ids:
+                    vllm_hit_blocks = (
+                        self.store.lookup_on_prefix(vllm_external_block_ids) + 1
+                    )
+
+                    if vllm_hit_blocks > 0:
+                        external_hit_blocks = vllm_hit_blocks
+                        ucm_block_ids = vllm_ucm_block_ids
+                        lookup_block_ids = vllm_ucm_block_ids
+                        external_block_ids = vllm_external_block_ids
+
+                        logger.info(
+                            "Lookup hit with vLLM block hashes after UCM "
+                            "token-hash miss. "
+                            f"request_id={request.request_id}, "
+                            f"hit_blocks={vllm_hit_blocks}, "
+                            f"vllm_external_block_ids="
+                            f"{self._format_bytes_ids(vllm_external_block_ids)}"
+                        )
             external_hit_blocks //= self.cp_world_size
         except Exception as e:
             external_hit_blocks = 0
@@ -2101,7 +2162,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
                     if not layer_ucm_block_ids:
                         continue
-                    shard_indexs = [layer_id] * len(layer_ucm_block_ids)
+                    shard_indexs = [local_row] * len(layer_ucm_block_ids)
                     task = self.store.load_data(
                         layer_ucm_block_ids,
                         shard_indexs,
@@ -2157,7 +2218,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
                     if not layer_ucm_block_ids:
                         continue
-                    shard_indexs = [layer_id] * len(layer_ucm_block_ids)
+                    shard_indexs = [local_row] * len(layer_ucm_block_ids)
                     task = self.store.load_data(
                         layer_ucm_block_ids,
                         shard_indexs,
@@ -2335,7 +2396,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 mamba_row = self._get_mamba_layer_row(layer_name)
                 if mamba_row is None:
                     return
-                group_index, local_layer_id, layer_id = mamba_row
+                group_index, local_layer_id, _ = mamba_row
                 for _, request in metadata.request_meta.items():
                     if group_index >= len(request.mamba_dump):
                         continue
@@ -2357,7 +2418,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             if not hybrid_ucm_block_ids:
                 return
             self.is_save = True
-            shard_indexs = [layer_id] * len(hybrid_ucm_block_ids)
+            shard_indexs = [local_layer_id] * len(hybrid_ucm_block_ids)
             try:
                 event_handle = self._get_dump_event_handle()
                 task = self.store.dump_data(
