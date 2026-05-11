@@ -1205,12 +1205,19 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             config_base = self.block_size * self.element_size * self.head_size
-            config["block_size"] = (
+            one_layer_size = (
                 config_base
-                * self.num_layers
                 * (1 if self.is_mla else self.num_head * 2)
                 * self.blocks_per_chunk
             )
+            config["block_size"] = one_layer_size * self.num_layers
+            if self.use_layerwise:
+                # Layerwise workers store one shard per layer (shard_index =
+                # layer_id, shard_size = one layer's KV data).  Without
+                # shard_size the scheduler store defaults to shard_size =
+                # block_size (single-shard mode) and never finds a complete
+                # block because N small shards ≠ one big shard.
+                config["shard_size"] = one_layer_size
         dp_rank = self._vllm_config.parallel_config.data_parallel_rank
         config["posix_gc_enable"] = (
             self._role != KVConnectorRole.WORKER and dp_rank == 0
