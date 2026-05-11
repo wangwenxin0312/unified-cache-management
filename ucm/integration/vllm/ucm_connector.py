@@ -1856,48 +1856,103 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     if not vllm_block_ids:
                         continue
-                    total_ptrs = self.kv_cache_layout.extract_block_addrs(
-                        vllm_block_ids, mamba_vllm_block_ids
-                    )
-                    total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
-                    shard_indexs = [0] * len(ucm_block_ids)
-                    self._log_load_mapping(
-                        request_id,
-                        "attention",
-                        ucm_block_ids,
-                        vllm_block_ids,
-                        dispatch_step=request.dispatch_step,
-                        dispatch_source=request.dispatch_source,
-                        shard_indexs=shard_indexs,
-                    )
-                    for k, mamba_vllm_ids in enumerate(mamba_vllm_block_ids):
-                        m_ucm_ids = (
-                            request.mamba_load[k][0]
-                            if k < len(request.mamba_load)
-                            else []
+                    if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
+                        # Attention and Mamba have independent block counts in
+                        # align mode (_select_mamba_load_blocks returns a single
+                        # running-state block regardless of prefix length).
+                        # extract_block_addrs enforces equal counts and raises
+                        # otherwise, silently aborting the entire load and leaving
+                        # Mamba blocks zero-initialised across process restarts.
+                        # Mirror the physical-shard path: load attention and each
+                        # Mamba group separately.
+                        attn_ptrs = (
+                            self.kv_cache_layout.extract_attention_block_addrs(
+                                vllm_block_ids
+                            )
                         )
-                        if m_ucm_ids or mamba_vllm_ids:
+                        shard_indexs = [0] * len(ucm_block_ids)
+                        self._log_load_mapping(
+                            request_id,
+                            "attention",
+                            ucm_block_ids,
+                            vllm_block_ids,
+                            dispatch_step=request.dispatch_step,
+                            dispatch_source=request.dispatch_source,
+                            shard_indexs=shard_indexs,
+                        )
+                        task = self.store.load_data(
+                            ucm_block_ids, shard_indexs, attn_ptrs
+                        )
+                        request_tasks.append(
+                            (
+                                request_id,
+                                request.dispatch_step,
+                                request.dispatch_source,
+                                task,
+                            )
+                        )
+                        for k, mamba_vllm_ids in enumerate(mamba_vllm_block_ids):
+                            m_ucm_ids = (
+                                request.mamba_load[k][0]
+                                if k < len(request.mamba_load)
+                                else []
+                            )
+                            m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                                m_ucm_ids, list(mamba_vllm_ids)
+                            )
+                            if not m_ucm_ids or not m_vllm_ids:
+                                continue
+                            m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
+                                k, m_vllm_ids
+                            )
+                            shard_indexs_m = [0] * len(m_ucm_ids)
                             self._log_load_mapping(
                                 request_id,
-                                "mamba_combined",
-                                ucm_block_ids,
-                                list(mamba_vllm_ids),
+                                "mamba",
+                                m_ucm_ids,
+                                m_vllm_ids,
                                 dispatch_step=request.dispatch_step,
                                 dispatch_source=request.dispatch_source,
                                 group_index=k,
-                                shard_indexs=shard_indexs,
+                                shard_indexs=shard_indexs_m,
                             )
-                    task = self.store.load_data(
-                        ucm_block_ids, shard_indexs, total_ptrs
-                    )
-                    request_tasks.append(
-                        (
-                            request_id,
-                            request.dispatch_step,
-                            request.dispatch_source,
-                            task,
+                            task = self.store.load_data(
+                                m_ucm_ids, shard_indexs_m, m_ptrs
+                            )
+                            request_tasks.append(
+                                (
+                                    request_id,
+                                    request.dispatch_step,
+                                    request.dispatch_source,
+                                    task,
+                                )
+                            )
+                    else:
+                        total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                            vllm_block_ids, mamba_vllm_block_ids
                         )
-                    )
+                        total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+                        shard_indexs = [0] * len(ucm_block_ids)
+                        self._log_load_mapping(
+                            request_id,
+                            "attention",
+                            ucm_block_ids,
+                            vllm_block_ids,
+                            dispatch_step=request.dispatch_step,
+                            dispatch_source=request.dispatch_source,
+                            shard_indexs=shard_indexs,
+                        )
+                        task = self.store.load_data(
+                            ucm_block_ids, shard_indexs, total_ptrs
+                        )
+                        request_tasks.append(
+                            (
+                                request_id,
+                                request.dispatch_step,
+                                request.dispatch_source,
+                                task,
+                            )
+                        )
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit load task error. {type(e).__name__}: {e}"
@@ -2049,17 +2104,48 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     if not total_vllm_block_ids:
                         return
-                    total_ptrs = self.kv_cache_layout.extract_block_addrs(
-                        total_vllm_block_ids, total_mamba_vllm_block_ids
-                    )
-                    total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
-                    shard_indexs = [0] * len(total_ucm_block_ids)
                     event_handle = self._get_dump_event_handle()
                     save_start_time = time.perf_counter() * 1000
-                    task = self.store.dump_data(
-                        total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
-                    )
-                    dump_tasks.append(task)
+                    if isinstance(self.kv_cache_layout, HybridKVCacheLayout):
+                        # Same fix as start_load_kv: attention and Mamba block
+                        # counts differ in align mode so they must be dumped
+                        # separately instead of via the combined extract_block_addrs
+                        # (which enforces equal counts and would raise otherwise).
+                        attn_ptrs = (
+                            self.kv_cache_layout.extract_attention_block_addrs(
+                                total_vllm_block_ids
+                            )
+                        )
+                        shard_indexs = [0] * len(total_ucm_block_ids)
+                        task = self.store.dump_data(
+                            total_ucm_block_ids, shard_indexs, attn_ptrs, event_handle
+                        )
+                        dump_tasks.append(task)
+                        for k, m_vllm_ids in enumerate(total_mamba_vllm_block_ids):
+                            m_ucm_ids = total_mamba_ucm_block_ids[k]
+                            m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                                m_ucm_ids, m_vllm_ids
+                            )
+                            if not m_ucm_ids or not m_vllm_ids:
+                                continue
+                            m_ptrs = self.kv_cache_layout.extract_mamba_block_addrs(
+                                k, m_vllm_ids
+                            )
+                            shard_indexs_m = [0] * len(m_ucm_ids)
+                            task = self.store.dump_data(
+                                m_ucm_ids, shard_indexs_m, m_ptrs, event_handle
+                            )
+                            dump_tasks.append(task)
+                    else:
+                        total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                            total_vllm_block_ids, total_mamba_vllm_block_ids
+                        )
+                        total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
+                        shard_indexs = [0] * len(total_ucm_block_ids)
+                        task = self.store.dump_data(
+                            total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
+                        )
+                        dump_tasks.append(task)
             except Exception as e:
                 logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
                 return
