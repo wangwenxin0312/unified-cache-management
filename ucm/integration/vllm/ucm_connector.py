@@ -729,6 +729,8 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         self.mamba_block_sizes: list[int] = []
         # Mamba layouts are folded into self.store for hybrid models.
         self.mamba_kv_cache_layouts: list[Optional["KVCacheLayout"]] = []
+        self._scheduler_hybrid_num_rows: Optional[int] = None
+        self._scheduler_hybrid_row_size: Optional[int] = None
 
         if current_platform.is_cuda_alike():
             logger.info("CUDA device is available.")
@@ -754,6 +756,7 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self.launch_config = ucm_config.get_config()
+        self.use_layerwise = self.launch_config.get("use_layerwise", False)
         self.connector_configs = self.launch_config.get("ucm_connectors", [])
         self.enable_event_sync = self.launch_config.get("enable_event_sync", True)
         self.enable_record_traces = self.launch_config.get(
@@ -764,6 +767,11 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         self.chunk_size = self.block_size
         self.blocks_per_chunk = self.chunk_size // self.block_size
 
+        # Scheduler store sizing also depends on hybrid Mamba metadata, so it
+        # must be available before creating the scheduler-side store.
+        if kv_cache_config is not None:
+            self._init_mamba_group_info(kv_cache_config)
+
         if role == KVConnectorRole.SCHEDULER:
             self.request_hasher = RequestHasher(vllm_config, 0)
             self._seed = self.request_hasher("UCM_HASH_SEED")
@@ -773,10 +781,6 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
             self.request_hasher = RequestHasher(
                 vllm_config, self.tp_rank % self.tp_size
             )
-
-        # Now that request_hasher is ready, initialise mamba group info.
-        if kv_cache_config is not None:
-            self._init_mamba_group_info(kv_cache_config)
 
         self.metrics_config = self.launch_config.get("metrics_config_path", "")
         if self.metrics_config:
@@ -817,15 +821,46 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
         controls the attention block_size already stored in self.block_size.
         All remaining groups that use MambaSpec are registered here.
         """
-        if not _HAS_KV_CACHE_CONFIG:
-            return
-        attn_block_size = self._vllm_config.cache_config.block_size
+        self.mamba_group_layer_names.clear()
+        self.mamba_block_sizes.clear()
+        self._scheduler_hybrid_num_rows = None
+        self._scheduler_hybrid_row_size = None
+
+        attention_layer_ids: set[int] = set()
+        mamba_layer_ids_by_group: list[set[int]] = []
+        attention_page_sizes: list[int] = []
+        mamba_page_sizes: list[int] = []
+
+        def try_extract_layer_index(layer_name: str) -> Optional[int]:
+            try:
+                return extract_layer_index(layer_name)
+            except Exception:
+                logger.warning_once(
+                    "Unable to extract layer index from KV cache layer name: "
+                    f"{layer_name!r}"
+                )
+                return None
+
         for gid, group_spec in enumerate(kv_cache_config.kv_cache_groups):
             spec = group_spec.kv_cache_spec
             if not isinstance(spec, MambaSpec):
+                for layer_name in group_spec.layer_names:
+                    layer_id = try_extract_layer_index(layer_name)
+                    if layer_id is not None:
+                        attention_layer_ids.add(layer_id)
+                page_size = getattr(spec, "page_size_bytes", None)
+                if page_size is not None:
+                    attention_page_sizes.append(int(page_size))
                 continue
             self.mamba_group_layer_names.append(sorted(group_spec.layer_names))
             self.mamba_block_sizes.append(spec.block_size)
+            group_layer_ids: set[int] = set()
+            for layer_name in group_spec.layer_names:
+                layer_id = try_extract_layer_index(layer_name)
+                if layer_id is not None:
+                    group_layer_ids.add(layer_id)
+            mamba_layer_ids_by_group.append(group_layer_ids)
+            mamba_page_sizes.append(int(spec.page_size_bytes))
             logger.info(
                 f"Registered mamba group {gid}: "
                 f"{len(group_spec.layer_names)} layers, "
@@ -834,6 +869,31 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 f"page_size_padded={getattr(spec, 'page_size_padded', None)}, "
                 f"shapes={spec.shapes}, "
                 f"dtypes={[str(dtype) for dtype in spec.dtypes]}"
+            )
+
+        if mamba_page_sizes:
+            if attention_layer_ids:
+                num_rows = len(attention_layer_ids)
+            elif mamba_layer_ids_by_group:
+                num_rows = max(len(ids) for ids in mamba_layer_ids_by_group)
+            else:
+                num_rows = self.num_layers
+
+            # For Ascend hybrid layerwise layout each dense row contains the
+            # padded physical page, e.g. conv + K/SSM + V/padding. The
+            # scheduler must use the same row size and dense row count as the
+            # worker; otherwise lookup() sees incomplete Mamba shards.
+            self._scheduler_hybrid_num_rows = num_rows
+            self._scheduler_hybrid_row_size = max(
+                [*attention_page_sizes, *mamba_page_sizes]
+            )
+            logger.info(
+                "Registered scheduler hybrid KV layout: "
+                f"rows={self._scheduler_hybrid_num_rows}, "
+                f"row_size={self._scheduler_hybrid_row_size}, "
+                f"attention_layer_ids={sorted(attention_layer_ids)}, "
+                f"mamba_layer_ids="
+                f"{[sorted(ids) for ids in mamba_layer_ids_by_group]}"
             )
 
     def _validate_single_store_mamba_blocks(self) -> None:
@@ -1252,13 +1312,23 @@ class UCMDirectConnector(KVConnectorBase_V1, SupportsHMA):
                 * (1 if self.is_mla else self.num_head * 2)
                 * self.blocks_per_chunk
             )
-            config["block_size"] = one_layer_size * self.num_layers
+            hybrid_row_size = self._scheduler_hybrid_row_size
+            hybrid_num_rows = self._scheduler_hybrid_num_rows
+            if hybrid_row_size is not None and hybrid_num_rows is not None:
+                one_layer_size = hybrid_row_size * self.blocks_per_chunk
+                config["block_size"] = one_layer_size * hybrid_num_rows
+                logger.info(
+                    "Scheduler hybrid store config: "
+                    f"row_size={one_layer_size}, "
+                    f"rows={hybrid_num_rows}, "
+                    f"block_size={config['block_size']}"
+                )
+            else:
+                config["block_size"] = one_layer_size * self.num_layers
             if self.use_layerwise:
-                # Layerwise workers store one shard per layer (shard_index =
-                # layer_id, shard_size = one layer's KV data).  Without
-                # shard_size the scheduler store defaults to shard_size =
-                # block_size (single-shard mode) and never finds a complete
-                # block because N small shards ≠ one big shard.
+                # Layerwise workers store one shard per layer/row. Without
+                # shard_size the scheduler store defaults to single-shard mode
+                # and never finds a complete block made of N smaller shards.
                 config["shard_size"] = one_layer_size
         dp_rank = self._vllm_config.parallel_config.data_parallel_rank
         config["posix_gc_enable"] = (
