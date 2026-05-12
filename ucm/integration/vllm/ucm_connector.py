@@ -2711,6 +2711,68 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 )
                 self._failure_req_ids.add(request_id)
 
+    def _dump_mamba_layers_for_hybrid_fallback(
+        self,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        """Fallback dump for hybrid Mamba states.
+
+        Some hybrid model paths do not call connector.save_kv_layer() for
+        Mamba/linear-attention layers.  With scratch padding, dumping these
+        states after forward is safe because padding slots no longer alias
+        attention or Mamba cache tensors.
+        """
+        if not self._is_hybrid_layerwise_physical():
+            return
+        assert isinstance(self.kv_cache_layout, HybridKVCacheLayout)
+
+        has_mamba_layer_dump = any(
+            self._get_mamba_layer_row(layer_name) is not None
+            for layer_name in self.dump_tasks
+        )
+        if has_mamba_layer_dump:
+            return
+
+        task_index = 0
+        for local_row, _ in enumerate(self.layer_ids):
+            hybrid_ucm_block_ids: list[bytes] = []
+            hybrid_ptrs: list[np.ndarray] = []
+            for request in metadata.request_meta.values():
+                for group_index, mamba_dump in enumerate(request.mamba_dump):
+                    m_ucm_ids, mamba_vllm_ids = mamba_dump
+                    m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
+                        m_ucm_ids, mamba_vllm_ids
+                    )
+                    if not m_ucm_ids or not m_vllm_ids:
+                        continue
+                    m_ptrs = self.kv_cache_layout.extract_mamba_layer_block_addrs(
+                        group_index, local_row, m_vllm_ids
+                    )
+                    for i, block_id in enumerate(m_ucm_ids):
+                        hybrid_ucm_block_ids.append(block_id)
+                        hybrid_ptrs.append(np.ascontiguousarray(m_ptrs[i]))
+
+            if not hybrid_ucm_block_ids:
+                continue
+
+            self.is_save = True
+            shard_indexs = [local_row] * len(hybrid_ucm_block_ids)
+            try:
+                event_handle = self._get_dump_event_handle()
+                task = self.store.dump_data(
+                    hybrid_ucm_block_ids,
+                    shard_indexs,
+                    np.asarray(hybrid_ptrs, dtype=np.uint64),
+                    event_handle,
+                )
+                self.dump_tasks[f"__hybrid_mamba_fallback_{task_index}"] = task
+                task_index += 1
+            except Exception as e:
+                logger.error(
+                    "submit hybrid mamba fallback dump task failed. "
+                    f"row={local_row}, {type(e).__name__}: {e}"
+                )
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         self.load_tasks.clear()
@@ -2932,12 +2994,20 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 logger.error(f"submit dump task failed. {type(e).__name__}: {e}")
 
     def wait_for_save(self) -> None:
+        if self._is_hybrid_layerwise_physical() and self._connector_metadata:
+            metadata = self._get_connector_metadata()
+            assert isinstance(metadata, UCMConnectorMetadata)
+            self._dump_mamba_layers_for_hybrid_fallback(metadata)
+
         if not self.is_save:
             return
         try:
             for layer_name in self.kv_caches:
                 if layer_name in self.dump_tasks:
                     self.store.wait(self.dump_tasks[layer_name])
+            for layer_name, task in self.dump_tasks.items():
+                if layer_name not in self.kv_caches:
+                    self.store.wait(task)
         except Exception as e:
             logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
         self.dump_tasks.clear()
