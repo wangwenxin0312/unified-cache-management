@@ -2373,6 +2373,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.dump_total_ptrs: np.ndarray | None = None
         self.request_data: list[LayerwiseRequestData] = []
         self._failure_req_ids: set[str] = set()
+        self._loaded_mamba_rows: set[tuple[int, int]] = set()
+        self._saved_mamba_rows: set[tuple[int, int]] = set()
         logger.info("Init UCMLayerWiseConnector.")
 
     def _get_registered_layer_id(self, layer_name: str) -> Optional[int]:
@@ -2645,6 +2647,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         if mamba_row is None:
             return
         group_index, local_row, layer_id = mamba_row
+        row_key = (group_index, local_row)
+        if row_key in self._loaded_mamba_rows:
+            logger.info(
+                "Hybrid layerwise mamba load skipped; row already loaded. "
+                f"layer_name={layer_name}, group_index={group_index}, "
+                f"local_row={local_row}, layer_id={layer_id}"
+            )
+            return
 
         tasks: list[tuple[str, Task]] = []
         for request_data in self.request_data:
@@ -2688,6 +2698,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     ),
                 )
                 tasks.append((request_id, task))
+                logger.info(
+                    "Hybrid layerwise mamba load submitted. "
+                    f"request_id={request_id}, layer_name={layer_name}, "
+                    f"group_index={group_index}, local_row={local_row}, "
+                    f"layer_id={layer_id}, "
+                    f"ucm_ids={self._format_bytes_ids(m_ucm_ids)}, "
+                    f"vllm_ids={self._format_int_ids(mamba_vllm_ids)}"
+                )
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit mamba layer load task "
@@ -2697,6 +2715,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
                 self._failure_req_ids.add(request_id)
+
+        if tasks:
+            self._loaded_mamba_rows.add(row_key)
 
         for request_id, task in tasks:
             try:
@@ -2726,19 +2747,27 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             return
         assert isinstance(self.kv_cache_layout, HybridKVCacheLayout)
 
-        has_mamba_layer_dump = any(
-            self._get_mamba_layer_row(layer_name) is not None
-            for layer_name in self.dump_tasks
-        )
-        if has_mamba_layer_dump:
-            return
-
         task_index = 0
         for local_row, _ in enumerate(self.layer_ids):
             hybrid_ucm_block_ids: list[bytes] = []
             hybrid_ptrs: list[np.ndarray] = []
             for request in metadata.request_meta.values():
                 for group_index, mamba_dump in enumerate(request.mamba_dump):
+                    if (group_index, local_row) in self._saved_mamba_rows:
+                        continue
+                    if (
+                        request.need_load
+                        and group_index < len(request.mamba_load)
+                        and self._has_any_mamba_ids([request.mamba_load[group_index]])
+                        and (group_index, local_row) not in self._loaded_mamba_rows
+                    ):
+                        logger.error(
+                            "Hybrid layerwise mamba row was saved without "
+                            "being loaded before forward; current generation "
+                            "may use stale/zero Mamba state. "
+                            f"group_index={group_index}, local_row={local_row}, "
+                            f"mamba_load={request.mamba_load[group_index]}"
+                        )
                     m_ucm_ids, mamba_vllm_ids = mamba_dump
                     m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
                         m_ucm_ids, mamba_vllm_ids
@@ -2766,6 +2795,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     event_handle,
                 )
                 self.dump_tasks[f"__hybrid_mamba_fallback_{task_index}"] = task
+                logger.warning(
+                    "Hybrid layerwise mamba fallback dump submitted; "
+                    "the model path did not call save_kv_layer for this "
+                    "mamba row before wait_for_save. "
+                    f"local_row={local_row}, "
+                    f"ucm_ids={self._format_bytes_ids(hybrid_ucm_block_ids)}"
+                )
                 task_index += 1
             except Exception as e:
                 logger.error(
@@ -2778,6 +2814,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.load_tasks.clear()
         self.request_data.clear()
         self._failure_req_ids.clear()
+        self._loaded_mamba_rows.clear()
+        self._saved_mamba_rows.clear()
         self.need_load = False
 
         for request_id, request in metadata.request_meta.items():
@@ -2944,6 +2982,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     for i, block_id in enumerate(m_ucm_ids):
                         hybrid_ucm_block_ids.append(block_id)
                         hybrid_ptrs.append(np.ascontiguousarray(m_ptrs[i]))
+                row_key = (group_index, local_layer_id)
 
             if not hybrid_ucm_block_ids:
                 return
@@ -2958,6 +2997,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     event_handle,
                 )
                 self.dump_tasks[layer_name] = task
+                if layer_id is None:
+                    self._saved_mamba_rows.add(row_key)
+                    logger.info(
+                        "Hybrid layerwise mamba save submitted. "
+                        f"layer_name={layer_name}, group_index={row_key[0]}, "
+                        f"local_row={row_key[1]}, "
+                        f"ucm_ids={self._format_bytes_ids(hybrid_ucm_block_ids)}"
+                    )
             except Exception as e:
                 logger.error(f"submit dump task failed. {type(e).__name__}: {e}")
             return
