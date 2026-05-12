@@ -93,6 +93,7 @@ class KVCacheLayout:
         self.tensor_size_lists: np.ndarray  # (n_layers, n_tensor_sizes)
         self.use_layerwise = use_layerwise
         self.vllm_config = vllm_config
+        self.device: Optional[torch.device] = None
         self.pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         self.num_hidden_layers = getattr(
             self.vllm_config.model_config.hf_text_config, "num_hidden_layers", 0
@@ -124,6 +125,8 @@ class KVCacheLayout:
             tensor_sizes = []
 
             def handle_tensor(t: torch.Tensor, size_dims):
+                if self.device is None:
+                    self.device = t.device
                 ptrs.append(t[0].data_ptr())
 
                 tensor_size = (
@@ -137,6 +140,8 @@ class KVCacheLayout:
                     raise ValueError(
                         f"Unsupported kv cache tensor shape: {t.shape}"
                     )
+                if self.device is None:
+                    self.device = t.device
                 ptrs.append(t[0].data_ptr())
                 tensor_sizes.append(math.prod(t.shape[1:]) * t.element_size())
                 block_strides.append(t.stride(0) * t.element_size())
@@ -312,6 +317,8 @@ class HybridKVCacheLayout:
             and self.attn_layout.base_ptrs.shape[1] >= 2
             and self._reference_mamba_layout.base_ptrs.shape[1] >= 2
         )
+        self._physical_padding_scratch: Optional[torch.Tensor] = None
+        self._physical_padding_scratch_ptrs: Optional[np.ndarray] = None
         if self._use_npu_physical_shards:
             ref_rows = self._reference_mamba_layout.base_ptrs.shape[0]
             attn_rows = self.attn_layout.base_ptrs.shape[0]
@@ -333,6 +340,26 @@ class HybridKVCacheLayout:
                         f"{k} shape={layout.base_ptrs.shape}, "
                         f"expected={self._reference_mamba_layout.base_ptrs.shape}."
                     )
+            rows = self._physical_tensor_size_rows()
+            max_padding_size = max(max(row[0], row[2]) for row in rows)
+            scratch_device = self.attn_layout.device
+            if scratch_device is None:
+                raise RuntimeError(
+                    "NPU hybrid physical-shard layout requires a known "
+                    "KV cache tensor device for padding scratch buffers."
+                )
+            self._physical_padding_scratch = torch.empty(
+                (attn_rows, max_padding_size),
+                dtype=torch.uint8,
+                device=scratch_device,
+            )
+            self._physical_padding_scratch_ptrs = np.asarray(
+                [
+                    self._physical_padding_scratch[row].data_ptr()
+                    for row in range(attn_rows)
+                ],
+                dtype=np.uint64,
+            )
             logger.info(
                 "HybridKVCacheLayout: enabled NPU physical-shard mode, "
                 f"attn_rows={attn_rows}, "
@@ -340,7 +367,8 @@ class HybridKVCacheLayout:
                 f"mamba_groups={len(self.mamba_layouts)}, "
                 f"mamba_ptrs_per_row={self._reference_mamba_layout.base_ptrs.shape[1]}, "
                 f"aligned_stride={self._npu_attn_aligned_stride()}, "
-                f"storage_shard_count={self.physical_shard_count}"
+                f"storage_shard_count={self.physical_shard_count}, "
+                f"padding_scratch_size={max_padding_size}"
             )
         else:
             logger.info(
@@ -440,14 +468,11 @@ class HybridKVCacheLayout:
         vllm_block_ids: List[int],
     ) -> np.ndarray:
         assert self._reference_mamba_layout is not None
+        assert self._physical_padding_scratch_ptrs is not None
         vllm_ids_np = np.array(vllm_block_ids, np.uint64)
-        conv_strides = self._reference_mamba_layout.block_stride_lists[
-            None, :, 0
-        ]
-        conv_bases = self._reference_mamba_layout.base_ptrs[None, :, 0]
-        conv_padding = (
-            vllm_ids_np[:, None] * conv_strides
-            + conv_bases
+        conv_padding = np.broadcast_to(
+            self._physical_padding_scratch_ptrs[None, :],
+            (len(vllm_block_ids), self.attn_layout.base_ptrs.shape[0]),
         )
         k_part = (
             vllm_ids_np[:, None] * np.uint64(self._npu_attn_aligned_stride())
@@ -482,6 +507,7 @@ class HybridKVCacheLayout:
         layout = self.mamba_layouts[group_index]
         if layout is None:
             raise RuntimeError(f"Mamba group {group_index} has no KV cache layout.")
+        assert self._physical_padding_scratch_ptrs is not None
         vllm_ids_np = np.array(vllm_block_ids, np.uint64)
         conv_part = (
             vllm_ids_np[:, None] * layout.block_stride_lists[None, :, 0]
@@ -491,9 +517,9 @@ class HybridKVCacheLayout:
             vllm_ids_np[:, None] * layout.block_stride_lists[None, :, 1]
             + layout.base_ptrs[None, :, 1]
         )
-        v_padding = (
-            vllm_ids_np[:, None] * np.uint64(self._npu_attn_aligned_stride())
-            + self.attn_layout.base_ptrs[None, :, 1]
+        v_padding = np.broadcast_to(
+            self._physical_padding_scratch_ptrs[None, :],
+            (len(vllm_block_ids), layout.base_ptrs.shape[0]),
         )
         return np.stack((conv_part, ssm_part, v_padding), axis=2).reshape(
             len(vllm_block_ids), -1
@@ -2606,63 +2632,84 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 )
                 self._failure_req_ids.add(request_id)
 
-    def _dump_mamba_layers_for_hybrid(
+    def _load_mamba_layer_for_hybrid(
         self,
+        layer_name: str,
         metadata: "UCMConnectorMetadata",
     ) -> None:
-        """Dump hybrid Mamba states after forward in layerwise mode.
-
-        vLLM's layerwise KV connector hooks are attached to attention layers.
-        Hybrid Mamba / linear-attention layers may not call save_kv_layer(), so
-        relying only on the Mamba branch there leaves the rehashed Mamba keys
-        absent even when attention blocks have been dumped. Dumping all Mamba
-        rows at wait_for_save time keeps prefix lookup consistent with the
-        attention side.
-        """
         if not self._is_hybrid_layerwise_physical():
             return
         assert isinstance(self.kv_cache_layout, HybridKVCacheLayout)
 
-        tasks: list[Task] = []
-        for local_row, _ in enumerate(self.layer_ids):
-            hybrid_ucm_block_ids: list[bytes] = []
-            hybrid_ptrs: list[np.ndarray] = []
-            for request in metadata.request_meta.values():
-                for group_index, mamba_dump in enumerate(request.mamba_dump):
-                    m_ucm_ids, mamba_vllm_ids = mamba_dump
-                    m_ucm_ids, m_vllm_ids = self._filter_nonzero_mamba_blocks(
-                        m_ucm_ids, mamba_vllm_ids
-                    )
-                    if not m_ucm_ids or not m_vllm_ids:
-                        continue
-                    m_ptrs = self.kv_cache_layout.extract_mamba_layer_block_addrs(
-                        group_index, local_row, m_vllm_ids
-                    )
-                    for i, block_id in enumerate(m_ucm_ids):
-                        hybrid_ucm_block_ids.append(block_id)
-                        hybrid_ptrs.append(np.ascontiguousarray(m_ptrs[i]))
+        mamba_row = self._get_mamba_layer_row(layer_name)
+        if mamba_row is None:
+            return
+        group_index, local_row, layer_id = mamba_row
 
-            if not hybrid_ucm_block_ids:
+        tasks: list[tuple[str, Task]] = []
+        for request_data in self.request_data:
+            request_id = request_data.request_id
+            if request_id in self._failure_req_ids:
                 continue
-            self.is_save = True
-            shard_indexs = [local_row] * len(hybrid_ucm_block_ids)
+            if group_index >= len(request_data.mamba_vllm_block_ids):
+                continue
+            mamba_vllm_ids = request_data.mamba_vllm_block_ids[group_index]
+            if not mamba_vllm_ids:
+                continue
+            m_ucm_ids = request_data.mamba_ucm_block_ids[group_index]
             try:
-                event_handle = self._get_dump_event_handle()
-                task = self.store.dump_data(
-                    hybrid_ucm_block_ids,
-                    shard_indexs,
-                    np.asarray(hybrid_ptrs, dtype=np.uint64),
-                    event_handle,
+                m_ptrs = self.kv_cache_layout.extract_mamba_layer_block_addrs(
+                    group_index, local_row, mamba_vllm_ids
                 )
-                tasks.append(task)
+                shard_indexs = [local_row] * len(m_ucm_ids)
+                request_meta = metadata.request_meta.get(request_id)
+                self._log_load_mapping(
+                    request_id,
+                    "mamba_layer",
+                    m_ucm_ids,
+                    mamba_vllm_ids,
+                    dispatch_step=(
+                        request_meta.dispatch_step if request_meta else None
+                    ),
+                    dispatch_source=(
+                        request_meta.dispatch_source if request_meta else ""
+                    ),
+                    group_index=group_index,
+                    layer_id=layer_id,
+                    local_row=local_row,
+                    shard_indexs=shard_indexs,
+                )
+                task = self.store.load_data(
+                    m_ucm_ids,
+                    shard_indexs,
+                    np.asarray(
+                        [np.ascontiguousarray(ptr) for ptr in m_ptrs],
+                        dtype=np.uint64,
+                    ),
+                )
+                tasks.append((request_id, task))
             except Exception as e:
                 logger.error(
-                    "submit hybrid mamba dump task failed. "
-                    f"row={local_row}, {type(e).__name__}: {e}"
+                    f"request {request_id} submit mamba layer load task "
+                    f"error. {type(e).__name__}: {e}"
                 )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
 
-        for i, task in enumerate(tasks):
-            self.dump_tasks[f"__hybrid_mamba_row_{i}"] = task
+        for request_id, task in tasks:
+            try:
+                self.store.wait(task)
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} wait mamba layer load failed. "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
@@ -2723,7 +2770,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self.need_load = True
 
         if self._is_hybrid_layerwise_physical() and self.request_data:
-            self._load_mamba_layers_for_hybrid(metadata)
             self.need_load = any(
                 request_data.vllm_block_ids
                 and request_data.request_id not in self._failure_req_ids
@@ -2740,9 +2786,15 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._connector_metadata:
             return
+        metadata = self._get_connector_metadata()
+        if self._is_hybrid_layerwise_physical():
+            mamba_row = self._get_mamba_layer_row(layer_name)
+            if mamba_row is not None:
+                self._load_mamba_layer_for_hybrid(layer_name, metadata)
+                return
+
         if not self.need_load:
             return
-        metadata = self._get_connector_metadata()
         current_layer_id = self._get_registered_layer_id(layer_name)
         if current_layer_id is None:
             return
@@ -2880,20 +2932,12 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 logger.error(f"submit dump task failed. {type(e).__name__}: {e}")
 
     def wait_for_save(self) -> None:
-        if self._is_hybrid_layerwise_physical() and self._connector_metadata:
-            metadata = self._get_connector_metadata()
-            assert isinstance(metadata, UCMConnectorMetadata)
-            self._dump_mamba_layers_for_hybrid(metadata)
-
         if not self.is_save:
             return
         try:
             for layer_name in self.kv_caches:
                 if layer_name in self.dump_tasks:
                     self.store.wait(self.dump_tasks[layer_name])
-            for layer_name, task in self.dump_tasks.items():
-                if layer_name not in self.kv_caches:
-                    self.store.wait(task)
         except Exception as e:
             logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
         self.dump_tasks.clear()
