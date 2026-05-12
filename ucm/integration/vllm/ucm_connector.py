@@ -242,6 +242,25 @@ class KVCacheLayout:
         return result
 
     @property
+    def content_size_list(self) -> list[int]:
+        """Logical content sizes (bytes) per tensor per block.
+
+        Unlike tensor_size_list which uses physical block strides, this returns
+        the actual data sizes computed from tensor shapes. On CUDA hybrid
+        models the KV layout interleaves K and V within the same allocation
+        (stride > content size), and Mamba states share a page-sized allocation
+        (stride = page_size >> individual state size). Use this property when
+        the copy granularity must match the logical data footprint, not the
+        physical allocation stride.
+        """
+        result = (
+            self.tensor_size_lists.reshape(-1).tolist()
+            if not self.use_layerwise
+            else self.tensor_size_lists[0].tolist()
+        )
+        return [int(x) for x in result]
+
+    @property
     def shard_size(self) -> int:
         return int(
             self.block_stride_lists.sum()
@@ -344,14 +363,20 @@ class HybridKVCacheLayout:
         spaced by the ssm block size (e.g. 262144).  We derive this target
         from the maximum stride found across all mamba layouts.
 
-        Returns 0 when no mamba layouts are present (pure-attention model,
-        no alignment override needed).
+        Returns 0 on non-NPU platforms or when no mamba layouts are present
+        (pure-attention model, no alignment override needed).
+
+        On CUDA, attention and Mamba tensors have independent allocations and
+        strides that reflect logical content sizes (possibly 2× on hybrid due
+        to K/V interleaving), so no cross-type alignment is needed or correct.
 
         # CONFIRM: verify that the NPU block allocator really places
         # consecutive attention blocks 'max_mamba_stride' bytes apart.
         # If attention blocks are truly 65536 bytes apart in physical memory
         # this override will produce wrong addresses.
         """
+        if current_platform.device_type != "npu":
+            return 0
         max_stride = 0
         for layout in self.mamba_layouts:
             if layout is not None:
@@ -507,27 +532,44 @@ class HybridKVCacheLayout:
         if self.uses_physical_shards:
             return self._physical_tensor_size_list()
 
-        # Retrieve the per-tensor strides from the attention sub-layout.
-        # This also triggers its internal log print.
-        attn_strides = self.attn_layout.tensor_size_list
-
         aligned_stride = self._npu_attn_aligned_stride()
         if aligned_stride > 0:
-            # On NPU each attention tensor slot must use the ssm-aligned
-            # physical stride so UCM storage granularity is consistent.
+            # NPU non-physical-shard path: each attention tensor slot must use
+            # the ssm-aligned physical stride so UCM storage granularity is
+            # consistent across all layer types.
             # CONFIRM: aligned_stride == max(ssm block strides) == 262144
             # for Qwen3-style hybrid models on Ascend.
+            attn_strides = self.attn_layout.tensor_size_list
             attn_strides = [aligned_stride] * len(attn_strides)
             logger.info(
                 f"HybridKVCacheLayout: overriding attention tensor sizes "
                 f"to NPU-aligned stride {aligned_stride} bytes "
                 f"({len(attn_strides)} entries)"
             )
+            ret = list(attn_strides)
+            for layout in self.mamba_layouts:
+                if layout is not None:
+                    ret = ret + layout.tensor_size_list
+            return ret
 
-        ret = list(attn_strides)
+        # CUDA path: use logical content sizes (tensor_size_lists) rather than
+        # physical strides (block_stride_lists). On CUDA hybrid models:
+        #   - Attention: _update_hybrid_attention_mamba_layout interleaves K and
+        #     V per block so stride(0) = 2 × content_size. Using stride would
+        #     make UCM copy twice the data and overlap with the paired tensor.
+        #   - Mamba: each state tensor has stride(0) = page_size_bytes (the
+        #     full page shared by all states), while only prod(shape)*dtype_size
+        #     bytes belong to that state. Using stride would make UCM overlap
+        #     into adjacent states or the next block.
+        # Content sizes give the exact bytes for each tensor slot so UCM
+        # correctly copies K, V, conv_state, ssm_state independently.
+        ret = self.attn_layout.content_size_list
         for layout in self.mamba_layouts:
             if layout is not None:
-                ret = ret + layout.tensor_size_list
+                ret = ret + layout.content_size_list
+        logger.info(
+            f"HybridKVCacheLayout CUDA tensor_size_list (content sizes): {ret}"
+        )
         return ret
 
     @property
