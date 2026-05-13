@@ -2010,6 +2010,18 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
         )
 
 
+class AscendHybridLinearAttentionLayerWiseLayout(AscendHybridLinearAttentionLayout):
+    @property
+    def block_size(self) -> int:
+        # In hybrid layerwise mode each raw tensor row is transferred as one
+        # shard, while a logical UCM block is complete only after all local rows
+        # have been dumped. This mirrors the non-layerwise hybrid connector,
+        # which stores all rows in one submit.
+        if self.tensor_size_lists.size == 0:
+            return 0
+        return int(self.tensor_size_lists[0].sum() * self.tensor_size_lists.shape[0])
+
+
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
     def __init__(
         self,
@@ -2713,7 +2725,16 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
         logger.info("Init UCMAscendHybridLinearAttentionLayerWiseConnector.")
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        super().register_kv_caches(kv_caches)
+        self.kv_caches = kv_caches
+        self.kv_cache_layout = AscendHybridLinearAttentionLayerWiseLayout(
+            self.kv_caches,
+            self.launch_config,
+            self._vllm_config,
+            self._kv_cache_config,
+        )
+        self.store = self._create_store(self.kv_cache_layout)
+        self.block_data_size = self.kv_cache_layout.block_size
+        self.device = create_device()
         self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
         self.layer_ids = sorted(set(self.layer_name_to_id.values()))
         self.first_layer_id = self.layer_ids[0]
@@ -2758,7 +2779,6 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
             group_id = self.layer_name_to_group_id.get(layer_name)
             if group_id is None:
                 continue
-            layer_id = self.layer_name_to_id[layer_name]
             for request_id, ucm_block_ids, vllm_block_ids, total_ptrs in (
                 self.request_group_data.get(group_id, [])
             ):
@@ -2766,7 +2786,7 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
                     continue
                 try:
                     layer_ptrs = np.ascontiguousarray(total_ptrs[row])
-                    shard_indexs = [layer_id] * len(ucm_block_ids)
+                    shard_indexs = [row] * len(ucm_block_ids)
                     task = self.store.load_data(
                         ucm_block_ids, shard_indexs, layer_ptrs
                     )
@@ -2893,13 +2913,12 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
                 if not ucm_block_ids:
                     continue
                 ucm_block_ids = self._hash_ucm_block_ids_for_rank(ucm_block_ids)
-                layer_id = self.layer_name_to_id[dump_layer_name]
                 try:
                     total_ptrs = self.kv_cache_layout.extract_block_addrs(
                         vllm_block_ids, layer_first=True
                     )
                     layer_ptrs = np.ascontiguousarray(total_ptrs[row])
-                    shard_indexs = [layer_id] * len(ucm_block_ids)
+                    shard_indexs = [row] * len(ucm_block_ids)
                     event_handle = self._get_dump_event_handle()
                     task = self.store.dump_data(
                         ucm_block_ids, shard_indexs, layer_ptrs, event_handle
