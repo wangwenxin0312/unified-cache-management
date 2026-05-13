@@ -61,6 +61,32 @@ def _short_np_row(values: np.ndarray, limit: int = 12) -> list[int]:
     return values.reshape(-1)[:limit].astype(np.uint64).tolist()
 
 
+def _drop_null_vllm_blocks(
+    ucm_block_ids: list[bytes],
+    vllm_block_ids: list[int],
+    context: str,
+) -> tuple[list[bytes], list[int]]:
+    if not ucm_block_ids or not vllm_block_ids:
+        return ucm_block_ids, vllm_block_ids
+
+    filtered_ucm_block_ids: list[bytes] = []
+    filtered_vllm_block_ids: list[int] = []
+    skipped = 0
+    for ucm_block_id, vllm_block_id in zip(ucm_block_ids, vllm_block_ids):
+        if vllm_block_id == 0:
+            skipped += 1
+            continue
+        filtered_ucm_block_ids.append(ucm_block_id)
+        filtered_vllm_block_ids.append(vllm_block_id)
+
+    if skipped:
+        logger.info(
+            f"{context}: skipped {skipped} null vLLM block(s), "
+            f"kept_vllm={_short_list(filtered_vllm_block_ids)}"
+        )
+    return filtered_ucm_block_ids, filtered_vllm_block_ids
+
+
 @dataclass
 class RequestMeta:
     ucm_block_ids: list[bytes] = field(default_factory=list)
@@ -307,6 +333,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.enable_record_traces = self.launch_config.get(
             "enable_record_traces", False
         )
+        self._skip_null_vllm_blocks = False
         assert len(self.connector_configs) > 0, "no storage connector name in config."
 
         self.chunk_size = self.block_size
@@ -665,6 +692,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         num_loaded_block = 0
         num_loaded_request = 0
         load_start_time = time.perf_counter() * 1000
+        request_to_load_blocks: dict[str, int] = {}
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
                 continue
@@ -673,6 +701,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
             num_loaded_request += 1
 
             ucm_block_ids, vllm_block_ids = request.load_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM load request {request_id}",
+                )
+                if len(ucm_block_ids) == 0:
+                    num_loaded_block -= len(request.load_block_ids[0])
+                    num_loaded_request -= 1
+                    continue
+                num_loaded_block -= len(request.load_block_ids[0]) - len(
+                    ucm_block_ids
+                )
             if self.tp_rank != 0 and not self.is_mla:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
@@ -681,7 +722,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     "UCM load submit: "
                     f"request_id={request_id}, blocks={len(ucm_block_ids)}, "
                     f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}, "
-                    f"vllm_sample={_short_list(vllm_block_ids)}, "
+                    f"vllm_sample={_short_list(vllm_block_ids, 24)}, "
                     f"tensor_size_list={self.kv_cache_layout.tensor_size_list}, "
                     f"block_stride_shape={self.kv_cache_layout.block_stride_lists.shape}"
                 )
@@ -690,11 +731,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.info(
                     "UCM load ptrs: "
                     f"request_id={request_id}, ptr_shape={total_ptrs.shape}, "
-                    f"first_row={_short_np_row(total_ptrs[0]) if total_ptrs.size else []}"
+                    f"first_row={_short_np_row(total_ptrs[0]) if total_ptrs.size else []}, "
+                    f"last_row={_short_np_row(total_ptrs[-1]) if total_ptrs.size else []}"
                 )
                 shard_indexs = [0] * len(ucm_block_ids)
                 task = self.store.load_data(ucm_block_ids, shard_indexs, total_ptrs)
                 request_to_task[request_id] = task
+                request_to_load_blocks[request_id] = len(ucm_block_ids)
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit load task error. {type(e).__name__}: {e}"
@@ -702,7 +745,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
-                num_loaded_block -= len(request.load_block_ids[0])
+                num_loaded_block -= len(ucm_block_ids)
 
         for request_id, task in request_to_task.items():
             try:
@@ -715,9 +758,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
-                num_loaded_block -= len(
-                    metadata.request_meta[request_id].load_block_ids[0]
-                )
+                num_loaded_block -= request_to_load_blocks.get(request_id, 0)
 
         load_end_time = time.perf_counter() * 1000
         load_speed = (
@@ -775,11 +816,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
-            is_save = True
-            num_saved_block += len(request.dump_block_ids[0])
-            num_saved_request += 1
 
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM dump request {request_id}",
+                )
+                if len(ucm_block_ids) == 0:
+                    continue
+            is_save = True
+            num_saved_block += len(ucm_block_ids)
+            num_saved_request += 1
             if self.tp_rank != 0:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
@@ -787,7 +836,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 "UCM dump request: "
                 f"request_id={request_id}, blocks={len(ucm_block_ids)}, "
                 f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}, "
-                f"vllm_sample={_short_list(vllm_block_ids)}"
+                f"vllm_sample={_short_list(vllm_block_ids, 24)}"
             )
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
@@ -798,7 +847,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     "UCM dump submit: "
                     f"total_blocks={len(total_ucm_block_ids)}, "
                     f"ucm_sample={_short_hex_block_ids(total_ucm_block_ids)}, "
-                    f"vllm_sample={_short_list(total_vllm_block_ids)}, "
+                    f"vllm_sample={_short_list(total_vllm_block_ids, 24)}, "
                     f"tensor_size_list={self.kv_cache_layout.tensor_size_list}, "
                     f"block_stride_shape={self.kv_cache_layout.block_stride_lists.shape}"
                 )
@@ -811,7 +860,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.info(
                     "UCM dump ptrs: "
                     f"ptr_shape={total_ptrs.shape}, event_handle={event_handle}, "
-                    f"first_row={_short_np_row(total_ptrs[0]) if total_ptrs.size else []}"
+                    f"first_row={_short_np_row(total_ptrs[0]) if total_ptrs.size else []}, "
+                    f"last_row={_short_np_row(total_ptrs[-1]) if total_ptrs.size else []}"
                 )
                 save_start_time = time.perf_counter() * 1000
                 task = self.store.dump_data(
@@ -1869,6 +1919,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         super().__init__(
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
         )
+        self._skip_null_vllm_blocks = True
         # group manager only lives on the scheduler side, where ``self._seed``
         # and ``self.request_hasher`` are populated by the parent ctor.
         self.group_manager: Optional[KVCacheGroupManager] = None
@@ -2152,6 +2203,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             seq_len: int,
             reason: str,
         ) -> None:
+            nonlocal skipped_null_blocks
             group = groups_by_id[gid]
             state_idx = max((seq_len - 1) // group.block_size, 0)
             # Keep this mapping aligned with
@@ -2171,18 +2223,17 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
                 )
                 return
+            if vllm_block_id == 0:
+                skipped_null_blocks += 1
+                return
             logger.info(
                 "HMA mamba-align state block: "
                 f"request_id={request_id}, group_id={gid}, reason={reason}, "
                 f"seq_len={seq_len}, state_idx={state_idx}, "
                 f"ucm={ucm_block_id.hex()}, vllm={vllm_block_id}"
             )
-            extend_non_null(
-                dst_ucm_block_ids,
-                dst_vllm_block_ids,
-                [ucm_block_id],
-                [vllm_block_id],
-            )
+            dst_ucm_block_ids.append(ucm_block_id)
+            dst_vllm_block_ids.append(vllm_block_id)
 
         external_hit_lcm_blocks = (
             req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
@@ -2310,7 +2361,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             f"dump_blocks={len(dump_ucm_block_ids)}, "
             f"skipped_null_blocks={skipped_null_blocks}, "
             f"load_vllm={_short_list(load_vllm_block_ids)}, "
-            f"dump_vllm={_short_list(dump_vllm_block_ids)}, "
+            f"dump_vllm={_short_list(dump_vllm_block_ids, 24)}, "
             f"load_ucm={_short_hex_block_ids(load_ucm_block_ids)}, "
             f"dump_ucm={_short_hex_block_ids(dump_ucm_block_ids)}"
         )
