@@ -1884,17 +1884,24 @@ def _attention_component_sizes(spec: KVCacheSpec) -> tuple[int, int]:
     return k_size, v_size
 
 
-class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
-    """Physical layout for Ascend hybrid full-attention + linear-attention pages.
+class HybridLinearAttentionLayout(HMAKVCacheLayout):
+    """Physical layout for hybrid full-attention + linear-attention pages.
 
-    vLLM-Ascend may back full-attention and linear-attention layers with one
-    shared raw int8 tensor whose per-physical-block layout is:
+    Backends can share one raw int8 tensor across full-attention and
+    linear-attention layers in two different ways.
+
+    CUDA uses the standard vLLM hybrid allocator: every physical block is a
+    uniform padded page, and different KV groups write into different block ids
+    of the same raw tensor.
+
+    vLLM-Ascend may instead back full-attention and linear-attention layers
+    with separate component-major tensors whose per-physical-block layout is:
         [conv_block_or_padding, k_or_ssm_block, v_block_or_padding]
 
-    The store receives one unified tensor_size_list, so we expose the three
-    physical slices for every raw tensor. The transfer sizes are slice sizes,
-    and the address stride follows vLLM-Ascend's component-major storage:
-    all conv blocks, then all k/ssm blocks, then all v/padding blocks.
+    The store receives one unified tensor_size_list. We expose the Ascend three
+    physical slices when that layout can actually hold the attention V slice;
+    otherwise we expose the complete padded page, which matches CUDA's shared
+    page layout.
     """
 
     def _build_layout(self, kvcaches):
@@ -1930,15 +1937,35 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
                 )
                 continue
 
+            if raw_tensor.size % self.num_blocks != 0:
+                raise ValueError(
+                    "Invalid hybrid linear-attention raw tensor size: "
+                    f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
+                    f"shared_by={raw_tensor.shared_by}"
+                )
+
+            page_size = raw_tensor.size // self.num_blocks
+            base = min(shared_ptrs)
+
+            def append_page_layout(reason: str) -> None:
+                layout_row = len(base_ptrs)
+                base_ptrs.append([base])
+                tensor_size_lists.append([page_size])
+                block_stride_lists.append([page_size])
+                row_layer_names.append(list(raw_tensor.shared_by))
+                for name in raw_tensor.shared_by:
+                    layer_name_to_layout_row[name] = layout_row
+                logger.info(
+                    "Hybrid linear-attention page layout raw tensor: "
+                    f"reason={reason}, shared_by={raw_tensor.shared_by}, "
+                    f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
+                    f"page_size={page_size}, base=0x{base:x}"
+                )
+
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
             if not mamba_specs or not attn_specs:
-                sample_layer_name = raw_tensor.shared_by[0]
-                kv_cache_spec = self.layer_name_to_kv_cache_spec[sample_layer_name][0]
-                page_size = kv_cache_spec.page_size_bytes
-                base_ptrs.append([min(shared_ptrs)])
-                tensor_size_lists.append([page_size])
-                block_stride_lists.append([page_size])
+                append_page_layout("non-mixed shared tensor")
                 continue
 
             mamba_sizes = _mamba_component_sizes(mamba_specs[0])
@@ -1947,31 +1974,25 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
                     f"unexpected mamba component sizes {mamba_sizes}; "
                     "falling back to contiguous page layout"
                 )
-                page_size = raw_tensor.size // self.num_blocks
-                base_ptrs.append([min(shared_ptrs)])
-                tensor_size_lists.append([page_size])
-                block_stride_lists.append([page_size])
+                append_page_layout("unexpected mamba component sizes")
                 continue
 
             conv_size = mamba_sizes[0]
             ssm_size = mamba_sizes[1]
             k_size, v_size = _attention_component_sizes(attn_specs[0])
             middle_size = max(k_size, ssm_size)
-            page_size = raw_tensor.size // self.num_blocks
             tail_size = page_size - conv_size - middle_size
-            if tail_size <= 0:
-                raise ValueError(
-                    "Invalid Ascend hybrid linear-attention page layout: "
-                    f"page_size={page_size}, conv_size={conv_size}, "
-                    f"middle_size={middle_size}, tail_size={tail_size}"
+            if tail_size <= 0 or tail_size < v_size:
+                # CUDA's aligned mamba pages can have the same page size as
+                # full-attention K+V pages. In that layout the raw tensor is not
+                # component-major; the "tail" is only padding, so splitting it
+                # would drop the attention V cache. Copy the whole page instead.
+                append_page_layout(
+                    "uniform shared page "
+                    f"(tail_size={tail_size}, attention_v_size={v_size})"
                 )
-            if tail_size < v_size:
-                raise ValueError(
-                    "Ascend hybrid linear-attention tail cannot hold attention V: "
-                    f"tail_size={tail_size}, v_size={v_size}"
-                )
+                continue
 
-            base = min(shared_ptrs)
             offsets = [
                 0,
                 conv_size * self.num_blocks,
@@ -1986,7 +2007,7 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
             for layer_name in raw_tensor.shared_by:
                 layer_name_to_layout_row[layer_name] = layout_row
             logger.info(
-                "Ascend hybrid layout raw tensor: "
+                "Hybrid linear-attention component layout raw tensor: "
                 f"shared_by={raw_tensor.shared_by}, "
                 f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
                 f"page_size={page_size}, conv_size={conv_size}, "
@@ -2003,14 +2024,14 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
         self.row_layer_names = row_layer_names
 
         logger.info(
-            "AscendHybridLinearAttentionLayout: "
+            "HybridLinearAttentionLayout: "
             f"base_ptrs={self.base_ptrs.shape}, "
             f"tensor_size_lists={self.tensor_size_lists.shape}, "
             f"block_stride_lists={self.block_stride_lists.shape}"
         )
 
 
-class AscendHybridLinearAttentionLayerWiseLayout(AscendHybridLinearAttentionLayout):
+class HybridLinearAttentionLayerWiseLayout(HybridLinearAttentionLayout):
     @property
     def block_size(self) -> int:
         # In hybrid layerwise mode each raw tensor row is transferred as one
@@ -2629,12 +2650,9 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         return False, None
 
 
-def use_ascend_hybrid_linear_attention_layout(
+def use_hybrid_linear_attention_layout(
     kv_cache_config: "KVCacheConfig",
 ) -> bool:
-    if current_platform.device_type != "npu":
-        return False
-
     layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
     has_full_attention = False
     has_mamba_align = False
@@ -2668,12 +2686,12 @@ def use_ascend_hybrid_linear_attention_layout(
     return False
 
 
-class UCMAscendHybridLinearAttentionConnector(UCMHMAConnector):
-    """Connector for Ascend full-attention + linear-attention hybrid layout."""
+class UCMHybridLinearAttentionConnector(UCMHMAConnector):
+    """Connector for full-attention + linear-attention hybrid layouts."""
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.kv_caches = kv_caches
-        self.kv_cache_layout = AscendHybridLinearAttentionLayout(
+        self.kv_cache_layout = HybridLinearAttentionLayout(
             self.kv_caches,
             self.launch_config,
             self._vllm_config,
@@ -2684,15 +2702,15 @@ class UCMAscendHybridLinearAttentionConnector(UCMHMAConnector):
         self.device = create_device()
 
 
-class UCMAscendHybridLinearAttentionLayerWiseConnector(
-    UCMAscendHybridLinearAttentionConnector
+class UCMHybridLinearAttentionLayerWiseConnector(
+    UCMHybridLinearAttentionConnector
 ):
-    """Layerwise connector for Ascend Qwen3-Next hybrid cache pages.
+    """Layerwise connector for Qwen3-Next-style hybrid cache pages.
 
-    Ascend packs three linear-attention layers and the following full-attention
-    layer into one physical raw tensor. The scheduler still allocates block ids
-    per KV-cache group, so load/save must keep group block ids while using the
-    shared raw tensor row as the physical copy target.
+    Hybrid models can share one physical raw tensor across several KV-cache
+    groups. The scheduler still allocates block ids per group, so load/save
+    must keep group block ids while using the shared raw tensor row as the
+    physical copy target.
     """
 
     def __init__(
@@ -2708,8 +2726,8 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
             for layer_name in group.layer_names:
                 self.layer_name_to_group_id[layer_name] = group_id
 
-        self.load_tasks: dict[int, list[tuple[str, str, Task]]] = defaultdict(list)
-        self.dump_tasks: list[tuple[str, str, Task]] = []
+        self.load_tasks: dict[int, list[tuple[str, int, Task]]] = defaultdict(list)
+        self.dump_tasks: list[tuple[str, int, Task]] = []
         self.request_group_data: dict[
             int, list[tuple[str, list[bytes], list[int], np.ndarray]]
         ] = defaultdict(list)
@@ -2722,11 +2740,11 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
         self.row_layer_names: dict[int, list[str]] = {}
         self.row_commit_layer_name: dict[int, str] = {}
         self.row_order: list[int] = []
-        logger.info("Init UCMAscendHybridLinearAttentionLayerWiseConnector.")
+        logger.info("Init UCMHybridLinearAttentionLayerWiseConnector.")
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.kv_caches = kv_caches
-        self.kv_cache_layout = AscendHybridLinearAttentionLayerWiseLayout(
+        self.kv_cache_layout = HybridLinearAttentionLayerWiseLayout(
             self.kv_caches,
             self.launch_config,
             self._vllm_config,
@@ -2775,39 +2793,50 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
         if row in self._submitted_load_rows:
             return
         self._submitted_load_rows.add(row)
-        for layer_name in self.row_layer_names.get(row, []):
-            group_id = self.layer_name_to_group_id.get(layer_name)
-            if group_id is None:
-                continue
+
+        request_rows: dict[
+            str, tuple[list[bytes], list[int], list[np.ndarray]]
+        ] = {}
+        for group_id in sorted(self.request_group_data):
             for request_id, ucm_block_ids, vllm_block_ids, total_ptrs in (
                 self.request_group_data.get(group_id, [])
             ):
                 if request_id in self._failure_req_ids:
                     continue
-                try:
-                    layer_ptrs = np.ascontiguousarray(total_ptrs[row])
-                    shard_indexs = [row] * len(ucm_block_ids)
-                    task = self.store.load_data(
-                        ucm_block_ids, shard_indexs, layer_ptrs
-                    )
-                    self.load_tasks[row].append((request_id, layer_name, task))
-                    logger.info(
-                        "Ascend hybrid layerwise load submit: "
-                        f"request_id={request_id}, layer_name={layer_name}, "
-                        f"group_id={group_id}, row={row}, blocks={len(ucm_block_ids)}, "
-                        f"vllm_sample={_short_list(vllm_block_ids, 24)}, "
-                        f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Ascend hybrid layerwise submit load failed: "
-                        f"request_id={request_id}, layer_name={layer_name}, "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    req_meta = metadata.request_meta.get(request_id)
-                    if req_meta is not None:
-                        self._invalid_block_ids.update(req_meta.load_block_ids[1])
-                    self._failure_req_ids.add(request_id)
+                row_ucm_block_ids, row_vllm_block_ids, row_ptrs = (
+                    request_rows.setdefault(request_id, ([], [], []))
+                )
+                row_ucm_block_ids.extend(ucm_block_ids)
+                row_vllm_block_ids.extend(vllm_block_ids)
+                row_ptrs.append(np.ascontiguousarray(total_ptrs[row]))
+
+        for request_id, (ucm_block_ids, vllm_block_ids, ptr_rows) in (
+            request_rows.items()
+        ):
+            if not ucm_block_ids:
+                continue
+            try:
+                total_ptrs = np.ascontiguousarray(np.concatenate(ptr_rows, axis=0))
+                shard_indexs = [row] * len(ucm_block_ids)
+                task = self.store.load_data(ucm_block_ids, shard_indexs, total_ptrs)
+                self.load_tasks[row].append((request_id, row, task))
+                logger.info(
+                    "Hybrid linear-attention layerwise row load submit: "
+                    f"request_id={request_id}, row={row}, "
+                    f"blocks={len(ucm_block_ids)}, "
+                    f"vllm_sample={_short_list(vllm_block_ids, 24)}, "
+                    f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}"
+                )
+            except Exception as e:
+                logger.error(
+                    "Hybrid linear-attention layerwise row submit load failed: "
+                    f"request_id={request_id}, row={row}, "
+                    f"{type(e).__name__}: {e}"
+                )
+                req_meta = metadata.request_meta.get(request_id)
+                if req_meta is not None:
+                    self._invalid_block_ids.update(req_meta.load_block_ids[1])
+                self._failure_req_ids.add(request_id)
 
     def _submit_next_load_row(self, row: int, metadata: "UCMConnectorMetadata") -> None:
         try:
@@ -2857,18 +2886,17 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
         assert isinstance(metadata, UCMConnectorMetadata)
 
         row_tasks = self.load_tasks.pop(row, [])
-        for request_id, waited_layer_name, task in row_tasks:
+        for request_id, waited_row, task in row_tasks:
             try:
                 self.store.wait(task)
                 logger.info(
-                    "Ascend hybrid layerwise load wait done: "
-                    f"request_id={request_id}, layer_name={waited_layer_name}, "
-                    f"row={row}"
+                    "Hybrid linear-attention layerwise row load wait done: "
+                    f"request_id={request_id}, row={waited_row}"
                 )
             except Exception as e:
                 logger.error(
-                    "Ascend hybrid layerwise wait load failed: "
-                    f"request_id={request_id}, layer_name={waited_layer_name}, "
+                    "Hybrid linear-attention layerwise row wait load failed: "
+                    f"request_id={request_id}, row={waited_row}, "
                     f"{type(e).__name__}: {e}"
                 )
                 req_meta = metadata.request_meta.get(request_id)
@@ -2899,17 +2927,16 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
 
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
-        row_layer_names = self.row_layer_names.get(row, [])
         for request_id, request in metadata.request_meta.items():
             if request.group_dump_block_ids is None:
                 continue
             group_ucm_block_ids, group_vllm_block_ids = request.group_dump_block_ids
-            for dump_layer_name in row_layer_names:
-                group_id = self.layer_name_to_group_id.get(dump_layer_name)
-                if group_id is None or group_id >= len(group_ucm_block_ids):
-                    continue
-                ucm_block_ids = group_ucm_block_ids[group_id]
-                vllm_block_ids = group_vllm_block_ids[group_id]
+            total_ucm_block_ids: list[bytes] = []
+            total_vllm_block_ids: list[int] = []
+            ptr_rows: list[np.ndarray] = []
+            for group_id, (ucm_block_ids, vllm_block_ids) in enumerate(
+                zip(group_ucm_block_ids, group_vllm_block_ids)
+            ):
                 if not ucm_block_ids:
                     continue
                 ucm_block_ids = self._hash_ucm_block_ids_for_rank(ucm_block_ids)
@@ -2917,47 +2944,77 @@ class UCMAscendHybridLinearAttentionLayerWiseConnector(
                     total_ptrs = self.kv_cache_layout.extract_block_addrs(
                         vllm_block_ids, layer_first=True
                     )
-                    layer_ptrs = np.ascontiguousarray(total_ptrs[row])
-                    shard_indexs = [row] * len(ucm_block_ids)
-                    event_handle = self._get_dump_event_handle()
-                    task = self.store.dump_data(
-                        ucm_block_ids, shard_indexs, layer_ptrs, event_handle
-                    )
-                    self.dump_tasks.append((request_id, dump_layer_name, task))
-                    self.is_save = True
+                    total_ucm_block_ids.extend(ucm_block_ids)
+                    total_vllm_block_ids.extend(vllm_block_ids)
+                    ptr_rows.append(np.ascontiguousarray(total_ptrs[row]))
                     logger.info(
-                        "Ascend hybrid layerwise dump submit: "
-                        f"request_id={request_id}, layer_name={dump_layer_name}, "
+                        "Hybrid linear-attention layerwise row dump group: "
                         f"group_id={group_id}, row={row}, blocks={len(ucm_block_ids)}, "
                         f"vllm_sample={_short_list(vllm_block_ids, 24)}, "
                         f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}"
                     )
                 except Exception as e:
                     logger.error(
-                        "Ascend hybrid layerwise submit dump failed: "
-                        f"request_id={request_id}, layer_name={dump_layer_name}, "
+                        "Hybrid linear-attention layerwise submit dump failed: "
+                        f"request_id={request_id}, group_id={group_id}, "
                         f"{type(e).__name__}: {e}"
                     )
+            if not total_ucm_block_ids:
+                continue
+            try:
+                total_ptrs = np.ascontiguousarray(np.concatenate(ptr_rows, axis=0))
+                shard_indexs = [row] * len(total_ucm_block_ids)
+                event_handle = self._get_dump_event_handle()
+                task = self.store.dump_data(
+                    total_ucm_block_ids, shard_indexs, total_ptrs, event_handle
+                )
+                self.dump_tasks.append((request_id, row, task))
+                self.is_save = True
+                logger.info(
+                    "Hybrid linear-attention layerwise row dump submit: "
+                    f"request_id={request_id}, commit_layer={layer_name}, "
+                    f"row={row}, blocks={len(total_ucm_block_ids)}, "
+                    f"vllm_sample={_short_list(total_vllm_block_ids, 24)}, "
+                    f"ucm_sample={_short_hex_block_ids(total_ucm_block_ids)}"
+                )
+            except Exception as e:
+                logger.error(
+                    "Hybrid linear-attention layerwise row submit dump failed: "
+                    f"request_id={request_id}, row={row}, "
+                    f"{type(e).__name__}: {e}"
+                )
 
     def wait_for_save(self) -> None:
         if not self.is_save:
             return
         try:
-            for request_id, layer_name, task in self.dump_tasks:
+            for request_id, row, task in self.dump_tasks:
                 self.store.wait(task)
                 logger.info(
-                    "Ascend hybrid layerwise dump wait done: "
-                    f"request_id={request_id}, layer_name={layer_name}"
+                    "Hybrid linear-attention layerwise row dump wait done: "
+                    f"request_id={request_id}, row={row}"
                 )
         except Exception as e:
             logger.error(
-                f"wait for Ascend hybrid layerwise dump failed. {type(e).__name__}: {e}"
+                "wait for hybrid linear-attention layerwise dump failed. "
+                f"{type(e).__name__}: {e}"
             )
         self.dump_tasks.clear()
         self._dumped_rows.clear()
         self.is_save = False
         if self.enable_event_sync:
             self.device.destroy_event_handles()
+
+
+# Backward-compatible aliases for out-of-tree imports/configs that still use
+# the old Ascend-scoped names.
+AscendHybridLinearAttentionLayout = HybridLinearAttentionLayout
+AscendHybridLinearAttentionLayerWiseLayout = HybridLinearAttentionLayerWiseLayout
+UCMAscendHybridLinearAttentionConnector = UCMHybridLinearAttentionConnector
+UCMAscendHybridLinearAttentionLayerWiseConnector = (
+    UCMHybridLinearAttentionLayerWiseConnector
+)
+use_ascend_hybrid_linear_attention_layout = use_hybrid_linear_attention_layout
 
 
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
@@ -3012,8 +3069,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             or os.getenv("USE_MULTI_GROUPS_KV_CACHE") == "1"
         )
 
-        use_ascend_hybrid_linear_attention = (
-            use_ascend_hybrid_linear_attention_layout(kv_cache_config)
+        use_hybrid_linear_attention = use_hybrid_linear_attention_layout(
+            kv_cache_config
         )
 
         if use_lite:
@@ -3022,14 +3079,14 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
             self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
-        elif use_layerwise and use_ascend_hybrid_linear_attention:
-            self.connector = UCMAscendHybridLinearAttentionLayerWiseConnector(
+        elif use_layerwise and use_hybrid_linear_attention:
+            self.connector = UCMHybridLinearAttentionLayerWiseConnector(
                 vllm_config, role, kv_cache_config
             )
         elif use_layerwise:
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
-        elif use_ascend_hybrid_linear_attention:
-            self.connector = UCMAscendHybridLinearAttentionConnector(
+        elif use_hybrid_linear_attention:
+            self.connector = UCMHybridLinearAttentionConnector(
                 vllm_config, role, kv_cache_config
             )
         elif use_hma:
