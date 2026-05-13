@@ -1500,6 +1500,13 @@ class KVCacheGroupManager:
         self, group: GroupInfo, token_ids: list[int]
     ) -> list[bytes]:
         """Hash ``token_ids`` into per-block ids using ``group``'s chain seed."""
+        if group.is_mamba_align:
+            # In mamba-align mode vLLM pads the per-request block table with
+            # block_id=0 and only keeps the current state block as a real
+            # physical page. Hashing every logical token block here would
+            # create keys for pages that can never be loaded or dumped.
+            return [b""] * (len(token_ids) // group.block_size)
+
         ret: list[bytes] = []
         parent = group.seed
         block_size = group.block_size
@@ -1521,6 +1528,43 @@ class KVCacheGroupManager:
         (if any) is dropped, matching :meth:`compute_block_hashes`.
         """
         return [self.compute_block_hashes(g, token_ids) for g in self.groups_by_id]
+
+    def compute_mamba_align_state_hash(
+        self,
+        group: GroupInfo,
+        seq_len: int,
+        group_block_ids: list[list[bytes]],
+    ) -> Optional[bytes]:
+        """Derive the hash for the real mamba-align state page at ``seq_len``.
+
+        The mamba state represents the whole prefix up to ``seq_len`` instead
+        of a normal KV block. We derive its key from the primary full-attention
+        prefix hash, so the state key still changes with every prefix token but
+        we do not need to materialize hashes for mamba's leading null blocks.
+        """
+        if seq_len <= 0 or seq_len % self.lcm_block_size != 0:
+            return None
+        primary = self.full_attn_groups[0]
+        prefix_idx = seq_len // primary.block_size - 1
+        if prefix_idx < 0:
+            return None
+        try:
+            prefix_hash = group_block_ids[primary.group_id][prefix_idx]
+        except IndexError:
+            logger.error(
+                "mamba-align state hash missing primary prefix hash: "
+                f"group_id={group.group_id}, seq_len={seq_len}, "
+                f"primary_group_id={primary.group_id}, "
+                f"prefix_idx={prefix_idx}, "
+                f"num_primary_hashes="
+                f"{len(group_block_ids[primary.group_id])}"
+            )
+            return None
+        if not prefix_hash:
+            return None
+        return self.request_hasher(
+            (group.seed, b"UCM_MAMBA_ALIGN_STATE", seq_len, prefix_hash)
+        )
 
     def lookup_external_hit_tokens(
         self,
@@ -1592,6 +1636,33 @@ class KVCacheGroupManager:
         # Stage 2: every SW group's tail window must be in the store.
         total_hit_tokens = num_computed_tokens + external_hit_tokens
         for sw in self.sliding_window_groups:
+            if sw.is_mamba_align:
+                mamba_state_hash = self.compute_mamba_align_state_hash(
+                    sw, total_hit_tokens, group_block_ids
+                )
+                if mamba_state_hash is None:
+                    logger.info(
+                        f"mamba-align group {sw.group_id} state hash missing "
+                        f"at total_hit_tokens={total_hit_tokens}, "
+                        "downgrade external hit to 0."
+                    )
+                    return 0, 0
+                try:
+                    results = store.lookup([mamba_state_hash])
+                except Exception as e:
+                    logger.error(
+                        f"mamba-align group {sw.group_id} lookup error. "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    return 0, 0
+                if not all(results):
+                    logger.info(
+                        f"mamba-align group {sw.group_id} state miss: "
+                        f"hits={results}, downgrade external hit to 0."
+                    )
+                    return 0, 0
+                continue
+
             # When ``block_size > sliding_window`` (e.g. on Ascend) a single
             # block already covers more than a window of tokens, so we use
             # the last block as the SW tail (tail_count = 1). Otherwise
@@ -1995,13 +2066,16 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         )
         for gid, block_ids in enumerate(group_ucm_block_ids):
             group = self.group_manager.groups_by_id[gid]
+            materialized_hashes = [block_id for block_id in block_ids if block_id]
             logger.info(
                 "HMA lookup group hashes: "
                 f"request_id={request.request_id}, group_id={gid}, "
                 f"is_full_attention={group.is_full_attention}, "
+                f"is_mamba_align={group.is_mamba_align}, "
                 f"block_size={group.block_size}, "
                 f"num_hash_blocks={len(block_ids)}, "
-                f"hash_sample={_short_hex_block_ids(block_ids)}"
+                f"num_materialized_hashes={len(materialized_hashes)}, "
+                f"hash_sample={_short_hex_block_ids(materialized_hashes)}"
             )
         # Legacy ``ucm_block_ids`` mirrors the first full-attn group (by
         # group_id order) for callers that still consume the flat list.
@@ -2219,20 +2293,41 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                         break
 
             try:
-                ucm_block_id = req_meta.group_ucm_block_ids[gid][state_idx]
                 vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
             except IndexError:
                 logger.error(
-                    "HMA mamba-align state block missing: "
+                    "HMA mamba-align state vLLM block missing: "
                     f"request_id={request_id}, group_id={gid}, reason={reason}, "
                     f"seq_len={seq_len}, state_idx={state_idx}, "
                     f"vllm_state_idx={vllm_state_idx}, "
-                    f"num_ucm_blocks={len(req_meta.group_ucm_block_ids[gid])}, "
                     f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
                 )
                 return
             if vllm_block_id == 0:
                 skipped_null_blocks += 1
+                return
+            if group.is_mamba_align:
+                ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
+                    group, seq_len, req_meta.group_ucm_block_ids
+                )
+            else:
+                try:
+                    ucm_block_id = req_meta.group_ucm_block_ids[gid][state_idx]
+                except IndexError:
+                    logger.error(
+                        "HMA state block UCM hash missing: "
+                        f"request_id={request_id}, group_id={gid}, "
+                        f"reason={reason}, seq_len={seq_len}, "
+                        f"state_idx={state_idx}, "
+                        f"num_ucm_blocks={len(req_meta.group_ucm_block_ids[gid])}"
+                    )
+                    return
+            if ucm_block_id is None:
+                logger.error(
+                    "HMA mamba-align state hash missing: "
+                    f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                    f"seq_len={seq_len}, state_idx={state_idx}"
+                )
                 return
             logger.info(
                 "HMA mamba-align state block: "
