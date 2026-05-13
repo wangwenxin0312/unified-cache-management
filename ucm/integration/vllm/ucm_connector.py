@@ -6,7 +6,7 @@ import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.model_executor.models.utils import extract_layer_index
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 from ucm.sparse.state import has_ucm_sparse
@@ -1149,9 +1151,16 @@ class UCMLiteConnector(UCMDirectConnector):
         return 0, False
 
 
-class UCMConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+class UCMConnector(KVConnectorBase_V1, SupportsHMA):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
+        super().__init__(
+            vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
+        )
         self.connector: KVConnectorBase_V1
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.launch_config = ucm_config.get_config()
@@ -1189,7 +1198,14 @@ class UCMConnector(KVConnectorBase_V1):
             > 1
         )
 
-        if use_lite:
+        if self._use_hybrid_attention_mamba_connector(vllm_config, kv_cache_config):
+            from ucm.integration.vllm.hybrid_connector import UCMHybridConnector
+
+            logger.info(
+                "Use UCMHybridConnector for hybrid attention + mamba KV layout."
+            )
+            self.connector = UCMHybridConnector(vllm_config, role, kv_cache_config)
+        elif use_lite:
             self.connector = UCMLiteConnector(vllm_config, role)
         elif use_ratio_rate:
             self.connector = UCMMockConnector(vllm_config, role)
@@ -1199,6 +1215,30 @@ class UCMConnector(KVConnectorBase_V1):
             self.connector = UCMLayerWiseConnector(vllm_config, role)
         else:
             self.connector = UCMDirectConnector(vllm_config, role)
+
+    @classmethod
+    def _use_hybrid_attention_mamba_connector(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_config: Optional["KVCacheConfig"],
+    ) -> bool:
+        if kv_cache_config is None:
+            return getattr(vllm_config.model_config, "is_hybrid", False)
+
+        try:
+            from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+        except ImportError:
+            return False
+
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+        has_attention = any(
+            isinstance(group.kv_cache_spec, AttentionSpec)
+            for group in kv_cache_groups
+        )
+        has_mamba = any(
+            isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_groups
+        )
+        return has_attention and has_mamba
 
     def get_num_new_matched_tokens(
         self,
@@ -1350,3 +1390,17 @@ class UCMConnector(KVConnectorBase_V1):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        request_finished_all_groups = getattr(
+            self.connector, "request_finished_all_groups", None
+        )
+        if request_finished_all_groups is not None:
+            return request_finished_all_groups(request, block_ids)
+        return self.connector.request_finished(
+            request, block_ids[0] if block_ids else []
+        )
