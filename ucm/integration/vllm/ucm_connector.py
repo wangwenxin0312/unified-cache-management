@@ -1908,7 +1908,6 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         base_ptrs: list[list[int]],
         tensor_size_lists: list[list[int]],
         block_stride_lists: list[list[int]],
-        reason: str,
     ) -> None:
         if raw_tensor.size % self.num_blocks != 0:
             raise ValueError(
@@ -1920,12 +1919,6 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         base_ptrs.append([base])
         tensor_size_lists.append([page_size])
         block_stride_lists.append([page_size])
-        logger.info(
-            "Hybrid linear-attention contiguous page layout: "
-            f"reason={reason}, shared_by={raw_tensor.shared_by}, "
-            f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
-            f"page_size={page_size}, base=0x{base:x}"
-        )
 
     def _append_ascend_component_major_layout(
         self,
@@ -1949,7 +1942,6 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                 base_ptrs,
                 tensor_size_lists,
                 block_stride_lists,
-                "unexpected_mamba_components",
             )
             return
 
@@ -1981,16 +1973,6 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         base_ptrs.append([base + offset for offset in offsets])
         tensor_size_lists.append(sizes)
         block_stride_lists.append(sizes)
-        logger.info(
-            "Hybrid linear-attention Ascend raw tensor layout: "
-            f"shared_by={raw_tensor.shared_by}, "
-            f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
-            f"page_size={page_size}, conv_size={conv_size}, "
-            f"k_size={k_size}, ssm_size={ssm_size}, "
-            f"middle_size={middle_size}, v_size={v_size}, "
-            f"tail_size={tail_size}, offsets={offsets}, "
-            f"strides={sizes}, base=0x{base:x}"
-        )
 
     def _build_layout(self, kvcaches):
         base_ptrs = []
@@ -2020,7 +2002,6 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                     base_ptrs,
                     tensor_size_lists,
                     block_stride_lists,
-                    "non_mixed_raw_tensor",
                 )
                 continue
 
@@ -2034,15 +2015,6 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                     tensor_size_lists,
                     block_stride_lists,
                 )
-            elif current_platform.is_cuda_alike():
-                self._append_contiguous_page_layout(
-                    raw_tensor,
-                    shared_ptrs,
-                    base_ptrs,
-                    tensor_size_lists,
-                    block_stride_lists,
-                    "cuda_page_major_mixed_tensor",
-                )
             else:
                 self._append_contiguous_page_layout(
                     raw_tensor,
@@ -2050,23 +2022,11 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                     base_ptrs,
                     tensor_size_lists,
                     block_stride_lists,
-                    f"{current_platform.device_type}_mixed_tensor",
                 )
 
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
-
-        logger.info(
-            "HybridLinearAttentionLayout: "
-            f"base_ptrs={self.base_ptrs.shape}, "
-            f"tensor_size_lists={self.tensor_size_lists.shape}, "
-            f"block_stride_lists={self.block_stride_lists.shape}"
-        )
-
-
-class AscendHybridLinearAttentionLayout(HybridLinearAttentionLayout):
-    """Backward-compatible name for the generalized hybrid layout."""
 
 
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
@@ -2102,22 +2062,26 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             f"UCMHMAConnector initialized with use_layerwise={self.use_layerwise}"
         )
 
+    def _create_kv_cache_layout(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> KVCacheLayout:
+        if current_platform.device_type == "npu" and self.use_compress:
+            return AscendDSV4Layout(
+                kv_caches,
+                self.launch_config,
+                self._vllm_config,
+                self._kv_cache_config,
+            )
+        return HMAKVCacheLayout(
+            kv_caches,
+            self.launch_config,
+            self._vllm_config,
+            self._kv_cache_config,
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.kv_caches = kv_caches
-        if current_platform.device_type == "npu" and self.use_compress:
-            self.kv_cache_layout = AscendDSV4Layout(
-                self.kv_caches,
-                self.launch_config,
-                self._vllm_config,
-                self._kv_cache_config,
-            )
-        else:
-            self.kv_cache_layout = HMAKVCacheLayout(
-                self.kv_caches,
-                self.launch_config,
-                self._vllm_config,
-                self._kv_cache_config,
-            )
+        self.kv_cache_layout = self._create_kv_cache_layout(self.kv_caches)
         self.store = self._create_store(self.kv_cache_layout)
         self.block_data_size = self.kv_cache_layout.block_size
         self.device = create_device()
@@ -2153,19 +2117,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(
             request.all_token_ids
         )
-        for gid, block_ids in enumerate(group_ucm_block_ids):
-            group = self.group_manager.groups_by_id[gid]
-            materialized_hashes = [block_id for block_id in block_ids if block_id]
-            logger.info(
-                "HMA lookup group hashes: "
-                f"request_id={request.request_id}, group_id={gid}, "
-                f"is_full_attention={group.is_full_attention}, "
-                f"is_mamba_align={group.is_mamba_align}, "
-                f"block_size={group.block_size}, "
-                f"num_hash_blocks={len(block_ids)}, "
-                f"num_materialized_hashes={len(materialized_hashes)}, "
-                f"hash_sample={_short_hex_block_ids(materialized_hashes)}"
-            )
         # Legacy ``ucm_block_ids`` mirrors the first full-attn group (by
         # group_id order) for callers that still consume the flat list.
         primary_full_attn = self.group_manager.full_attn_groups[0]
@@ -2241,12 +2192,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 f"HMA group count {self.group_manager.num_groups}"
             )
         req_meta.group_vllm_block_ids = [list(group) for group in block_ids]
-        logger.info(
-            "HMA update_state_after_alloc: "
-            f"request_id={request.request_id}, "
-            f"num_external_tokens={num_external_tokens}, "
-            f"group_block_ids={[ _short_list(group) for group in req_meta.group_vllm_block_ids ]}"
-        )
 
     def _generate_hma_dispatch_meta(
         self,
@@ -2295,15 +2240,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             f"{len(new_vllm_block_ids_per_group)} does not match "
             f"num_groups {num_groups}"
         )
-        logger.info(
-            "HMA dispatch begin: "
-            f"request_id={request_id}, new_tokens={new_tokens}, "
-            f"need_load={need_load}, lcm_block_size={lcm_block_size}, "
-            f"token_processed={req_meta.token_processed}, "
-            f"num_token_ids={req_meta.num_token_ids}, "
-            f"hbm_lcm_blocks={req_meta.hbm_hit_block_num}, "
-            f"total_lcm_blocks={req_meta.total_hit_block_num}"
-        )
         for gid in range(num_groups):
             incoming_vllm_block_ids = list(new_vllm_block_ids_per_group[gid])
             existing_vllm_block_ids = req_meta.group_vllm_block_ids[gid]
@@ -2321,24 +2257,11 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 suffix_len = len(incoming_vllm_block_ids)
                 if existing_vllm_block_ids[-suffix_len:] != incoming_vllm_block_ids:
                     existing_vllm_block_ids.extend(incoming_vllm_block_ids)
-            logger.info(
-                "HMA dispatch group blocks: "
-                f"request_id={request_id}, group_id={gid}, "
-                f"is_full_attention={groups_by_id[gid].is_full_attention}, "
-                f"is_mamba_align={groups_by_id[gid].is_mamba_align}, "
-                f"block_size={groups_by_id[gid].block_size}, "
-                f"sliding_window={groups_by_id[gid].sliding_window}, "
-                f"incoming_are_full={incoming_block_ids_are_full}, "
-                f"incoming_vllm={_short_list(incoming_vllm_block_ids)}, "
-                f"all_vllm_tail={_short_list(req_meta.group_vllm_block_ids[gid][-12:])}"
-            )
 
         load_ucm_block_ids: list[bytes] = []
         load_vllm_block_ids: list[int] = []
         dump_ucm_block_ids: list[bytes] = []
         dump_vllm_block_ids: list[int] = []
-
-        skipped_null_blocks = 0
 
         def extend_non_null(
             dst_ucm_block_ids: list[bytes],
@@ -2346,7 +2269,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             src_ucm_block_ids: list[bytes],
             src_vllm_block_ids: list[int],
         ) -> None:
-            nonlocal skipped_null_blocks
             # Mamba align mode pads req block tables with vLLM's null block
             # (block_id=0). These are metadata placeholders, not physical pages
             # that should be loaded from or dumped to the store.
@@ -2354,7 +2276,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 src_ucm_block_ids, src_vllm_block_ids
             ):
                 if vllm_block_id == 0:
-                    skipped_null_blocks += 1
                     continue
                 dst_ucm_block_ids.append(ucm_block_id)
                 dst_vllm_block_ids.append(vllm_block_id)
@@ -2366,7 +2287,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             seq_len: int,
             reason: str,
         ) -> None:
-            nonlocal skipped_null_blocks
             group = groups_by_id[gid]
             state_idx = max((seq_len - 1) // group.block_size, 0)
             vllm_state_idx = state_idx
@@ -2393,7 +2313,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 )
                 return
             if vllm_block_id == 0:
-                skipped_null_blocks += 1
                 return
             if group.is_mamba_align:
                 ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
@@ -2418,13 +2337,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     f"seq_len={seq_len}, state_idx={state_idx}"
                 )
                 return
-            logger.info(
-                "HMA mamba-align state block: "
-                f"request_id={request_id}, group_id={gid}, reason={reason}, "
-                f"seq_len={seq_len}, state_idx={state_idx}, "
-                f"vllm_state_idx={vllm_state_idx}, "
-                f"ucm={ucm_block_id.hex()}, vllm={vllm_block_id}"
-            )
             dst_ucm_block_ids.append(ucm_block_id)
             dst_vllm_block_ids.append(vllm_block_id)
 
@@ -2452,14 +2364,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 load_tok_end = total_hit_tokens
                 start_blk = load_tok_start // group.block_size
                 end_blk = load_tok_end // group.block_size
-                logger.info(
-                    "HMA load slice: "
-                    f"request_id={request_id}, group_id={gid}, "
-                    f"tok_range=({load_tok_start}, {load_tok_end}), "
-                    f"blk_range=({start_blk}, {end_blk}), "
-                    f"vllm_slice={_short_list(req_meta.group_vllm_block_ids[gid][start_blk:end_blk])}, "
-                    f"ucm_slice={_short_hex_block_ids(req_meta.group_ucm_block_ids[gid][start_blk:end_blk])}"
-                )
                 if start_blk >= end_blk:
                     continue
                 extend_non_null(
@@ -2488,14 +2392,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     # future hits.
                     start_blk = dump_tok_start // group.block_size
                     end_blk = dump_tok_end // group.block_size
-                    logger.info(
-                        "HMA dump full-attn slice: "
-                        f"request_id={request_id}, group_id={gid}, "
-                        f"tok_range=({dump_tok_start}, {dump_tok_end}), "
-                        f"blk_range=({start_blk}, {end_blk}), "
-                        f"vllm_slice={_short_list(req_meta.group_vllm_block_ids[gid][start_blk:end_blk])}, "
-                        f"ucm_slice={_short_hex_block_ids(req_meta.group_ucm_block_ids[gid][start_blk:end_blk])}"
-                    )
                     if start_blk >= end_blk:
                         continue
                     extend_non_null(
@@ -2529,14 +2425,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     while b <= last_lcm_b:
                         end_blk = b // group.block_size
                         start_blk = max(0, end_blk - tail_count)
-                        logger.info(
-                            "HMA dump linear-attn tail slice: "
-                            f"request_id={request_id}, group_id={gid}, "
-                            f"lcm_boundary={b}, tail_count={tail_count}, "
-                            f"blk_range=({start_blk}, {end_blk}), "
-                            f"vllm_slice={_short_list(req_meta.group_vllm_block_ids[gid][start_blk:end_blk])}, "
-                            f"ucm_slice={_short_hex_block_ids(req_meta.group_ucm_block_ids[gid][start_blk:end_blk])}"
-                        )
                         if start_blk < end_blk:
                             extend_non_null(
                                 dump_ucm_block_ids,
@@ -2546,18 +2434,6 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                             )
                         b += lcm_block_size
             req_meta.token_processed += new_tokens
-
-        logger.info(
-            "HMA dispatch end: "
-            f"request_id={request_id}, "
-            f"load_blocks={len(load_ucm_block_ids)}, "
-            f"dump_blocks={len(dump_ucm_block_ids)}, "
-            f"skipped_null_blocks={skipped_null_blocks}, "
-            f"load_vllm={_short_list(load_vllm_block_ids)}, "
-            f"dump_vllm={_short_list(dump_vllm_block_ids, 24)}, "
-            f"load_ucm={_short_hex_block_ids(load_ucm_block_ids)}, "
-            f"dump_ucm={_short_hex_block_ids(dump_ucm_block_ids)}"
-        )
 
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
@@ -2652,19 +2528,6 @@ def use_hybrid_linear_attention_layout(
         return False
 
     layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
-    has_full_attention = False
-    has_mamba_align = False
-    for layer_specs in layer_to_specs.values():
-        for spec in layer_specs:
-            has_full_attention = has_full_attention or isinstance(
-                spec, FullAttentionSpec
-            )
-            has_mamba_align = has_mamba_align or (
-                isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
-            )
-    if not has_full_attention or not has_mamba_align:
-        return False
-
     for raw_tensor in kv_cache_config.kv_cache_tensors:
         shared_specs = [
             spec
@@ -2684,30 +2547,18 @@ def use_hybrid_linear_attention_layout(
     return False
 
 
-def use_ascend_hybrid_linear_attention_layout(
-    kv_cache_config: "KVCacheConfig",
-) -> bool:
-    return use_hybrid_linear_attention_layout(kv_cache_config)
-
-
 class UCMHybridLinearAttentionConnector(UCMHMAConnector):
     """Connector for full-attention + linear-attention hybrid layouts."""
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        self.kv_caches = kv_caches
-        self.kv_cache_layout = HybridLinearAttentionLayout(
-            self.kv_caches,
+    def _create_kv_cache_layout(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> KVCacheLayout:
+        return HybridLinearAttentionLayout(
+            kv_caches,
             self.launch_config,
             self._vllm_config,
             self._kv_cache_config,
         )
-        self.store = self._create_store(self.kv_cache_layout)
-        self.block_data_size = self.kv_cache_layout.block_size
-        self.device = create_device()
-
-
-class UCMAscendHybridLinearAttentionConnector(UCMHybridLinearAttentionConnector):
-    """Backward-compatible name for the generalized hybrid connector."""
 
 
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
