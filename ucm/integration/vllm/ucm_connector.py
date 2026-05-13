@@ -1862,18 +1862,135 @@ def _attention_component_sizes(spec: KVCacheSpec) -> tuple[int, int]:
     return k_size, v_size
 
 
-class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
-    """Physical layout for Ascend hybrid full-attention + linear-attention pages.
+class HybridLinearAttentionLayout(HMAKVCacheLayout):
+    """Physical layout for hybrid full-attention + linear-attention pages.
 
-    vLLM-Ascend may back full-attention and linear-attention layers with one
-    shared raw int8 tensor whose per-physical-block layout is:
+    vLLM may back full-attention and linear-attention layers with one shared
+    raw int8 tensor. The physical layout is backend dependent:
+
+    - Ascend stores the shared page in component-major order:
         [conv_block_or_padding, k_or_ssm_block, v_block_or_padding]
+      across all physical blocks.
+    - CUDA stores one contiguous page per physical block. The same bytes are
+      viewed as either attention [K, V] or mamba [conv, ssm, padding].
 
     The store receives one unified tensor_size_list, so we expose the three
-    physical slices for every raw tensor. The transfer sizes are slice sizes,
-    and the address stride follows vLLM-Ascend's component-major storage:
-    all conv blocks, then all k/ssm blocks, then all v/padding blocks.
+    physical slices for Ascend, while CUDA is exposed as one contiguous page
+    with a full-page stride.
     """
+
+    def _collect_shared_tensor_info(
+        self,
+        raw_tensor,
+        kvcaches,
+    ) -> tuple[list[KVCacheSpec], list[int]]:
+        shared_specs: list[KVCacheSpec] = []
+        shared_ptrs: list[int] = []
+        for layer_name in raw_tensor.shared_by:
+            kv_layer = kvcaches.get(layer_name)
+            if kv_layer is None:
+                continue
+            shared_specs.extend(self.layer_name_to_kv_cache_spec[layer_name])
+            if isinstance(kv_layer, torch.Tensor):
+                shared_ptrs.append(kv_layer.data_ptr())
+            elif isinstance(kv_layer, (tuple, list)):
+                for tensor in kv_layer:
+                    if isinstance(tensor, torch.Tensor):
+                        shared_ptrs.append(tensor.data_ptr())
+            else:
+                logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
+        return shared_specs, shared_ptrs
+
+    def _append_contiguous_page_layout(
+        self,
+        raw_tensor,
+        shared_ptrs: list[int],
+        base_ptrs: list[list[int]],
+        tensor_size_lists: list[list[int]],
+        block_stride_lists: list[list[int]],
+        reason: str,
+    ) -> None:
+        if raw_tensor.size % self.num_blocks != 0:
+            raise ValueError(
+                "Invalid hybrid linear-attention raw tensor size: "
+                f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}"
+            )
+        page_size = raw_tensor.size // self.num_blocks
+        base = min(shared_ptrs)
+        base_ptrs.append([base])
+        tensor_size_lists.append([page_size])
+        block_stride_lists.append([page_size])
+        logger.info(
+            "Hybrid linear-attention contiguous page layout: "
+            f"reason={reason}, shared_by={raw_tensor.shared_by}, "
+            f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
+            f"page_size={page_size}, base=0x{base:x}"
+        )
+
+    def _append_ascend_component_major_layout(
+        self,
+        raw_tensor,
+        shared_ptrs: list[int],
+        mamba_specs: list[MambaSpec],
+        attn_specs: list[FullAttentionSpec],
+        base_ptrs: list[list[int]],
+        tensor_size_lists: list[list[int]],
+        block_stride_lists: list[list[int]],
+    ) -> None:
+        mamba_sizes = _mamba_component_sizes(mamba_specs[0])
+        if len(mamba_sizes) < 2:
+            logger.warning(
+                f"unexpected mamba component sizes {mamba_sizes}; "
+                "falling back to contiguous page layout"
+            )
+            self._append_contiguous_page_layout(
+                raw_tensor,
+                shared_ptrs,
+                base_ptrs,
+                tensor_size_lists,
+                block_stride_lists,
+                "unexpected_mamba_components",
+            )
+            return
+
+        conv_size = mamba_sizes[0]
+        ssm_size = mamba_sizes[1]
+        k_size, v_size = _attention_component_sizes(attn_specs[0])
+        middle_size = max(k_size, ssm_size)
+        page_size = raw_tensor.size // self.num_blocks
+        tail_size = page_size - conv_size - middle_size
+        if tail_size <= 0:
+            raise ValueError(
+                "Invalid Ascend hybrid linear-attention page layout: "
+                f"page_size={page_size}, conv_size={conv_size}, "
+                f"middle_size={middle_size}, tail_size={tail_size}"
+            )
+        if tail_size < v_size:
+            raise ValueError(
+                "Ascend hybrid linear-attention tail cannot hold attention V: "
+                f"tail_size={tail_size}, v_size={v_size}"
+            )
+
+        base = min(shared_ptrs)
+        offsets = [
+            0,
+            conv_size * self.num_blocks,
+            (conv_size + middle_size) * self.num_blocks,
+        ]
+        sizes = [conv_size, middle_size, tail_size]
+        base_ptrs.append([base + offset for offset in offsets])
+        tensor_size_lists.append(sizes)
+        block_stride_lists.append(sizes)
+        logger.info(
+            "Hybrid linear-attention Ascend raw tensor layout: "
+            f"shared_by={raw_tensor.shared_by}, "
+            f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
+            f"page_size={page_size}, conv_size={conv_size}, "
+            f"k_size={k_size}, ssm_size={ssm_size}, "
+            f"middle_size={middle_size}, v_size={v_size}, "
+            f"tail_size={tail_size}, offsets={offsets}, "
+            f"strides={sizes}, base=0x{base:x}"
+        )
 
     def _build_layout(self, kvcaches):
         base_ptrs = []
@@ -1884,21 +2001,9 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
             if not raw_tensor.shared_by:
                 continue
 
-            shared_specs: list[KVCacheSpec] = []
-            shared_ptrs: list[int] = []
-            for layer_name in raw_tensor.shared_by:
-                kv_layer = kvcaches.get(layer_name)
-                if kv_layer is None:
-                    continue
-                shared_specs.extend(self.layer_name_to_kv_cache_spec[layer_name])
-                if isinstance(kv_layer, torch.Tensor):
-                    shared_ptrs.append(kv_layer.data_ptr())
-                elif isinstance(kv_layer, (tuple, list)):
-                    for tensor in kv_layer:
-                        if isinstance(tensor, torch.Tensor):
-                            shared_ptrs.append(tensor.data_ptr())
-                else:
-                    logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
+            shared_specs, shared_ptrs = self._collect_shared_tensor_info(
+                raw_tensor, kvcaches
+            )
 
             if not shared_ptrs:
                 logger.warning(
@@ -1909,75 +2014,59 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
             if not mamba_specs or not attn_specs:
-                sample_layer_name = raw_tensor.shared_by[0]
-                kv_cache_spec = self.layer_name_to_kv_cache_spec[sample_layer_name][0]
-                page_size = kv_cache_spec.page_size_bytes
-                base_ptrs.append([min(shared_ptrs)])
-                tensor_size_lists.append([page_size])
-                block_stride_lists.append([page_size])
+                self._append_contiguous_page_layout(
+                    raw_tensor,
+                    shared_ptrs,
+                    base_ptrs,
+                    tensor_size_lists,
+                    block_stride_lists,
+                    "non_mixed_raw_tensor",
+                )
                 continue
 
-            mamba_sizes = _mamba_component_sizes(mamba_specs[0])
-            if len(mamba_sizes) < 2:
-                logger.warning(
-                    f"unexpected mamba component sizes {mamba_sizes}; "
-                    "falling back to contiguous page layout"
+            if current_platform.device_type == "npu":
+                self._append_ascend_component_major_layout(
+                    raw_tensor,
+                    shared_ptrs,
+                    mamba_specs,
+                    attn_specs,
+                    base_ptrs,
+                    tensor_size_lists,
+                    block_stride_lists,
                 )
-                page_size = raw_tensor.size // self.num_blocks
-                base_ptrs.append([min(shared_ptrs)])
-                tensor_size_lists.append([page_size])
-                block_stride_lists.append([page_size])
-                continue
-
-            conv_size = mamba_sizes[0]
-            ssm_size = mamba_sizes[1]
-            k_size, v_size = _attention_component_sizes(attn_specs[0])
-            middle_size = max(k_size, ssm_size)
-            page_size = raw_tensor.size // self.num_blocks
-            tail_size = page_size - conv_size - middle_size
-            if tail_size <= 0:
-                raise ValueError(
-                    "Invalid Ascend hybrid linear-attention page layout: "
-                    f"page_size={page_size}, conv_size={conv_size}, "
-                    f"middle_size={middle_size}, tail_size={tail_size}"
+            elif current_platform.is_cuda_alike():
+                self._append_contiguous_page_layout(
+                    raw_tensor,
+                    shared_ptrs,
+                    base_ptrs,
+                    tensor_size_lists,
+                    block_stride_lists,
+                    "cuda_page_major_mixed_tensor",
                 )
-            if tail_size < v_size:
-                raise ValueError(
-                    "Ascend hybrid linear-attention tail cannot hold attention V: "
-                    f"tail_size={tail_size}, v_size={v_size}"
+            else:
+                self._append_contiguous_page_layout(
+                    raw_tensor,
+                    shared_ptrs,
+                    base_ptrs,
+                    tensor_size_lists,
+                    block_stride_lists,
+                    f"{current_platform.device_type}_mixed_tensor",
                 )
-
-            base = min(shared_ptrs)
-            offsets = [
-                0,
-                conv_size * self.num_blocks,
-                (conv_size + middle_size) * self.num_blocks,
-            ]
-            sizes = [conv_size, middle_size, tail_size]
-            base_ptrs.append([base + offset for offset in offsets])
-            tensor_size_lists.append(sizes)
-            block_stride_lists.append(sizes)
-            logger.info(
-                "Ascend hybrid layout raw tensor: "
-                f"shared_by={raw_tensor.shared_by}, "
-                f"raw_size={raw_tensor.size}, num_blocks={self.num_blocks}, "
-                f"page_size={page_size}, conv_size={conv_size}, "
-                f"k_size={k_size}, ssm_size={ssm_size}, "
-                f"middle_size={middle_size}, v_size={v_size}, "
-                f"tail_size={tail_size}, offsets={offsets}, "
-                f"strides={sizes}, base=0x{base:x}"
-            )
 
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
 
         logger.info(
-            "AscendHybridLinearAttentionLayout: "
+            "HybridLinearAttentionLayout: "
             f"base_ptrs={self.base_ptrs.shape}, "
             f"tensor_size_lists={self.tensor_size_lists.shape}, "
             f"block_stride_lists={self.block_stride_lists.shape}"
         )
+
+
+class AscendHybridLinearAttentionLayout(HybridLinearAttentionLayout):
+    """Backward-compatible name for the generalized hybrid layout."""
 
 
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
@@ -2556,10 +2645,10 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         return False, None
 
 
-def use_ascend_hybrid_linear_attention_layout(
+def use_hybrid_linear_attention_layout(
     kv_cache_config: "KVCacheConfig",
 ) -> bool:
-    if current_platform.device_type != "npu":
+    if current_platform.device_type != "npu" and not current_platform.is_cuda_alike():
         return False
 
     layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
@@ -2595,12 +2684,18 @@ def use_ascend_hybrid_linear_attention_layout(
     return False
 
 
-class UCMAscendHybridLinearAttentionConnector(UCMHMAConnector):
-    """Connector for Ascend full-attention + linear-attention hybrid layout."""
+def use_ascend_hybrid_linear_attention_layout(
+    kv_cache_config: "KVCacheConfig",
+) -> bool:
+    return use_hybrid_linear_attention_layout(kv_cache_config)
+
+
+class UCMHybridLinearAttentionConnector(UCMHMAConnector):
+    """Connector for full-attention + linear-attention hybrid layouts."""
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.kv_caches = kv_caches
-        self.kv_cache_layout = AscendHybridLinearAttentionLayout(
+        self.kv_cache_layout = HybridLinearAttentionLayout(
             self.kv_caches,
             self.launch_config,
             self._vllm_config,
@@ -2609,6 +2704,10 @@ class UCMAscendHybridLinearAttentionConnector(UCMHMAConnector):
         self.store = self._create_store(self.kv_cache_layout)
         self.block_data_size = self.kv_cache_layout.block_size
         self.device = create_device()
+
+
+class UCMAscendHybridLinearAttentionConnector(UCMHybridLinearAttentionConnector):
+    """Backward-compatible name for the generalized hybrid connector."""
 
 
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
@@ -2663,8 +2762,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             or os.getenv("USE_MULTI_GROUPS_KV_CACHE") == "1"
         )
 
-        use_ascend_hybrid_linear_attention = (
-            use_ascend_hybrid_linear_attention_layout(kv_cache_config)
+        use_hybrid_linear_attention = use_hybrid_linear_attention_layout(
+            kv_cache_config
         )
 
         if use_lite:
@@ -2675,8 +2774,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMCPConnector(vllm_config, role)
         elif use_layerwise:
             self.connector = UCMLayerWiseConnector(vllm_config, role)
-        elif use_ascend_hybrid_linear_attention:
-            self.connector = UCMAscendHybridLinearAttentionConnector(
+        elif use_hybrid_linear_attention:
+            self.connector = UCMHybridLinearAttentionConnector(
                 vllm_config, role, kv_cache_config
             )
         elif use_hma:
