@@ -129,6 +129,8 @@ class RequestDispatchMeta:
         list[bytes], list[int]
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
+    group_load_block_ids: Optional[tuple[list[list[bytes]], list[list[int]]]] = None
+    group_dump_block_ids: Optional[tuple[list[list[bytes]], list[list[int]]]] = None
 
 
 class KVCacheLayout:
@@ -925,8 +927,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                              load l2    -> forward l2 -> save l2
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
         # {layer_id: {request_id: Task}}
         self.load_tasks: dict[int, dict[str, Task]] = defaultdict(dict)
         self.dump_tasks: dict[str, Task] = {}
@@ -1086,8 +1093,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
 
 class UCMCPConnector(UCMLayerWiseConnector):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
         self.use_layerwise = self.launch_config.get("use_layerwise", False)
 
         try:
@@ -1184,8 +1196,13 @@ class UCMPDConnector(UCMDirectConnector):
     load req3               -> load req4
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
 
     def get_num_new_matched_tokens(
         self,
@@ -1218,8 +1235,13 @@ class UCMMockConnector(UCMDirectConnector):
     will reduce hit_tokens under the hit_ratio you set.
     """
 
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
         self._hit_ratio = float(self.launch_config["hit_ratio"])
         logger.info(f"hit_ratio: {self._hit_ratio}")
 
@@ -1251,7 +1273,7 @@ class UCMMockConnector(UCMDirectConnector):
 
 
 class UCMLiteConnector(UCMDirectConnector):
-    def __init__(self, vllm_config, role):
+    def __init__(self, vllm_config, role, kv_cache_config: "KVCacheConfig"):
         ucm_config = Config(vllm_config.kv_transfer_config)
         launch_config = ucm_config.get_config()
         enable_record_traces = launch_config.get("enable_record_traces", False)
@@ -1271,7 +1293,7 @@ class UCMLiteConnector(UCMDirectConnector):
             "persist_token_threshold": persist_token_threshold,
             "use_lite": True,
         }
-        super().__init__(vllm_config, role)
+        super().__init__(vllm_config, role, kv_cache_config)
         self.total_block_nums = 0
         self.total_hit_block_nums = 0
         logger.info("Init UCMLiteConnector.")
@@ -1879,6 +1901,8 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
         base_ptrs = []
         tensor_size_lists = []
         block_stride_lists = []
+        layer_name_to_layout_row: dict[str, int] = {}
+        row_layer_names: list[list[str]] = []
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             if not raw_tensor.shared_by:
@@ -1954,9 +1978,13 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
                 (conv_size + middle_size) * self.num_blocks,
             ]
             sizes = [conv_size, middle_size, tail_size]
+            layout_row = len(base_ptrs)
             base_ptrs.append([base + offset for offset in offsets])
             tensor_size_lists.append(sizes)
             block_stride_lists.append(sizes)
+            row_layer_names.append(list(raw_tensor.shared_by))
+            for layer_name in raw_tensor.shared_by:
+                layer_name_to_layout_row[layer_name] = layout_row
             logger.info(
                 "Ascend hybrid layout raw tensor: "
                 f"shared_by={raw_tensor.shared_by}, "
@@ -1971,6 +1999,8 @@ class AscendHybridLinearAttentionLayout(HMAKVCacheLayout):
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
+        self.layer_name_to_layout_row = layer_name_to_layout_row
+        self.row_layer_names = row_layer_names
 
         logger.info(
             "AscendHybridLinearAttentionLayout: "
@@ -2248,6 +2278,18 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         load_vllm_block_ids: list[int] = []
         dump_ucm_block_ids: list[bytes] = []
         dump_vllm_block_ids: list[int] = []
+        group_load_ucm_block_ids: list[list[bytes]] = [
+            [] for _ in range(num_groups)
+        ]
+        group_load_vllm_block_ids: list[list[int]] = [
+            [] for _ in range(num_groups)
+        ]
+        group_dump_ucm_block_ids: list[list[bytes]] = [
+            [] for _ in range(num_groups)
+        ]
+        group_dump_vllm_block_ids: list[list[int]] = [
+            [] for _ in range(num_groups)
+        ]
 
         skipped_null_blocks = 0
 
@@ -2256,6 +2298,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             dst_vllm_block_ids: list[int],
             src_ucm_block_ids: list[bytes],
             src_vllm_block_ids: list[int],
+            group_id: Optional[int] = None,
         ) -> None:
             nonlocal skipped_null_blocks
             # Mamba align mode pads req block tables with vLLM's null block
@@ -2269,6 +2312,13 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     continue
                 dst_ucm_block_ids.append(ucm_block_id)
                 dst_vllm_block_ids.append(vllm_block_id)
+                if group_id is not None:
+                    if dst_ucm_block_ids is load_ucm_block_ids:
+                        group_load_ucm_block_ids[group_id].append(ucm_block_id)
+                        group_load_vllm_block_ids[group_id].append(vllm_block_id)
+                    else:
+                        group_dump_ucm_block_ids[group_id].append(ucm_block_id)
+                        group_dump_vllm_block_ids[group_id].append(vllm_block_id)
 
         def append_mamba_align_state_block(
             dst_ucm_block_ids: list[bytes],
@@ -2338,6 +2388,12 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             )
             dst_ucm_block_ids.append(ucm_block_id)
             dst_vllm_block_ids.append(vllm_block_id)
+            if dst_ucm_block_ids is load_ucm_block_ids:
+                group_load_ucm_block_ids[gid].append(ucm_block_id)
+                group_load_vllm_block_ids[gid].append(vllm_block_id)
+            else:
+                group_dump_ucm_block_ids[gid].append(ucm_block_id)
+                group_dump_vllm_block_ids[gid].append(vllm_block_id)
 
         external_hit_lcm_blocks = (
             req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
@@ -2378,6 +2434,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     load_vllm_block_ids,
                     req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
                     req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                    gid,
                 )
 
         if req_meta.token_processed < req_meta.num_token_ids:
@@ -2414,6 +2471,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                         dump_vllm_block_ids,
                         req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
                         req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                        gid,
                     )
                 else:
                     # Dump only the tail blocks at each LCM boundary reached
@@ -2454,6 +2512,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                                 dump_vllm_block_ids,
                                 req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
                                 req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                                gid,
                             )
                         b += lcm_block_size
             req_meta.token_processed += new_tokens
@@ -2473,6 +2532,8 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
+            (group_load_ucm_block_ids, group_load_vllm_block_ids),
+            (group_dump_ucm_block_ids, group_dump_vllm_block_ids),
         )
 
     def build_connector_meta(
@@ -2611,6 +2672,275 @@ class UCMAscendHybridLinearAttentionConnector(UCMHMAConnector):
         self.device = create_device()
 
 
+class UCMAscendHybridLinearAttentionLayerWiseConnector(
+    UCMAscendHybridLinearAttentionConnector
+):
+    """Layerwise connector for Ascend Qwen3-Next hybrid cache pages.
+
+    Ascend packs three linear-attention layers and the following full-attention
+    layer into one physical raw tensor. The scheduler still allocates block ids
+    per KV-cache group, so load/save must keep group block ids while using the
+    shared raw tensor row as the physical copy target.
+    """
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.use_layerwise = True
+        self.layer_name_to_group_id: dict[str, int] = {}
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                self.layer_name_to_group_id[layer_name] = group_id
+
+        self.load_tasks: dict[int, list[tuple[str, str, Task]]] = defaultdict(list)
+        self.dump_tasks: list[tuple[str, str, Task]] = []
+        self.request_group_data: dict[
+            int, list[tuple[str, list[bytes], list[int], np.ndarray]]
+        ] = defaultdict(list)
+        self.need_load = False
+        self.is_save = False
+        self._failure_req_ids: set[str] = set()
+        self._submitted_load_rows: set[int] = set()
+        self._dumped_rows: set[int] = set()
+        self.layer_name_to_layout_row: dict[str, int] = {}
+        self.row_layer_names: dict[int, list[str]] = {}
+        self.row_commit_layer_name: dict[int, str] = {}
+        self.row_order: list[int] = []
+        logger.info("Init UCMAscendHybridLinearAttentionLayerWiseConnector.")
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        super().register_kv_caches(kv_caches)
+        self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
+        self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        self.first_layer_id = self.layer_ids[0]
+        self.layer_name_to_layout_row = dict(
+            getattr(self.kv_cache_layout, "layer_name_to_layout_row", {})
+        )
+        raw_row_layer_names = getattr(self.kv_cache_layout, "row_layer_names", [])
+        self.row_layer_names = {}
+        self.row_commit_layer_name = {}
+        for row, layer_names in enumerate(raw_row_layer_names):
+            known_layer_names = [
+                name for name in layer_names if name in self.layer_name_to_id
+            ]
+            known_layer_names.sort(key=lambda name: self.layer_name_to_id[name])
+            if not known_layer_names:
+                continue
+            self.row_layer_names[row] = known_layer_names
+            self.row_commit_layer_name[row] = known_layer_names[-1]
+        self.row_order = sorted(
+            self.row_layer_names,
+            key=lambda row: self.layer_name_to_id[self.row_layer_names[row][0]],
+        )
+
+    def _hash_ucm_block_ids_for_rank(
+        self,
+        ucm_block_ids: list[bytes],
+    ) -> list[bytes]:
+        ucm_block_ids = list(ucm_block_ids)
+        if self.tp_rank != 0 and not self.is_mla:
+            return [self.request_hasher(block_id) for block_id in ucm_block_ids]
+        return ucm_block_ids
+
+    def _submit_load_tasks_for_row(
+        self,
+        row: int,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        if row in self._submitted_load_rows:
+            return
+        self._submitted_load_rows.add(row)
+        for layer_name in self.row_layer_names.get(row, []):
+            group_id = self.layer_name_to_group_id.get(layer_name)
+            if group_id is None:
+                continue
+            layer_id = self.layer_name_to_id[layer_name]
+            for request_id, ucm_block_ids, vllm_block_ids, total_ptrs in (
+                self.request_group_data.get(group_id, [])
+            ):
+                if request_id in self._failure_req_ids:
+                    continue
+                try:
+                    layer_ptrs = np.ascontiguousarray(total_ptrs[row])
+                    shard_indexs = [layer_id] * len(ucm_block_ids)
+                    task = self.store.load_data(
+                        ucm_block_ids, shard_indexs, layer_ptrs
+                    )
+                    self.load_tasks[row].append((request_id, layer_name, task))
+                    logger.info(
+                        "Ascend hybrid layerwise load submit: "
+                        f"request_id={request_id}, layer_name={layer_name}, "
+                        f"group_id={group_id}, row={row}, blocks={len(ucm_block_ids)}, "
+                        f"vllm_sample={_short_list(vllm_block_ids, 24)}, "
+                        f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Ascend hybrid layerwise submit load failed: "
+                        f"request_id={request_id}, layer_name={layer_name}, "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    req_meta = metadata.request_meta.get(request_id)
+                    if req_meta is not None:
+                        self._invalid_block_ids.update(req_meta.load_block_ids[1])
+                    self._failure_req_ids.add(request_id)
+
+    def _submit_next_load_row(self, row: int, metadata: "UCMConnectorMetadata") -> None:
+        try:
+            row_idx = self.row_order.index(row)
+        except ValueError:
+            return
+        if row_idx + 1 < len(self.row_order):
+            self._submit_load_tasks_for_row(self.row_order[row_idx + 1], metadata)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+        self.load_tasks.clear()
+        self.request_group_data.clear()
+        self._failure_req_ids.clear()
+        self._submitted_load_rows.clear()
+        self.need_load = False
+
+        for request_id, request in metadata.request_meta.items():
+            if request.group_load_block_ids is None:
+                continue
+            group_ucm_block_ids, group_vllm_block_ids = request.group_load_block_ids
+            for group_id, (ucm_block_ids, vllm_block_ids) in enumerate(
+                zip(group_ucm_block_ids, group_vllm_block_ids)
+            ):
+                if not ucm_block_ids:
+                    continue
+                self.need_load = True
+                ucm_block_ids = self._hash_ucm_block_ids_for_rank(ucm_block_ids)
+                total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                    vllm_block_ids, layer_first=True
+                )
+                self.request_group_data[group_id].append(
+                    (request_id, ucm_block_ids, list(vllm_block_ids), total_ptrs)
+                )
+
+        if self.need_load and self.row_order:
+            self._submit_load_tasks_for_row(self.row_order[0], metadata)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._connector_metadata or not self.need_load:
+            return
+        row = self.layer_name_to_layout_row.get(layer_name)
+        if row is None:
+            return
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+
+        row_tasks = self.load_tasks.pop(row, [])
+        for request_id, waited_layer_name, task in row_tasks:
+            try:
+                self.store.wait(task)
+                logger.info(
+                    "Ascend hybrid layerwise load wait done: "
+                    f"request_id={request_id}, layer_name={waited_layer_name}, "
+                    f"row={row}"
+                )
+            except Exception as e:
+                logger.error(
+                    "Ascend hybrid layerwise wait load failed: "
+                    f"request_id={request_id}, layer_name={waited_layer_name}, "
+                    f"{type(e).__name__}: {e}"
+                )
+                req_meta = metadata.request_meta.get(request_id)
+                if req_meta is not None:
+                    self._invalid_block_ids.update(req_meta.load_block_ids[1])
+                self._failure_req_ids.add(request_id)
+
+        self._submit_next_load_row(row, metadata)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        if not self._connector_metadata:
+            return
+        if self.is_mla and self.tp_rank != 0:
+            return
+
+        row = self.layer_name_to_layout_row.get(layer_name)
+        if row is None or self.row_commit_layer_name.get(row) != layer_name:
+            return
+        if row in self._dumped_rows:
+            return
+        self._dumped_rows.add(row)
+
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+        row_layer_names = self.row_layer_names.get(row, [])
+        for request_id, request in metadata.request_meta.items():
+            if request.group_dump_block_ids is None:
+                continue
+            group_ucm_block_ids, group_vllm_block_ids = request.group_dump_block_ids
+            for dump_layer_name in row_layer_names:
+                group_id = self.layer_name_to_group_id.get(dump_layer_name)
+                if group_id is None or group_id >= len(group_ucm_block_ids):
+                    continue
+                ucm_block_ids = group_ucm_block_ids[group_id]
+                vllm_block_ids = group_vllm_block_ids[group_id]
+                if not ucm_block_ids:
+                    continue
+                ucm_block_ids = self._hash_ucm_block_ids_for_rank(ucm_block_ids)
+                layer_id = self.layer_name_to_id[dump_layer_name]
+                try:
+                    total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                        vllm_block_ids, layer_first=True
+                    )
+                    layer_ptrs = np.ascontiguousarray(total_ptrs[row])
+                    shard_indexs = [layer_id] * len(ucm_block_ids)
+                    event_handle = self._get_dump_event_handle()
+                    task = self.store.dump_data(
+                        ucm_block_ids, shard_indexs, layer_ptrs, event_handle
+                    )
+                    self.dump_tasks.append((request_id, dump_layer_name, task))
+                    self.is_save = True
+                    logger.info(
+                        "Ascend hybrid layerwise dump submit: "
+                        f"request_id={request_id}, layer_name={dump_layer_name}, "
+                        f"group_id={group_id}, row={row}, blocks={len(ucm_block_ids)}, "
+                        f"vllm_sample={_short_list(vllm_block_ids, 24)}, "
+                        f"ucm_sample={_short_hex_block_ids(ucm_block_ids)}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Ascend hybrid layerwise submit dump failed: "
+                        f"request_id={request_id}, layer_name={dump_layer_name}, "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+    def wait_for_save(self) -> None:
+        if not self.is_save:
+            return
+        try:
+            for request_id, layer_name, task in self.dump_tasks:
+                self.store.wait(task)
+                logger.info(
+                    "Ascend hybrid layerwise dump wait done: "
+                    f"request_id={request_id}, layer_name={layer_name}"
+                )
+        except Exception as e:
+            logger.error(
+                f"wait for Ascend hybrid layerwise dump failed. {type(e).__name__}: {e}"
+            )
+        self.dump_tasks.clear()
+        self._dumped_rows.clear()
+        self.is_save = False
+        if self.enable_event_sync:
+            self.device.destroy_event_handles()
+
+
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -2668,13 +2998,17 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if use_lite:
-            self.connector = UCMLiteConnector(vllm_config, role)
+            self.connector = UCMLiteConnector(vllm_config, role, kv_cache_config)
         elif use_ratio_rate:
-            self.connector = UCMMockConnector(vllm_config, role)
+            self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
-            self.connector = UCMCPConnector(vllm_config, role)
+            self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
+        elif use_layerwise and use_ascend_hybrid_linear_attention:
+            self.connector = UCMAscendHybridLinearAttentionLayerWiseConnector(
+                vllm_config, role, kv_cache_config
+            )
         elif use_layerwise:
-            self.connector = UCMLayerWiseConnector(vllm_config, role)
+            self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         elif use_ascend_hybrid_linear_attention:
             self.connector = UCMAscendHybridLinearAttentionConnector(
                 vllm_config, role, kv_cache_config
