@@ -1329,6 +1329,7 @@ class GroupInfo:
     layer_names: tuple[str, ...]
     # Independent hash chain seed per group (see ``KVCacheGroupManager``).
     seed: bytes
+    is_mamba_align: bool = False
 
     @property
     def is_full_attention(self) -> bool:
@@ -1383,6 +1384,7 @@ class KVCacheGroupManager:
                 sliding_window=sliding_window,
                 layer_names=tuple(group.layer_names),
                 seed=seed,
+                is_mamba_align=is_mamba_align_kv_cache_spec(spec),
             )
             self.groups_by_id.append(info)
             if info.is_full_attention:
@@ -1437,7 +1439,7 @@ class KVCacheGroupManager:
             f"full_attn_groups="
             f"{[(g.group_id, g.block_size) for g in self.full_attn_groups]}, "
             f"sliding_window_groups="
-            f"{[(g.group_id, g.block_size, g.sliding_window) for g in self.sliding_window_groups]}"
+            f"{[(g.group_id, g.block_size, g.sliding_window, g.is_mamba_align) for g in self.sliding_window_groups]}"
         )
 
     @property
@@ -2011,6 +2013,27 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
 
         return external_hit_tokens, False
 
+    def update_state_after_alloc(
+        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    ):
+        req_meta = self.requests_meta.get(request.request_id)
+        if req_meta is None:
+            return
+        assert isinstance(req_meta, HMARequestMeta)
+        block_ids = blocks.get_block_ids()
+        if self.group_manager is not None:
+            assert len(block_ids) == self.group_manager.num_groups, (
+                f"allocated block group count {len(block_ids)} does not match "
+                f"HMA group count {self.group_manager.num_groups}"
+            )
+        req_meta.group_vllm_block_ids = [list(group) for group in block_ids]
+        logger.info(
+            "HMA update_state_after_alloc: "
+            f"request_id={request.request_id}, "
+            f"num_external_tokens={num_external_tokens}, "
+            f"group_block_ids={[ _short_list(group) for group in req_meta.group_vllm_block_ids ]}"
+        )
+
     def _generate_hma_dispatch_meta(
         self,
         req_meta: "HMARequestMeta",
@@ -2018,6 +2041,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         new_vllm_block_ids_per_group: tuple[list[int], ...],
         need_load: bool = True,
         request_id: str = "",
+        incoming_block_ids_are_full: bool = False,
     ) -> RequestDispatchMeta:
         """Build a flat (ucm, vllm) block id pair list across all groups.
 
@@ -2067,14 +2091,31 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             f"total_lcm_blocks={req_meta.total_hit_block_num}"
         )
         for gid in range(num_groups):
-            req_meta.group_vllm_block_ids[gid].extend(new_vllm_block_ids_per_group[gid])
+            incoming_vllm_block_ids = list(new_vllm_block_ids_per_group[gid])
+            existing_vllm_block_ids = req_meta.group_vllm_block_ids[gid]
+            if incoming_block_ids_are_full:
+                req_meta.group_vllm_block_ids[gid] = incoming_vllm_block_ids
+            elif not existing_vllm_block_ids:
+                req_meta.group_vllm_block_ids[gid] = incoming_vllm_block_ids
+            elif incoming_vllm_block_ids:
+                # update_state_after_alloc() usually gives us the full block
+                # table before build_connector_meta(). If that happened, the
+                # scheduler's "new" block ids are already the suffix of the
+                # full table and must not be appended again. If the connector is
+                # used with an older scheduler path that did not call
+                # update_state_after_alloc(), append as a fallback.
+                suffix_len = len(incoming_vllm_block_ids)
+                if existing_vllm_block_ids[-suffix_len:] != incoming_vllm_block_ids:
+                    existing_vllm_block_ids.extend(incoming_vllm_block_ids)
             logger.info(
                 "HMA dispatch group blocks: "
                 f"request_id={request_id}, group_id={gid}, "
                 f"is_full_attention={groups_by_id[gid].is_full_attention}, "
+                f"is_mamba_align={groups_by_id[gid].is_mamba_align}, "
                 f"block_size={groups_by_id[gid].block_size}, "
                 f"sliding_window={groups_by_id[gid].sliding_window}, "
-                f"new_vllm={_short_list(new_vllm_block_ids_per_group[gid])}, "
+                f"incoming_are_full={incoming_block_ids_are_full}, "
+                f"incoming_vllm={_short_list(incoming_vllm_block_ids)}, "
                 f"all_vllm_tail={_short_list(req_meta.group_vllm_block_ids[gid][-12:])}"
             )
 
@@ -2104,6 +2145,45 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 dst_ucm_block_ids.append(ucm_block_id)
                 dst_vllm_block_ids.append(vllm_block_id)
 
+        def append_mamba_align_state_block(
+            dst_ucm_block_ids: list[bytes],
+            dst_vllm_block_ids: list[int],
+            gid: int,
+            seq_len: int,
+            reason: str,
+        ) -> None:
+            group = groups_by_id[gid]
+            state_idx = max((seq_len - 1) // group.block_size, 0)
+            # Keep this mapping aligned with
+            # vllm.v1.attention.backends.utils.mamba_get_block_table_tensor:
+            # align mode gathers block_table[:, state_idx + offsets], where
+            # offset 0 is the actual non-spec state block used by linear
+            # attention. For UCM load/dump we only transfer that non-spec state.
+            try:
+                ucm_block_id = req_meta.group_ucm_block_ids[gid][state_idx]
+                vllm_block_id = req_meta.group_vllm_block_ids[gid][state_idx]
+            except IndexError:
+                logger.error(
+                    "HMA mamba-align state block missing: "
+                    f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                    f"seq_len={seq_len}, state_idx={state_idx}, "
+                    f"num_ucm_blocks={len(req_meta.group_ucm_block_ids[gid])}, "
+                    f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
+                )
+                return
+            logger.info(
+                "HMA mamba-align state block: "
+                f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                f"seq_len={seq_len}, state_idx={state_idx}, "
+                f"ucm={ucm_block_id.hex()}, vllm={vllm_block_id}"
+            )
+            extend_non_null(
+                dst_ucm_block_ids,
+                dst_vllm_block_ids,
+                [ucm_block_id],
+                [vllm_block_id],
+            )
+
         external_hit_lcm_blocks = (
             req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
         )
@@ -2112,6 +2192,15 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
 
         if need_load and external_hit_lcm_blocks > 0:
             for gid, group in enumerate(groups_by_id):
+                if group.is_mamba_align:
+                    append_mamba_align_state_block(
+                        load_ucm_block_ids,
+                        load_vllm_block_ids,
+                        gid,
+                        total_hit_tokens,
+                        "load",
+                    )
+                    continue
                 if group.is_full_attention:
                     load_tok_start = hbm_hit_tokens
                 else:
@@ -2179,6 +2268,18 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     # extend the lists without dedup.
                     if first_lcm_b > last_lcm_b:
                         continue
+                    if group.is_mamba_align:
+                        b = first_lcm_b
+                        while b <= last_lcm_b:
+                            append_mamba_align_state_block(
+                                dump_ucm_block_ids,
+                                dump_vllm_block_ids,
+                                gid,
+                                b,
+                                "dump",
+                            )
+                            b += lcm_block_size
+                        continue
                     tail_count = max(1, group.sliding_window // group.block_size)
                     b = first_lcm_b
                     while b <= last_lcm_b:
@@ -2239,6 +2340,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 scheduler_output.num_scheduled_tokens[request_id],
                 request.block_ids,
                 request_id=request_id,
+                incoming_block_ids_are_full=True,
             )
 
         # Same three situations as the parent: chunked prefill (dump only),
@@ -2268,6 +2370,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     new_block_ids,
                     resumed_from_preemption,
                     request_id=request_id,
+                    incoming_block_ids_are_full=resumed_from_preemption,
                 )
         else:
             for request in scheduled_cached_reqs:
@@ -2282,6 +2385,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     request.new_block_ids,
                     request.resumed_from_preemption,
                     request_id=request_id,
+                    incoming_block_ids_are_full=request.resumed_from_preemption,
                 )
 
         for request_id in scheduler_output.finished_req_ids:
