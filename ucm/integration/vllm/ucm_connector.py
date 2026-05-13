@@ -1641,6 +1641,80 @@ class AscendDSV4Layout(HMAKVCacheLayout):
         )
 
 
+class AscendHybridKVCacheLayout(HMAKVCacheLayout):
+    """KV cache layout for Ascend hybrid attention+mamba models (align mode).
+
+    On Ascend, all layers sharing a ``KVCacheTensor`` use the same physical
+    block pool.  The per-block memory layout is:
+
+        [conv_or_padding | k_or_ssm | v_or_padding]   (total = page_size_padded)
+
+    The mamba layer's tensor pointer sits at physical offset 0 (the start of
+    the conv/padding region).  Using that pointer as ``base_ptr`` together
+    with ``page_size_padded`` as the per-block stride lets the store read or
+    write the complete physical block in a single dispatch — covering all four
+    layer groups (1 attention + 3 mamba) simultaneously.
+    """
+
+    def _build_layout(self, kvcaches):
+        base_ptrs = []
+        tensor_size_lists = []
+
+        for raw_tensor in self.kv_cache_config.kv_cache_tensors:
+            if not raw_tensor.shared_by:
+                continue
+
+            # Find the first mamba layer in this shared tensor.  Its kv_layer
+            # data_ptr() is at block offset 0 (conv/padding start), which is
+            # exactly the address the store must use as the dispatch base.
+            sample_name = None
+            for name in raw_tensor.shared_by:
+                specs = self.layer_name_to_kv_cache_spec.get(name, [])
+                if specs and isinstance(specs[0], MambaSpec):
+                    sample_name = name
+                    break
+            if sample_name is None:
+                # No mamba layer found — fall back to the first listed layer.
+                sample_name = raw_tensor.shared_by[0]
+
+            kv_layer = kvcaches.get(sample_name)
+            if kv_layer is None:
+                logger.warning(
+                    f"[AscendHybrid] kv_layer {sample_name!r} not found in kvcaches"
+                )
+                continue
+
+            spec = self.layer_name_to_kv_cache_spec[sample_name][0]
+            page_size_padded = getattr(spec, "page_size_padded", None)
+            if page_size_padded is None:
+                logger.warning(
+                    f"[AscendHybrid] {sample_name!r} spec has no page_size_padded; "
+                    "skipping tensor"
+                )
+                continue
+
+            if isinstance(kv_layer, (tuple, list)):
+                base_ptr = kv_layer[0].data_ptr()
+            elif isinstance(kv_layer, torch.Tensor):
+                base_ptr = kv_layer.data_ptr()
+            else:
+                logger.warning(
+                    f"[AscendHybrid] unsupported kv_layer type {type(kv_layer)!r}"
+                )
+                continue
+
+            base_ptrs.append([base_ptr])
+            tensor_size_lists.append([page_size_padded])
+
+        self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
+        self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
+        logger.info(
+            "[AscendHybrid] Layout built: "
+            f"base_ptrs shape={self.base_ptrs.shape}, "
+            f"tensor_size_lists shape={self.tensor_size_lists.shape}"
+        )
+
+
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
     def __init__(
         self,
@@ -1992,6 +2066,277 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         return False, None
 
 
+class UCMAscendHybridConnector(UCMHMAConnector):
+    """Connector for Ascend hybrid attention+mamba models (qwen3-next series).
+
+    Architecture summary
+    --------------------
+    * 4 KV-cache groups: group 0 = FullAttention, groups 1-3 = MambaSpec
+      with ``mamba_cache_mode='align'``.
+    * Every set of 4 consecutive layers (e.g. layers 0-3, 4-7, …) shares one
+      ``KVCacheTensor``.  All four groups therefore share the same physical
+      block pool, and ``block_ids[0][i] == block_ids[k][i]`` for k=1,2,3.
+    * Physical block layout: ``[conv_or_padding | k_or_ssm | v_or_padding]``
+      with total size = ``page_size_padded`` bytes.
+    * Mamba block IDs may carry leading zeros (null/unallocated padding
+      slots) that must be filtered before dispatch.
+
+    Store strategy
+    --------------
+    * UCM store keys are derived **only** from the full-attention group
+      (group 0).  A single store entry covers the entire physical block
+      (all four layers), so there is no need to store under mamba group
+      hashes.
+    * Each physical block is dispatched **once** — not once per group.
+      This is achieved by using only group-0 block IDs in the dispatch
+      lists and by sizing ``AscendHybridKVCacheLayout`` to cover the full
+      ``page_size_padded`` bytes per block.
+    * Physical addresses are computed from a mamba layer's ``data_ptr()``
+      (at block offset 0 = conv/padding start) with ``page_size_padded``
+      as the stride.  If a mamba block ID is zero (null block), the
+      corresponding attention block ID is used as fallback (they share
+      the same physical pool on Ascend align mode).
+    """
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        self.kv_caches = kv_caches
+        self.kv_cache_layout = AscendHybridKVCacheLayout(
+            self.kv_caches,
+            self.launch_config,
+            self._vllm_config,
+            self._kv_cache_config,
+        )
+        self.store = self._create_store(self.kv_cache_layout)
+        self.block_data_size = self.kv_cache_layout.block_size
+        self.device = create_device()
+        logger.info("UCMAscendHybridConnector: kv caches registered.")
+
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        """Lookup using only the primary full-attention group (group 0).
+
+        On Ascend hybrid all groups share physical blocks.  Data is stored
+        under attention-group hashes; mamba-group hashes are never stored.
+        Running lookup on all groups would always return 0 for mamba groups
+        and collapse the min to zero, so we query only group 0.
+        """
+        assert self.group_manager is not None, (
+            "get_num_new_matched_tokens must be called on the scheduler side."
+        )
+
+        lcm_block_size = self.group_manager.lcm_block_size
+        assert num_computed_tokens % lcm_block_size == 0, (
+            f"num_computed_tokens={num_computed_tokens} not aligned to "
+            f"lcm_block_size={lcm_block_size}"
+        )
+        hbm_hit_block_num = num_computed_tokens // lcm_block_size
+
+        if self.persist_token_threshold > request.num_tokens:
+            logger.info_once(
+                f"Skip persistence: req {request.request_id}, "
+                f"input tokens ({request.num_tokens}) < threshold "
+                f"({self.persist_token_threshold})."
+            )
+            return 0, False
+
+        # Compute hashes for every group (the dump path will reuse them) but
+        # only query the store with the primary full-attention group's hashes.
+        group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(
+            request.all_token_ids
+        )
+        primary_fa = self.group_manager.full_attn_groups[0]
+        fa_gid = primary_fa.group_id
+        primary_block_ids = group_ucm_block_ids[fa_gid]
+
+        fa_external = primary_block_ids[hbm_hit_block_num:]
+        fa_hit_blocks = 0
+        if fa_external:
+            try:
+                fa_hit_blocks = max(self.store.lookup_on_prefix(fa_external) + 1, 0)
+            except Exception as e:
+                logger.error(
+                    f"request {request.request_id} lookup error. "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        # Align hit count to lcm_block_size boundary.
+        external_hit_tokens = (
+            (fa_hit_blocks * primary_fa.block_size) // lcm_block_size
+        ) * lcm_block_size
+        external_hit_lcm_blocks = external_hit_tokens // lcm_block_size
+
+        total_hit_block_num = hbm_hit_block_num + external_hit_lcm_blocks
+
+        if (
+            self.enable_record_traces
+            and request.request_id not in self.requests_meta
+            and primary_block_ids
+        ):
+            logger.info_once(
+                f"timestamp: {time.perf_counter()}, "
+                f"input_length: {request.num_tokens}, "
+                f"output_length: {request.max_tokens}, "
+                f"ucm_block_ids: {[b.hex() for b in primary_block_ids]}"
+            )
+
+        logger.info_once(
+            f"[AscendHybrid] request_id: {request.request_id}, "
+            f"total_lcm_blocks: {request.num_tokens // lcm_block_size}, "
+            f"hit hbm: {hbm_hit_block_num}, "
+            f"hit external (fa group only): {external_hit_lcm_blocks}"
+        )
+
+        if self.metrics_config and primary_block_ids:
+            ucmmetrics.update_stats(
+                {
+                    "interval_lookup_hit_rates": external_hit_lcm_blocks
+                    * lcm_block_size
+                    / (len(primary_block_ids) * primary_fa.block_size)
+                }
+            )
+
+        num_total_hit_tokens = total_hit_block_num * lcm_block_size
+        if num_total_hit_tokens == request.num_tokens and external_hit_tokens > 0:
+            external_hit_tokens -= 1
+
+        self.requests_meta[request.request_id] = HMARequestMeta(
+            ucm_block_ids=primary_block_ids,
+            hbm_hit_block_num=hbm_hit_block_num,
+            total_hit_block_num=total_hit_block_num,
+            num_token_ids=len(request.all_token_ids),
+            token_processed=num_total_hit_tokens,
+            group_ucm_block_ids=group_ucm_block_ids,
+            group_vllm_block_ids=[[] for _ in range(self.group_manager.num_groups)],
+        )
+        return external_hit_tokens, False
+
+    def _generate_hma_dispatch_meta(
+        self,
+        req_meta: "HMARequestMeta",
+        new_tokens: int,
+        new_vllm_block_ids_per_group: tuple[list[int], ...],
+        need_load: bool = True,
+    ) -> RequestDispatchMeta:
+        """Ascend hybrid dispatch: one physical-block dispatch per LCM block.
+
+        All 4 groups share the same physical block pool on Ascend.  UCM store
+        keys come from the full-attention group (gid 0).  Physical addresses
+        are resolved by preferring the mamba group's (gid 1) block IDs —
+        since a mamba layer's data_ptr() sits at physical block offset 0
+        (conv/padding start) which is where ``AscendHybridKVCacheLayout``
+        anchors its base pointer.
+
+        Mamba block IDs may carry leading zeros (padding / null slots from
+        the allocator).  For any position where the mamba ID is zero, we
+        fall back to the attention group ID (they share the same physical
+        pool under mamba_cache_mode='align').
+
+        A single dispatch entry covers the full ``page_size_padded`` bytes
+        across all 12 shared tensors, so there is no need to add separate
+        entries for each of the 4 KV-cache groups.
+        """
+        assert self.group_manager is not None
+        num_groups = self.group_manager.num_groups
+        lcm_block_size = self.group_manager.lcm_block_size
+        primary_fa = self.group_manager.full_attn_groups[0]
+        fa_gid = primary_fa.group_id
+
+        # Mamba group gid: first non-full-attention group (gid 1 for this model).
+        mamba_gid = next(
+            (g.group_id for g in self.group_manager.groups_by_id
+             if not g.is_full_attention),
+            fa_gid,
+        )
+
+        assert len(new_vllm_block_ids_per_group) == num_groups, (
+            f"new_vllm_block_ids_per_group length "
+            f"{len(new_vllm_block_ids_per_group)} != num_groups {num_groups}"
+        )
+        # Accumulate per-group physical block IDs for later address resolution.
+        for gid in range(num_groups):
+            req_meta.group_vllm_block_ids[gid].extend(
+                new_vllm_block_ids_per_group[gid]
+            )
+
+        fa_ucm_ids = req_meta.group_ucm_block_ids[fa_gid]
+        mamba_vllm = req_meta.group_vllm_block_ids[mamba_gid]
+        fa_vllm = req_meta.group_vllm_block_ids[fa_gid]
+
+        def _resolve_vllm_id(blk_idx: int) -> Optional[int]:
+            """Return the physical block ID at position blk_idx.
+
+            Prefers the mamba group ID (block offset 0); falls back to the
+            attention group ID when the mamba slot is zero (null padding).
+            Returns None when neither is available or both are zero.
+            """
+            mid = mamba_vllm[blk_idx] if blk_idx < len(mamba_vllm) else 0
+            if mid != 0:
+                return mid
+            fid = fa_vllm[blk_idx] if blk_idx < len(fa_vllm) else 0
+            return fid if fid != 0 else None
+
+        external_hit_lcm_blocks = (
+            req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
+        )
+        hbm_hit_tokens = req_meta.hbm_hit_block_num * lcm_block_size
+        total_hit_tokens = req_meta.total_hit_block_num * lcm_block_size
+
+        load_ucm_block_ids: list[bytes] = []
+        load_vllm_block_ids: list[int] = []
+
+        if need_load and external_hit_lcm_blocks > 0:
+            # Load blocks in the range [hbm_hit_tokens, total_hit_tokens).
+            # Use full-attention group hashes as store keys; physical addresses
+            # are resolved via _resolve_vllm_id (mamba-first with fa fallback).
+            start_blk = hbm_hit_tokens // primary_fa.block_size
+            end_blk = total_hit_tokens // primary_fa.block_size
+            for i in range(start_blk, end_blk):
+                if i >= len(fa_ucm_ids):
+                    break
+                vllm_id = _resolve_vllm_id(i)
+                if vllm_id is not None:
+                    load_ucm_block_ids.append(fa_ucm_ids[i])
+                    load_vllm_block_ids.append(vllm_id)
+
+        dump_ucm_block_ids: list[bytes] = []
+        dump_vllm_block_ids: list[int] = []
+
+        if req_meta.token_processed < req_meta.num_token_ids:
+            dump_tok_start = req_meta.token_processed
+            dump_tok_end = min(
+                req_meta.token_processed + new_tokens, req_meta.num_token_ids
+            )
+            # Dump every newly completed block so the prefix-hash chain in the
+            # store remains gapless (lookup_on_prefix requires all prefix blocks
+            # to be present).  Only the full-attention group hash is stored.
+            start_blk = dump_tok_start // primary_fa.block_size
+            end_blk = dump_tok_end // primary_fa.block_size
+            for i in range(start_blk, end_blk):
+                if i >= len(fa_ucm_ids):
+                    break
+                vllm_id = _resolve_vllm_id(i)
+                if vllm_id is not None:
+                    dump_ucm_block_ids.append(fa_ucm_ids[i])
+                    dump_vllm_block_ids.append(vllm_id)
+            req_meta.token_processed += new_tokens
+
+        return RequestDispatchMeta(
+            (load_ucm_block_ids, load_vllm_block_ids),
+            (dump_ucm_block_ids, dump_vllm_block_ids),
+        )
+
+    # build_connector_meta is inherited from UCMHMAConnector; it calls
+    # _generate_hma_dispatch_meta which is overridden above.
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return False, None
+
+
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -2044,6 +2389,18 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             or os.getenv("USE_MULTI_GROUPS_KV_CACHE") == "1"
         )
 
+        # Ascend hybrid: NPU platform + at least one mamba group with
+        # mamba_cache_mode='align' (shared physical tensors, aligned page sizes).
+        use_ascend_hybrid = (
+            use_hma
+            and current_platform.device_type == "npu"
+            and any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and getattr(g.kv_cache_spec, "mamba_cache_mode", None) == "align"
+                for g in kv_cache_config.kv_cache_groups
+            )
+        )
+
         if use_lite:
             self.connector = UCMLiteConnector(vllm_config, role)
         elif use_ratio_rate:
@@ -2052,6 +2409,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMCPConnector(vllm_config, role)
         elif use_layerwise:
             self.connector = UCMLayerWiseConnector(vllm_config, role)
+        elif use_ascend_hybrid:
+            self.connector = UCMAscendHybridConnector(vllm_config, role, kv_cache_config)
         elif use_hma:
             self.connector = UCMHMAConnector(vllm_config, role, kv_cache_config)
         else:
