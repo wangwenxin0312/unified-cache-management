@@ -2206,19 +2206,27 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             nonlocal skipped_null_blocks
             group = groups_by_id[gid]
             state_idx = max((seq_len - 1) // group.block_size, 0)
-            # Keep this mapping aligned with
-            # vllm.v1.attention.backends.utils.mamba_get_block_table_tensor:
-            # align mode gathers block_table[:, state_idx + offsets], where
-            # offset 0 is the actual non-spec state block used by linear
-            # attention. For UCM load/dump we only transfer that non-spec state.
+            vllm_state_idx = state_idx
+            if reason == "load":
+                # For resumed mamba-align requests, vLLM keeps the cached
+                # prefix state at ``state_idx`` and allocates a fresh running
+                # state block at the tail of the block table. UCM must read
+                # the prefix hash but write into that current running block.
+                block_ids = req_meta.group_vllm_block_ids[gid]
+                for i in range(len(block_ids) - 1, -1, -1):
+                    if block_ids[i] != 0:
+                        vllm_state_idx = i
+                        break
+
             try:
                 ucm_block_id = req_meta.group_ucm_block_ids[gid][state_idx]
-                vllm_block_id = req_meta.group_vllm_block_ids[gid][state_idx]
+                vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
             except IndexError:
                 logger.error(
                     "HMA mamba-align state block missing: "
                     f"request_id={request_id}, group_id={gid}, reason={reason}, "
                     f"seq_len={seq_len}, state_idx={state_idx}, "
+                    f"vllm_state_idx={vllm_state_idx}, "
                     f"num_ucm_blocks={len(req_meta.group_ucm_block_ids[gid])}, "
                     f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
                 )
@@ -2230,6 +2238,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 "HMA mamba-align state block: "
                 f"request_id={request_id}, group_id={gid}, reason={reason}, "
                 f"seq_len={seq_len}, state_idx={state_idx}, "
+                f"vllm_state_idx={vllm_state_idx}, "
                 f"ucm={ucm_block_id.hex()}, vllm={vllm_block_id}"
             )
             dst_ucm_block_ids.append(ucm_block_id)
