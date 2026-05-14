@@ -2894,8 +2894,6 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMLiteConnector(vllm_config, role)
         elif use_ratio_rate:
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
-        elif use_cp_parallel:
-            self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
         elif use_layerwise and use_hybrid_linear_attention:
             self.connector = UCMHybridLinearAttentionLayerWiseConnector(
                 vllm_config, role, kv_cache_config
@@ -2904,6 +2902,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMHybridLinearAttentionConnector(
                 vllm_config, role, kv_cache_config
             )
+        elif use_cp_parallel:
+            self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
         elif use_layerwise:
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         elif use_hma:
