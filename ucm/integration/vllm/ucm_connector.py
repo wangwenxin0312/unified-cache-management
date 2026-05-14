@@ -1894,10 +1894,10 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         shared_specs: list[KVCacheSpec] = []
         shared_ptrs: list[int] = []
         for layer_name in raw_tensor.shared_by:
+            shared_specs.extend(self.layer_name_to_kv_cache_spec[layer_name])
             kv_layer = kvcaches.get(layer_name)
             if kv_layer is None:
                 continue
-            shared_specs.extend(self.layer_name_to_kv_cache_spec[layer_name])
             if isinstance(kv_layer, torch.Tensor):
                 shared_ptrs.append(kv_layer.data_ptr())
             elif isinstance(kv_layer, (tuple, list)):
@@ -2388,6 +2388,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             group = groups_by_id[gid]
             state_idx = max((seq_len - 1) // group.block_size, 0)
             vllm_state_idx = state_idx
+            fallback_vllm_block_id: int | None = None
             if reason in ("load", "dump"):
                 # Mamba-align block tables use ``block_id=0`` for consumed or
                 # pre-allocated-but-inactive slots; only the last non-zero entry
@@ -2414,6 +2415,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     for i in range(len(attn_block_ids) - 1, -1, -1):
                         if attn_block_ids[i] != 0:
                             vllm_state_idx = i
+                            fallback_vllm_block_id = attn_block_ids[i]
                             break
                     logger.info(
                         "[hybrid_layerwise][mamba_block_fallback] req=%s gid=%d "
@@ -2421,22 +2423,23 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                         "using attn block at idx=%d (block=%d)",
                         request_id[:8], gid, reason, seq_len,
                         vllm_state_idx,
-                        req_meta.group_vllm_block_ids[primary_gid][vllm_state_idx]
-                        if vllm_state_idx < len(req_meta.group_vllm_block_ids[primary_gid])
-                        else -1,
+                        fallback_vllm_block_id if fallback_vllm_block_id else -1,
                     )
 
-            try:
-                vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
-            except IndexError:
-                logger.error(
-                    "HMA mamba-align state vLLM block missing: "
-                    f"request_id={request_id}, group_id={gid}, reason={reason}, "
-                    f"seq_len={seq_len}, state_idx={state_idx}, "
-                    f"vllm_state_idx={vllm_state_idx}, "
-                    f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
-                )
-                return
+            if fallback_vllm_block_id is not None:
+                vllm_block_id = fallback_vllm_block_id
+            else:
+                try:
+                    vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
+                except IndexError:
+                    logger.error(
+                        "HMA mamba-align state vLLM block missing: "
+                        f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                        f"seq_len={seq_len}, state_idx={state_idx}, "
+                        f"vllm_state_idx={vllm_state_idx}, "
+                        f"num_vllm_blocks={len(req_meta.group_vllm_block_ids[gid])}"
+                    )
+                    return
             if vllm_block_id == 0:
                 logger.warning(
                     "[hybrid_layerwise][mamba_vllm_zero] req=%s gid=%d "
@@ -2471,7 +2474,7 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     f"seq_len={seq_len}, state_idx={state_idx}"
                 )
                 return
-            logger.debug(
+            logger.info(
                 "[hybrid_layerwise][mamba_state] req=%s gid=%d reason=%s "
                 "seq_len=%d state_idx=%d vllm_state_idx=%d "
                 "vllm_block=%d ucm_hash=%s",
@@ -2749,6 +2752,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self.submitted_rows: set[int] = set()
         # layer_name -> Task for pending async dumps
         self.dump_tasks: dict[str, "Task"] = {}
+        self.submitted_dump_layers: set[str] = set()
         self.is_save = False
         self.need_load = False
         self._failure_req_ids: set[str] = set()
@@ -2854,6 +2858,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         metadata = self._get_connector_metadata()
         self.load_tasks.clear()
         self.submitted_rows.clear()
+        self.submitted_dump_layers.clear()
         self._failure_req_ids.clear()
         self.need_load = False
         # Pre-submit row 0; subsequent rows are submitted in wait_for_layer_load.
@@ -2937,6 +2942,22 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             )
             return
 
+        if layer_name in self.submitted_dump_layers:
+            return
+        self.submitted_dump_layers.add(layer_name)
+
+        # Ascend hybrid pages are shared by one full-attention layer and the
+        # preceding linear-attention layers. The full-attention hook is always
+        # present, so use it as a row-level flush point for any linear hook that
+        # did not run in this environment.
+        group_spec = self._kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+        if sliding_window_from_kv_cache_spec(group_spec) is None:
+            for target_layer in layout._row_id_to_layer_names.get(row_id, []):
+                if target_layer != layer_name:
+                    self.save_kv_layer(
+                        target_layer, kv_layer, attn_metadata, **kwargs
+                    )
+
         total_ucm_ids: list[bytes] = []
         total_vllm_ids: list[int] = []
         ptrs_rows: list[np.ndarray] = []
@@ -2947,7 +2968,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             )
             ucm_ids, vllm_ids = request.group_dump_block_ids[gid]
             if not ucm_ids:
-                logger.debug(
+                logger.info(
                     "[hybrid_layerwise][dump_empty_gid] req=%s layer=%s "
                     "gid=%d group_vllm_block_ids=%s",
                     request_id[:8], layer_name, gid,
@@ -2958,7 +2979,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             # Mirror UCMLayerWiseConnector: hash only for non-rank-0 non-MLA.
             if self.tp_rank % self.tp_size != 0 and not self.is_mla:
                 ucm_ids = [self.request_hasher(uid) for uid in ucm_ids]
-            logger.debug(
+            logger.info(
                 "[hybrid_layerwise][dump_req] req=%s layer=%s gid=%d row=%d "
                 "n_blocks=%d ucm[0]=%s vllm=%s",
                 request_id[:8], layer_name, gid, row_id,
@@ -3010,6 +3031,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 [l.split(".")[-2] + "." + l.split(".")[-1] for l in done_layers[:6]],
             )
             self.dump_tasks.clear()
+            self.submitted_dump_layers.clear()
             self.is_save = False
             if self.enable_event_sync:
                 self.device.destroy_event_handles()
