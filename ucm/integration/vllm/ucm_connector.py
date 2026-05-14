@@ -183,10 +183,23 @@ class KVCacheLayout:
                     raise ValueError(
                         f"Unsupported kv cache tensor shape: {kv_layer.shape}"
                     )
-            elif isinstance(kv_layer, Tuple):
-                # vllm_ascend >= 0.10.0, ([num_blocks, block_size, num_head, head_dim], ...)
+            elif isinstance(kv_layer, (tuple, list)):
+                # vllm_ascend >= 0.10.0 may register split cache tensors as
+                # tuple/list, e.g. attention (k, v) or linear_attn state
+                # tensors [(num_blocks, 3, 2048), (num_blocks, 8, 128, 128)].
                 for tensor in kv_layer:
-                    handle_tensor(tensor, (-3, -2, -1))
+                    if not isinstance(tensor, torch.Tensor):
+                        raise TypeError(
+                            f"Unsupported kv cache item type for {layer_name}: "
+                            f"{type(tensor)}"
+                        )
+                    if tensor.dim() in (3, 4):
+                        handle_tensor(tensor, tuple(range(1, tensor.dim())))
+                    else:
+                        raise ValueError(
+                            f"Unsupported kv cache tensor shape for "
+                            f"{layer_name}: {tensor.shape}"
+                        )
             else:
                 raise TypeError(f"Unsupported kv cache type: {type(kv_layer)}")
 
@@ -2551,8 +2564,6 @@ def use_hybrid_linear_attention_layout(
     kv_cache_config: "KVCacheConfig",
 ) -> bool:
     if kv_cache_config is None:
-        return False
-    if current_platform.device_type != "npu" and not current_platform.is_cuda_alike():
         return False
 
     layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
