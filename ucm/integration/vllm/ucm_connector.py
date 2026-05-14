@@ -2557,16 +2557,21 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     # consecutive boundaries' tails do not overlap and we can
                     # extend the lists without dedup.
                     if group.is_mamba_align:
-                        b = first_lcm_b
-                        while b <= last_lcm_b:
+                        # Mamba-align stores one recurrent state page per
+                        # layer, representing the current forward prefix. It
+                        # cannot provide historical states for every LCM
+                        # boundary crossed by a long prefill step, so only dump
+                        # the state for the prefix that just finished. Earlier
+                        # boundary states must have been dumped by earlier
+                        # chunked-prefill steps.
+                        if dump_tok_end == last_lcm_b:
                             append_mamba_align_state_block(
                                 g_ucm,
                                 g_vllm,
                                 gid,
-                                b,
+                                dump_tok_end,
                                 "dump",
                             )
-                            b += lcm_block_size
                     else:
                         tail_count = max(1, group.sliding_window // group.block_size)
                         b = first_lcm_b
