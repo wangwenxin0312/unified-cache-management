@@ -2074,12 +2074,17 @@ class HybridLinearAttentionLayerWiseLayout(HybridLinearAttentionLayout):
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             if not raw_tensor.shared_by:
                 continue
-            layers_in_stage = [
-                name for name in raw_tensor.shared_by if name in kvcaches
-            ]
-            if not layers_in_stage:
+            # A row exists when at least one layer from the shared tensor is
+            # registered in kvcaches (i.e. physically present in this PP stage).
+            # On Ascend, only attention layers appear in kvcaches — mamba/
+            # linear_attn layers are excluded by the model runner.  We still
+            # need to map mamba layers to the same row so save_kv_layer /
+            # wait_for_layer_load can look up their physical addresses via the
+            # shared tensor's base_ptrs and strides.
+            has_kvcache_layer = any(name in kvcaches for name in raw_tensor.shared_by)
+            if not has_kvcache_layer:
                 continue
-            for layer_name in layers_in_stage:
+            for layer_name in raw_tensor.shared_by:
                 self._layer_name_to_row_id[layer_name] = row_idx
                 self._row_id_to_layer_names[row_idx].append(layer_name)
             row_idx += 1
@@ -2394,6 +2399,32 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     if block_ids[i] != 0:
                         vllm_state_idx = i
                         break
+                else:
+                    # On Ascend the model runner does not register mamba/
+                    # linear_attn layers in kvcaches, so the scheduler receives
+                    # empty or all-zero block tables for mamba groups.  In
+                    # mamba_cache_mode='align', each mamba state is stored at
+                    # the same physical block as the corresponding attention KV
+                    # block (they share the raw tensor; different components are
+                    # used: conv→comp0, SSM→comp1 vs K→comp1, V→comp2).
+                    # Fall back to the primary full-attention group's block at
+                    # state_idx so the correct physical address is resolved.
+                    primary_gid = self.group_manager.full_attn_groups[0].group_id
+                    attn_block_ids = req_meta.group_vllm_block_ids[primary_gid]
+                    for i in range(len(attn_block_ids) - 1, -1, -1):
+                        if attn_block_ids[i] != 0:
+                            vllm_state_idx = i
+                            break
+                    logger.info(
+                        "[hybrid_layerwise][mamba_block_fallback] req=%s gid=%d "
+                        "reason=%s seq_len=%d: mamba block_table all-zero, "
+                        "using attn block at idx=%d (block=%d)",
+                        request_id[:8], gid, reason, seq_len,
+                        vllm_state_idx,
+                        req_meta.group_vllm_block_ids[primary_gid][vllm_state_idx]
+                        if vllm_state_idx < len(req_meta.group_vllm_block_ids[primary_gid])
+                        else -1,
+                    )
 
             try:
                 vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
@@ -2407,6 +2438,15 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 )
                 return
             if vllm_block_id == 0:
+                logger.warning(
+                    "[hybrid_layerwise][mamba_vllm_zero] req=%s gid=%d "
+                    "reason=%s seq_len=%d state_idx=%d vllm_state_idx=%d "
+                    "block_table_len=%d block_table=%s",
+                    request_id[:8], gid, reason, seq_len,
+                    state_idx, vllm_state_idx,
+                    len(req_meta.group_vllm_block_ids[gid]),
+                    req_meta.group_vllm_block_ids[gid],
+                )
                 return
             if group.is_mamba_align:
                 ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
@@ -2882,9 +2922,19 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         layout = self._get_layerwise_layout()
         row_id = layout._layer_name_to_row_id.get(layer_name)
         if row_id is None:
+            logger.warning(
+                "[hybrid_layerwise][save_kv_no_row] layer=%s not in "
+                "_layer_name_to_row_id — dump skipped",
+                layer_name,
+            )
             return
         gid = self._layer_to_group_id.get(layer_name)
         if gid is None:
+            logger.warning(
+                "[hybrid_layerwise][save_kv_no_gid] layer=%s not in "
+                "_layer_to_group_id — dump skipped",
+                layer_name,
+            )
             return
 
         total_ucm_ids: list[bytes] = []
@@ -2897,6 +2947,12 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             )
             ucm_ids, vllm_ids = request.group_dump_block_ids[gid]
             if not ucm_ids:
+                logger.debug(
+                    "[hybrid_layerwise][dump_empty_gid] req=%s layer=%s "
+                    "gid=%d group_vllm_block_ids=%s",
+                    request_id[:8], layer_name, gid,
+                    request.group_dump_block_ids[gid],
+                )
                 continue
             self.is_save = True
             # Mirror UCMLayerWiseConnector: hash only for non-rank-0 non-MLA.
