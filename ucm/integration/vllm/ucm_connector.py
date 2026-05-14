@@ -1,4 +1,5 @@
 import copy
+import functools
 import hashlib
 import math
 import os
@@ -124,6 +125,27 @@ class RequestDispatchMeta:
         list[bytes], list[int]
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
+
+
+@dataclass
+class HybridLayerWiseDispatchMeta(RequestDispatchMeta):
+    """Extends RequestDispatchMeta with per-group block ID lists.
+
+    Allows layerwise hybrid connectors to look up each individual layer's
+    blocks without re-parsing the flat merged lists.
+
+    ``group_load_block_ids[gid]`` and ``group_dump_block_ids[gid]`` are
+    (ucm_ids, vllm_ids) tuples for group ``gid``.  For mamba-align groups
+    zero-padded vLLM block entries are already excluded here; only the real
+    state block (at most one per request) appears.
+    """
+
+    group_load_block_ids: list[tuple[list[bytes], list[int]]] = field(
+        default_factory=list
+    )
+    group_dump_block_ids: list[tuple[list[bytes], list[int]]] = field(
+        default_factory=list
+    )
 
 
 class KVCacheLayout:
@@ -2014,6 +2036,82 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
 
 
+class HybridLinearAttentionLayerWiseLayout(HybridLinearAttentionLayout):
+    """Per-layer extension of HybridLinearAttentionLayout for Ascend layerwise offload.
+
+    The parent class builds one row per shared raw tensor (e.g., 12 rows for a
+    48-layer Qwen3-Next model).  This subclass keeps that layout unchanged for
+    store configuration but adds two auxiliary structures built in
+    ``_build_layout``:
+
+    ``_layer_name_to_row_id`` : dict[str, int]
+        Maps each individual layer name to the index of the shared-tensor row
+        it belongs to.  Attention layers and the mamba-align layers that share
+        the same physical tensor all map to the same row.
+
+    ``_row_id_to_layer_names`` : dict[int, list[str]]
+        Inverse mapping: row index → list of layer names sharing that tensor.
+
+    ``extract_layer_block_addrs(layer_name, vllm_block_ids)`` uses these
+    mappings to return the correct ``(num_blocks, n_ptrs)`` address array for
+    a specific layer's physical blocks, which the layerwise connector then
+    passes directly to ``store.load_data`` / ``store.dump_data``.
+    """
+
+    def _build_layout(self, kvcaches):
+        # Delegate to parent to build the shared-tensor rows (12 rows × 3 ptrs
+        # for Ascend).  All store-configuration properties (tensor_size_list,
+        # shard_size, block_size) remain unchanged.
+        super()._build_layout(kvcaches)
+
+        # Build layer_name → row_id mapping by re-iterating kv_cache_tensors
+        # in the same order the parent's _build_layout processed them.
+        # A tensor adds a row iff shared_by is non-empty AND at least one
+        # layer in shared_by is present in kvcaches (same guard as parent).
+        self._layer_name_to_row_id: dict[str, int] = {}
+        self._row_id_to_layer_names: dict[int, list[str]] = defaultdict(list)
+        row_idx = 0
+        for raw_tensor in self.kv_cache_config.kv_cache_tensors:
+            if not raw_tensor.shared_by:
+                continue
+            layers_in_stage = [
+                name for name in raw_tensor.shared_by if name in kvcaches
+            ]
+            if not layers_in_stage:
+                continue
+            for layer_name in layers_in_stage:
+                self._layer_name_to_row_id[layer_name] = row_idx
+                self._row_id_to_layer_names[row_idx].append(layer_name)
+            row_idx += 1
+        self._num_rows: int = row_idx
+
+        logger.info(
+            f"HybridLinearAttentionLayerWiseLayout: "
+            f"base_ptrs={self.base_ptrs.shape}, "
+            f"num_rows={self._num_rows}"
+        )
+
+    def extract_layer_block_addrs(
+        self,
+        layer_name: str,
+        vllm_block_ids: list[int],
+    ) -> np.ndarray:
+        """Return ``(num_blocks, n_ptrs)`` physical-address array for one layer.
+
+        ``vllm_block_ids`` must already have zero (padding) entries removed.
+        The returned array uses the shared-tensor row for ``layer_name`` so the
+        caller can pass it directly to ``store.load_data`` / ``store.dump_data``
+        with ``shard_index = row_id``.
+        """
+        row = self._layer_name_to_row_id[layer_name]
+        vllm_arr = np.array(vllm_block_ids, dtype=np.uint64)
+        # shape: (num_blocks, n_ptrs)
+        return (
+            vllm_arr[:, None] * self.block_stride_lists[row][None, :]
+            + self.base_ptrs[row][None, :]
+        )
+
+
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
     def __init__(
         self,
@@ -2248,6 +2346,16 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         dump_ucm_block_ids: list[bytes] = []
         dump_vllm_block_ids: list[int] = []
 
+        # Per-group block IDs consumed by the layerwise hybrid connector.
+        # group_load_block_ids[gid] / group_dump_block_ids[gid] are
+        # (ucm_ids, vllm_ids) tuples with zero-padded entries already removed.
+        group_load_block_ids: list[tuple[list[bytes], list[int]]] = [
+            ([], []) for _ in range(num_groups)
+        ]
+        group_dump_block_ids: list[tuple[list[bytes], list[int]]] = [
+            ([], []) for _ in range(num_groups)
+        ]
+
         def extend_non_null(
             dst_ucm_block_ids: list[bytes],
             dst_vllm_block_ids: list[int],
@@ -2333,30 +2441,34 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
 
         if need_load and external_hit_lcm_blocks > 0:
             for gid, group in enumerate(groups_by_id):
+                g_ucm: list[bytes] = []
+                g_vllm: list[int] = []
                 if group.is_mamba_align:
                     append_mamba_align_state_block(
-                        load_ucm_block_ids,
-                        load_vllm_block_ids,
+                        g_ucm,
+                        g_vllm,
                         gid,
                         total_hit_tokens,
                         "load",
                     )
-                    continue
-                if group.is_full_attention:
-                    load_tok_start = hbm_hit_tokens
                 else:
-                    load_tok_start = total_hit_tokens - group.sliding_window
-                load_tok_end = total_hit_tokens
-                start_blk = load_tok_start // group.block_size
-                end_blk = load_tok_end // group.block_size
-                if start_blk >= end_blk:
-                    continue
-                extend_non_null(
-                    load_ucm_block_ids,
-                    load_vllm_block_ids,
-                    req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
-                    req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
-                )
+                    if group.is_full_attention:
+                        load_tok_start = hbm_hit_tokens
+                    else:
+                        load_tok_start = total_hit_tokens - group.sliding_window
+                    load_tok_end = total_hit_tokens
+                    start_blk = load_tok_start // group.block_size
+                    end_blk = load_tok_end // group.block_size
+                    if start_blk < end_blk:
+                        extend_non_null(
+                            g_ucm,
+                            g_vllm,
+                            req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
+                            req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                        )
+                group_load_block_ids[gid] = (g_ucm, g_vllm)
+                load_ucm_block_ids.extend(g_ucm)
+                load_vllm_block_ids.extend(g_vllm)
 
         if req_meta.token_processed < req_meta.num_token_ids:
             dump_tok_start = req_meta.token_processed
@@ -2371,58 +2483,62 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             last_lcm_b = (dump_tok_end // lcm_block_size) * lcm_block_size
 
             for gid, group in enumerate(groups_by_id):
+                g_ucm: list[bytes] = []
+                g_vllm: list[int] = []
                 if group.is_full_attention:
                     # Dump every newly completed block: ``lookup_on_prefix``
                     # walks the full prefix chain so any gap would truncate
                     # future hits.
                     start_blk = dump_tok_start // group.block_size
                     end_blk = dump_tok_end // group.block_size
-                    if start_blk >= end_blk:
-                        continue
-                    extend_non_null(
-                        dump_ucm_block_ids,
-                        dump_vllm_block_ids,
-                        req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
-                        req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
-                    )
-                else:
+                    if start_blk < end_blk:
+                        extend_non_null(
+                            g_ucm,
+                            g_vllm,
+                            req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
+                            req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                        )
+                elif first_lcm_b <= last_lcm_b:
                     # Dump only the tail blocks at each LCM boundary reached
                     # in this range. Since ``sliding_window <=
                     # lcm_block_size`` (validated in ``KVCacheGroupManager``),
                     # consecutive boundaries' tails do not overlap and we can
                     # extend the lists without dedup.
-                    if first_lcm_b > last_lcm_b:
-                        continue
                     if group.is_mamba_align:
                         b = first_lcm_b
                         while b <= last_lcm_b:
                             append_mamba_align_state_block(
-                                dump_ucm_block_ids,
-                                dump_vllm_block_ids,
+                                g_ucm,
+                                g_vllm,
                                 gid,
                                 b,
                                 "dump",
                             )
                             b += lcm_block_size
-                        continue
-                    tail_count = max(1, group.sliding_window // group.block_size)
-                    b = first_lcm_b
-                    while b <= last_lcm_b:
-                        end_blk = b // group.block_size
-                        start_blk = max(0, end_blk - tail_count)
-                        if start_blk < end_blk:
-                            extend_non_null(
-                                dump_ucm_block_ids,
-                                dump_vllm_block_ids,
-                                req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
-                                req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
-                            )
-                        b += lcm_block_size
+                    else:
+                        tail_count = max(1, group.sliding_window // group.block_size)
+                        b = first_lcm_b
+                        while b <= last_lcm_b:
+                            end_blk = b // group.block_size
+                            start_blk = max(0, end_blk - tail_count)
+                            if start_blk < end_blk:
+                                extend_non_null(
+                                    g_ucm,
+                                    g_vllm,
+                                    req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
+                                    req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
+                                )
+                            b += lcm_block_size
+                group_dump_block_ids[gid] = (g_ucm, g_vllm)
+                dump_ucm_block_ids.extend(g_ucm)
+                dump_vllm_block_ids.extend(g_vllm)
             req_meta.token_processed += new_tokens
 
-        return RequestDispatchMeta(
-            (load_ucm_block_ids, load_vllm_block_ids),
-            (dump_ucm_block_ids, dump_vllm_block_ids),
+        return HybridLayerWiseDispatchMeta(
+            load_block_ids=(load_ucm_block_ids, load_vllm_block_ids),
+            dump_block_ids=(dump_ucm_block_ids, dump_vllm_block_ids),
+            group_load_block_ids=group_load_block_ids,
+            group_dump_block_ids=group_dump_block_ids,
         )
 
     def build_connector_meta(
@@ -2546,6 +2662,251 @@ class UCMHybridLinearAttentionConnector(UCMHMAConnector):
         )
 
 
+class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnector):
+    """Layer-wise offload for Ascend hybrid (full-attention + mamba-align) models.
+
+    Pipelines IO and compute at shared-tensor-group granularity (one group = one
+    attention layer + its co-located mamba-align layers sharing a raw tensor):
+
+    * ``start_load_kv`` pre-submits load tasks for row 0.
+    * ``wait_for_layer_load(name)`` waits for that layer's row and
+      pre-submits the next row's load tasks before returning.
+    * ``save_kv_layer(name, ...)`` submits an async dump for that layer using
+      per-group (ucm_block_ids, vllm_block_ids) from
+      ``HybridLayerWiseDispatchMeta`` — zero-padded mamba-align entries are
+      already excluded from those lists.
+    * ``wait_for_save`` collects all outstanding dump tasks.
+
+    The physical-address lookup uses ``HybridLinearAttentionLayerWiseLayout``,
+    which maps every layer name to the shared-tensor row that holds its data.
+    Attention layers dump their KV blocks (with padding in conv component) and
+    mamba-align layers dump their state block (with padding in V component).
+    The 3-component layout keeps store configuration uniform across all rows.
+    """
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.use_layerwise = True
+        # layer_name -> {request_id: Task}
+        # Fine-grained so wait_for_layer_load(name) blocks only on that
+        # layer's own IO, not on every other layer sharing the same row.
+        self.load_tasks: dict[str, dict[str, "Task"]] = defaultdict(dict)
+        # rows for which load has been pre-submitted this step
+        self.submitted_rows: set[int] = set()
+        # layer_name -> Task for pending async dumps
+        self.dump_tasks: dict[str, "Task"] = {}
+        self.is_save = False
+        self.need_load = False
+        self._failure_req_ids: set[str] = set()
+        logger.info("Init UCMHybridLinearAttentionLayerWiseConnector.")
+
+    # ------------------------------------------------------------------ #
+    #  Layout factory                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _create_kv_cache_layout(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> KVCacheLayout:
+        return HybridLinearAttentionLayerWiseLayout(
+            kv_caches,
+            self.launch_config,
+            self._vllm_config,
+            self._kv_cache_config,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Layer → group mapping (cached, built from kv_cache_config)        #
+    # ------------------------------------------------------------------ #
+
+    @functools.cached_property
+    def _layer_to_group_id(self) -> dict[str, int]:
+        """Map each layer name to its group_id in kv_cache_groups."""
+        out: dict[str, int] = {}
+        for gid, group in enumerate(self._kv_cache_config.kv_cache_groups):
+            for name in group.layer_names:
+                out[name] = gid
+        return out
+
+    def _get_layerwise_layout(self) -> "HybridLinearAttentionLayerWiseLayout":
+        assert isinstance(self.kv_cache_layout, HybridLinearAttentionLayerWiseLayout), (
+            "kv_cache_layout must be HybridLinearAttentionLayerWiseLayout for "
+            "UCMHybridLinearAttentionLayerWiseConnector"
+        )
+        return self.kv_cache_layout  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    #  Load path                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _submit_row_load(
+        self,
+        row_id: int,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        """Pre-submit load tasks for every layer in shared-tensor ``row_id``."""
+        if row_id in self.submitted_rows:
+            return
+        layout = self._get_layerwise_layout()
+        if row_id >= layout._num_rows:
+            return
+        self.submitted_rows.add(row_id)
+
+        layer_names = layout._row_id_to_layer_names.get(row_id, [])
+        for layer_name in layer_names:
+            gid = self._layer_to_group_id.get(layer_name)
+            if gid is None:
+                continue
+            for request_id, request in metadata.request_meta.items():
+                if request_id in self._failure_req_ids:
+                    continue
+                assert isinstance(request, HybridLayerWiseDispatchMeta), (
+                    f"Expected HybridLayerWiseDispatchMeta, got {type(request)}"
+                )
+                ucm_ids, vllm_ids = request.group_load_block_ids[gid]
+                if not ucm_ids:
+                    continue
+                try:
+                    # Mirror UCMLayerWiseConnector: non-rank-0 non-MLA workers
+                    # hash ucm_ids so load keys match what save_kv_layer stored.
+                    if self.tp_rank % self.tp_size != 0 and not self.is_mla:
+                        ucm_ids = [self.request_hasher(uid) for uid in ucm_ids]
+                    layer_ptrs = layout.extract_layer_block_addrs(layer_name, vllm_ids)
+                    shard_indexs = [row_id] * len(ucm_ids)
+                    task = self.store.load_data(ucm_ids, shard_indexs, layer_ptrs)
+                    # Key by layer_name so each wait_for_layer_load only
+                    # blocks on its own layer's IO, not the full row.
+                    self.load_tasks[layer_name][request_id] = task
+                    self.need_load = True
+                except Exception as e:
+                    logger.error(
+                        f"request {request_id} layer {layer_name} submit load error: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    self._invalid_block_ids.update(vllm_ids)
+                    self._failure_req_ids.add(request_id)
+
+    def start_load_kv(
+        self, forward_context: "ForwardContext", **kwargs
+    ) -> None:
+        metadata = self._get_connector_metadata()
+        self.load_tasks.clear()
+        self.submitted_rows.clear()
+        self._failure_req_ids.clear()
+        self.need_load = False
+        # Pre-submit row 0; subsequent rows are submitted in wait_for_layer_load.
+        self._submit_row_load(0, metadata)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._connector_metadata:
+            return
+        if not self.need_load:
+            return
+        metadata = self._get_connector_metadata()
+        layout = self._get_layerwise_layout()
+        row_id = layout._layer_name_to_row_id.get(layer_name)
+        if row_id is None:
+            return
+
+        # Wait ONLY for this specific layer's tasks.  Each layer has its own
+        # entry in load_tasks so mamba layers (1 state block, ~536 KB) do not
+        # block on attention KV blocks (n large blocks) sharing the same row.
+        layer_tasks = self.load_tasks.pop(layer_name, {})
+        for req_id, task in layer_tasks.items():
+            try:
+                self.store.wait(task)
+            except Exception as e:
+                logger.error(
+                    f"request {req_id} wait layer {layer_name} load error: "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[req_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(req_id)
+
+        # Pre-submit the next row's loads so IO overlaps with current row's
+        # compute.  The submitted_rows guard makes this idempotent — safe to
+        # call from every layer in the same row.
+        self._submit_row_load(row_id + 1, metadata)
+
+    # ------------------------------------------------------------------ #
+    #  Save path                                                           #
+    # ------------------------------------------------------------------ #
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        if not self._connector_metadata:
+            return
+        if self.is_mla and self.tp_rank % self.tp_size != 0:
+            return
+
+        metadata = self._get_connector_metadata()
+        layout = self._get_layerwise_layout()
+        row_id = layout._layer_name_to_row_id.get(layer_name)
+        if row_id is None:
+            return
+        gid = self._layer_to_group_id.get(layer_name)
+        if gid is None:
+            return
+
+        total_ucm_ids: list[bytes] = []
+        ptrs_rows: list[np.ndarray] = []
+
+        for request_id, request in metadata.request_meta.items():
+            assert isinstance(request, HybridLayerWiseDispatchMeta), (
+                f"Expected HybridLayerWiseDispatchMeta, got {type(request)}"
+            )
+            ucm_ids, vllm_ids = request.group_dump_block_ids[gid]
+            if not ucm_ids:
+                continue
+            self.is_save = True
+            # Mirror UCMLayerWiseConnector: hash only for non-rank-0 non-MLA.
+            if self.tp_rank % self.tp_size != 0 and not self.is_mla:
+                ucm_ids = [self.request_hasher(uid) for uid in ucm_ids]
+            total_ucm_ids.extend(ucm_ids)
+            ptrs_rows.append(layout.extract_layer_block_addrs(layer_name, vllm_ids))
+
+        if not total_ucm_ids:
+            return
+
+        combined_ptrs = np.concatenate(ptrs_rows, axis=0)  # (total_blocks, n_ptrs)
+        shard_indexs = [row_id] * len(total_ucm_ids)
+        try:
+            event_handle = self._get_dump_event_handle()
+            task = self.store.dump_data(
+                total_ucm_ids, shard_indexs, combined_ptrs, event_handle
+            )
+            self.dump_tasks[layer_name] = task
+        except Exception as e:
+            logger.error(
+                f"layer {layer_name} submit dump error: {type(e).__name__}: {e}"
+            )
+
+    def wait_for_save(self) -> None:
+        if not self.is_save:
+            return
+        try:
+            for layer_name, task in self.dump_tasks.items():
+                self.store.wait(task)
+        except Exception as e:
+            logger.error(f"wait_for_save error: {type(e).__name__}: {e}")
+        finally:
+            self.dump_tasks.clear()
+            self.is_save = False
+            if self.enable_event_sync:
+                self.device.destroy_event_handles()
+
+
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -2630,12 +2991,19 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
             self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
+        elif use_hybrid_linear_attention:
+            # Check layerwise BEFORE the generic use_layerwise branch so that
+            # hybrid models always enter the hybrid-aware connector path.
+            if use_layerwise:
+                self.connector = UCMHybridLinearAttentionLayerWiseConnector(
+                    vllm_config, role, kv_cache_config
+                )
+            else:
+                self.connector = UCMHybridLinearAttentionConnector(
+                    vllm_config, role, kv_cache_config
+                )
         elif use_layerwise:
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
-        elif use_hybrid_linear_attention:
-            self.connector = UCMHybridLinearAttentionConnector(
-                vllm_config, role, kv_cache_config
-            )
         elif use_hma:
             self.connector = UCMHMAConnector(vllm_config, role, kv_cache_config)
         else:
