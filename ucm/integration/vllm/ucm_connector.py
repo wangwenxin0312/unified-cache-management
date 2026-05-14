@@ -2383,11 +2383,12 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             group = groups_by_id[gid]
             state_idx = max((seq_len - 1) // group.block_size, 0)
             vllm_state_idx = state_idx
-            if reason == "load":
-                # For resumed mamba-align requests, vLLM keeps the cached
-                # prefix state at ``state_idx`` and allocates a fresh running
-                # state block at the tail of the block table. UCM must read
-                # the prefix hash but write into that current running block.
+            if reason in ("load", "dump"):
+                # Mamba-align block tables use ``block_id=0`` for consumed or
+                # pre-allocated-but-inactive slots; only the last non-zero entry
+                # holds the current running state.  Always resolve to that entry:
+                # - dump: the current forward-pass state lives in the last real slot
+                # - load: the freshly allocated resume slot also lives at the tail
                 block_ids = req_meta.group_vllm_block_ids[gid]
                 for i in range(len(block_ids) - 1, -1, -1):
                     if block_ids[i] != 0:
@@ -2430,6 +2431,14 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     f"seq_len={seq_len}, state_idx={state_idx}"
                 )
                 return
+            logger.debug(
+                "[hybrid_layerwise][mamba_state] req=%s gid=%d reason=%s "
+                "seq_len=%d state_idx=%d vllm_state_idx=%d "
+                "vllm_block=%d ucm_hash=%s",
+                request_id[:8], gid, reason,
+                seq_len, state_idx, vllm_state_idx,
+                vllm_block_id, ucm_block_id.hex()[:12],
+            )
             dst_ucm_block_ids.append(ucm_block_id)
             dst_vllm_block_ids.append(vllm_block_id)
 
