@@ -2791,6 +2791,15 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                     # blocks on its own layer's IO, not the full row.
                     self.load_tasks[layer_name][request_id] = task
                     self.need_load = True
+                    logger.info(
+                        "[hybrid_layerwise][load_submit] req=%s layer=%s "
+                        "gid=%d row=%d shard=%d n_blocks=%d "
+                        "ucm[0]=%s vllm[0]=%s",
+                        request_id[:8], layer_name,
+                        gid, row_id, row_id, len(ucm_ids),
+                        ucm_ids[0].hex()[:12],
+                        vllm_ids[0] if vllm_ids else -1,
+                    )
                 except Exception as e:
                     logger.error(
                         f"request {request_id} layer {layer_name} submit load error: "
@@ -2825,10 +2834,12 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         # entry in load_tasks so mamba layers (1 state block, ~536 KB) do not
         # block on attention KV blocks (n large blocks) sharing the same row.
         layer_tasks = self.load_tasks.pop(layer_name, {})
+        failed_reqs: list[str] = []
         for req_id, task in layer_tasks.items():
             try:
                 self.store.wait(task)
             except Exception as e:
+                failed_reqs.append(req_id)
                 logger.error(
                     f"request {req_id} wait layer {layer_name} load error: "
                     f"{type(e).__name__}: {e}"
@@ -2837,6 +2848,14 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                     metadata.request_meta[req_id].load_block_ids[1]
                 )
                 self._failure_req_ids.add(req_id)
+
+        if layer_tasks:
+            logger.info(
+                "[hybrid_layerwise][load_done] layer=%s row=%d "
+                "n_reqs=%d failed=%d",
+                layer_name, row_id,
+                len(layer_tasks), len(failed_reqs),
+            )
 
         # Pre-submit the next row's loads so IO overlaps with current row's
         # compute.  The submitted_rows guard makes this idempotent — safe to
@@ -2869,6 +2888,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             return
 
         total_ucm_ids: list[bytes] = []
+        total_vllm_ids: list[int] = []
         ptrs_rows: list[np.ndarray] = []
 
         for request_id, request in metadata.request_meta.items():
@@ -2882,7 +2902,14 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             # Mirror UCMLayerWiseConnector: hash only for non-rank-0 non-MLA.
             if self.tp_rank % self.tp_size != 0 and not self.is_mla:
                 ucm_ids = [self.request_hasher(uid) for uid in ucm_ids]
+            logger.debug(
+                "[hybrid_layerwise][dump_req] req=%s layer=%s gid=%d row=%d "
+                "n_blocks=%d ucm[0]=%s vllm=%s",
+                request_id[:8], layer_name, gid, row_id,
+                len(ucm_ids), ucm_ids[0].hex()[:12], vllm_ids[:4],
+            )
             total_ucm_ids.extend(ucm_ids)
+            total_vllm_ids.extend(vllm_ids)
             ptrs_rows.append(layout.extract_layer_block_addrs(layer_name, vllm_ids))
 
         if not total_ucm_ids:
@@ -2896,6 +2923,14 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 total_ucm_ids, shard_indexs, combined_ptrs, event_handle
             )
             self.dump_tasks[layer_name] = task
+            logger.info(
+                "[hybrid_layerwise][dump_submit] layer=%s gid=%d row=%d shard=%d "
+                "n_blocks=%d ucm[0]=%s vllm[0]=%s",
+                layer_name, gid, row_id, row_id,
+                len(total_ucm_ids),
+                total_ucm_ids[0].hex()[:12],
+                total_vllm_ids[0] if total_vllm_ids else -1,
+            )
         except Exception as e:
             logger.error(
                 f"layer {layer_name} submit dump error: {type(e).__name__}: {e}"
@@ -2904,12 +2939,20 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
     def wait_for_save(self) -> None:
         if not self.is_save:
             return
+        failed_layers: list[str] = []
         try:
             for layer_name, task in self.dump_tasks.items():
                 self.store.wait(task)
         except Exception as e:
+            failed_layers.append(layer_name)
             logger.error(f"wait_for_save error: {type(e).__name__}: {e}")
         finally:
+            done_layers = [l for l in self.dump_tasks if l not in failed_layers]
+            logger.info(
+                "[hybrid_layerwise][dump_done] committed=%d failed=%d layers=%s",
+                len(done_layers), len(failed_layers),
+                [l.split(".")[-2] + "." + l.split(".")[-1] for l in done_layers[:6]],
+            )
             self.dump_tasks.clear()
             self.is_save = False
             if self.enable_event_sync:
