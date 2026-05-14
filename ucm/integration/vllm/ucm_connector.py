@@ -2564,10 +2564,11 @@ def use_hybrid_linear_attention_layout(
     kv_cache_config: "KVCacheConfig",
 ) -> bool:
     if kv_cache_config is None:
+        logger.info("[UCM][CONNECTOR_SELECT] kv_cache_config is None")
         return False
 
     layer_to_specs = layer_name_to_kv_cache_spec(kv_cache_config)
-    for raw_tensor in kv_cache_config.kv_cache_tensors:
+    for tensor_id, raw_tensor in enumerate(kv_cache_config.kv_cache_tensors):
         shared_specs = [
             spec
             for layer_name in raw_tensor.shared_by
@@ -2576,13 +2577,50 @@ def use_hybrid_linear_attention_layout(
         tensor_has_full_attention = any(
             isinstance(spec, FullAttentionSpec) for spec in shared_specs
         )
+        tensor_has_mamba = any(isinstance(spec, MambaSpec) for spec in shared_specs)
         tensor_has_mamba_align = any(
-            isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
+            isinstance(spec, MambaSpec)
+            and getattr(spec, "mamba_cache_mode", None) == "align"
             for spec in shared_specs
         )
-        if tensor_has_full_attention and tensor_has_mamba_align:
+        tensor_has_linear_layer = any(
+            "linear_attn" in layer_name for layer_name in raw_tensor.shared_by
+        )
+        tensor_has_attention_layer = any(
+            "attn" in layer_name and "linear_attn" not in layer_name
+            for layer_name in raw_tensor.shared_by
+        )
+        spec_debug = [
+            (
+                type(spec).__name__,
+                getattr(spec, "block_size", None),
+                getattr(spec, "mamba_cache_mode", None),
+                getattr(spec, "page_size_bytes", None),
+                getattr(spec, "page_size_padded", None),
+            )
+            for spec in shared_specs
+        ]
+        logger.info(
+            "[UCM][CONNECTOR_SELECT] hybrid_linear_check "
+            f"tensor_id={tensor_id} shared_by={list(raw_tensor.shared_by)} "
+            f"specs={spec_debug} has_full={tensor_has_full_attention} "
+            f"has_mamba={tensor_has_mamba} "
+            f"has_mamba_align={tensor_has_mamba_align} "
+            f"has_linear_layer={tensor_has_linear_layer} "
+            f"has_attention_layer={tensor_has_attention_layer}"
+        )
+        if tensor_has_full_attention and (
+            tensor_has_mamba_align
+            or tensor_has_mamba
+            or (tensor_has_linear_layer and tensor_has_attention_layer)
+        ):
+            logger.info(
+                "[UCM][CONNECTOR_SELECT] hybrid linear attention layout detected "
+                f"at tensor_id={tensor_id}"
+            )
             return True
 
+    logger.info("[UCM][CONNECTOR_SELECT] hybrid linear attention layout not detected")
     return False
 
 
@@ -2869,17 +2907,15 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         use_fawa_store = UCMFAWAConnector.can_handle_kv_cache_config(
             kv_cache_config
         ) or UCMAscendFAWAConnector.can_handle_ascend_kv_cache_config(kv_cache_config)
+        fawa_connector_cls = None
         if use_fawa_store:
-            connector_cls = (
+            fawa_connector_cls = (
                 UCMAscendFAWAConnector
                 if UCMAscendFAWAConnector.can_handle_ascend_kv_cache_config(
                     kv_cache_config
                 )
                 else UCMFAWAConnector
             )
-            self.connector = connector_cls(vllm_config, role, kv_cache_config)
-        elif use_lite:
-            self.connector = UCMLiteConnector(vllm_config, role, kv_cache_config)
 
         use_hma = (
             self._vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
@@ -2890,26 +2926,73 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             kv_cache_config
         )
 
+        logger.info(
+            "[UCM][CONNECTOR_SELECT] flags "
+            f"role={role} use_lite={use_lite} "
+            f"use_ratio_rate={use_ratio_rate} "
+            f"use_layerwise={use_layerwise} "
+            f"use_hybrid_linear_attention={use_hybrid_linear_attention} "
+            f"use_cp_parallel={use_cp_parallel} "
+            f"use_hma={use_hma} use_fawa_store={use_fawa_store} "
+            f"pp_enabled={pp_enabled} "
+            f"prefill_cp={getattr(self._vllm_config.parallel_config, 'prefill_context_parallel_size', None)} "
+            f"decode_cp={getattr(self._vllm_config.parallel_config, 'decode_context_parallel_size', None)}"
+        )
+
         if use_lite:
+            logger.info("[UCM][CONNECTOR_SELECT] selecting UCMLiteConnector")
             self.connector = UCMLiteConnector(vllm_config, role)
+            selected_connector = "UCMLiteConnector"
         elif use_ratio_rate:
+            logger.info("[UCM][CONNECTOR_SELECT] selecting UCMMockConnector")
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
+            selected_connector = "UCMMockConnector"
         elif use_layerwise and use_hybrid_linear_attention:
+            logger.info(
+                "[UCM][CONNECTOR_SELECT] selecting "
+                "UCMHybridLinearAttentionLayerWiseConnector"
+            )
             self.connector = UCMHybridLinearAttentionLayerWiseConnector(
                 vllm_config, role, kv_cache_config
             )
+            selected_connector = "UCMHybridLinearAttentionLayerWiseConnector"
         elif use_hybrid_linear_attention:
+            logger.info(
+                "[UCM][CONNECTOR_SELECT] selecting "
+                "UCMHybridLinearAttentionConnector"
+            )
             self.connector = UCMHybridLinearAttentionConnector(
                 vllm_config, role, kv_cache_config
             )
+            selected_connector = "UCMHybridLinearAttentionConnector"
+        elif use_fawa_store:
+            logger.info(
+                "[UCM][CONNECTOR_SELECT] selecting "
+                f"{fawa_connector_cls.__name__}"
+            )
+            self.connector = fawa_connector_cls(vllm_config, role, kv_cache_config)
+            selected_connector = fawa_connector_cls.__name__
         elif use_cp_parallel:
+            logger.info("[UCM][CONNECTOR_SELECT] selecting UCMCPConnector")
             self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
+            selected_connector = "UCMCPConnector"
         elif use_layerwise:
+            logger.info("[UCM][CONNECTOR_SELECT] selecting UCMLayerWiseConnector")
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
+            selected_connector = "UCMLayerWiseConnector"
         elif use_hma:
+            logger.info("[UCM][CONNECTOR_SELECT] selecting UCMHMAConnector")
             self.connector = UCMHMAConnector(vllm_config, role, kv_cache_config)
+            selected_connector = "UCMHMAConnector"
         else:
+            logger.info("[UCM][CONNECTOR_SELECT] selecting UCMDirectConnector")
             self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
+            selected_connector = "UCMDirectConnector"
+
+        logger.info(
+            "[UCM][CONNECTOR_SELECT] selected "
+            f"{selected_connector} actual_type={type(self.connector).__name__}"
+        )
 
     def get_num_new_matched_tokens(
         self,
