@@ -1886,6 +1886,30 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                 logger.warning(f"unsupported kv_layer type: {type(kv_layer)}")
         return shared_specs, shared_ptrs
 
+    @staticmethod
+    def _shared_layer_ids(raw_tensor) -> list[int]:
+        return sorted(extract_layer_index(name) for name in raw_tensor.shared_by)
+
+    def _append_row_layer_mapping(
+        self,
+        raw_tensor,
+        row_id: int,
+    ) -> None:
+        layer_ids = self._shared_layer_ids(raw_tensor)
+        if not layer_ids:
+            raise ValueError(
+                "Hybrid linear-attention raw tensor has no layer ids: "
+                f"shared_by={raw_tensor.shared_by}"
+            )
+        self.row_layer_ids.append(tuple(layer_ids))
+        self.row_first_layer_ids.append(layer_ids[0])
+        self.row_last_layer_ids.append(layer_ids[-1])
+        self.row_shard_ids.append(layer_ids[0])
+        for layer_name in raw_tensor.shared_by:
+            layer_id = extract_layer_index(layer_name)
+            self.layer_name_to_row_id[layer_name] = row_id
+            self.layer_id_to_row_id[layer_id] = row_id
+
     def _append_contiguous_page_layout(
         self,
         raw_tensor,
@@ -1963,6 +1987,12 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         base_ptrs = []
         tensor_size_lists = []
         block_stride_lists = []
+        self.layer_name_to_row_id: dict[str, int] = {}
+        self.layer_id_to_row_id: dict[int, int] = {}
+        self.row_layer_ids: list[tuple[int, ...]] = []
+        self.row_first_layer_ids: list[int] = []
+        self.row_last_layer_ids: list[int] = []
+        self.row_shard_ids: list[int] = []
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             if not raw_tensor.shared_by:
@@ -1977,6 +2007,9 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                     f"no kv cache tensor found for shared layers {raw_tensor.shared_by}"
                 )
                 continue
+
+            row_id = len(base_ptrs)
+            self._append_row_layer_mapping(raw_tensor, row_id)
 
             mamba_specs = [s for s in shared_specs if isinstance(s, MambaSpec)]
             attn_specs = [s for s in shared_specs if isinstance(s, FullAttentionSpec)]
@@ -2012,6 +2045,14 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
+
+        logger.info(
+            "Hybrid linear-attention layout: "
+            f"rows={self.base_ptrs.shape}, "
+            f"row_layer_ids={self.row_layer_ids}, "
+            f"row_shard_ids={self.row_shard_ids}, "
+            f"tensor_size_lists={self.tensor_size_lists.tolist()}"
+        )
 
 
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
@@ -2509,6 +2550,8 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
 def use_hybrid_linear_attention_layout(
     kv_cache_config: "KVCacheConfig",
 ) -> bool:
+    if kv_cache_config is None:
+        return False
     if current_platform.device_type != "npu" and not current_platform.is_cuda_alike():
         return False
 
@@ -2544,6 +2587,218 @@ class UCMHybridLinearAttentionConnector(UCMHMAConnector):
             self._vllm_config,
             self._kv_cache_config,
         )
+
+
+class UCMHybridLinearAttentionLayerWiseConnector(
+    UCMLayerWiseConnector, UCMHybridLinearAttentionConnector
+):
+    """Layerwise connector for shared full-attn + linear-attn KV pages.
+
+    In hybrid linear-attention models, one physical cache page can be shared by
+    several model layers, e.g. three ``linear_attn`` layers plus one
+    ``self_attn`` layer. Layerwise transfer therefore cannot use the model
+    layer id as the physical row directly. We load the shared page before the
+    first layer that views it and dump it after the last layer has updated it.
+    """
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        UCMHMAConnector.register_kv_caches(self, kv_caches)
+
+        layout = self.kv_cache_layout
+        if not isinstance(layout, HybridLinearAttentionLayout):
+            raise TypeError(
+                "UCMHybridLinearAttentionLayerWiseConnector requires "
+                f"HybridLinearAttentionLayout, got {type(layout)}"
+            )
+        self.layer_name_to_id = layout.layer_name_to_id
+        self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        self.first_layer_id = self.layer_ids[0]
+        self.row_ids = list(range(len(layout.row_first_layer_ids)))
+        self.row_first_layer_id_to_row_id = {
+            layer_id: row_id
+            for row_id, layer_id in enumerate(layout.row_first_layer_ids)
+        }
+        self.row_last_layer_id_to_row_id = {
+            layer_id: row_id for row_id, layer_id in enumerate(layout.row_last_layer_ids)
+        }
+
+    @property
+    def hybrid_layout(self) -> HybridLinearAttentionLayout:
+        layout = self.kv_cache_layout
+        assert isinstance(layout, HybridLinearAttentionLayout)
+        return layout
+
+    def _submit_request_load_tasks_for_row(
+        self,
+        row_id: int,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        layout = self.hybrid_layout
+        shard_id = layout.row_shard_ids[row_id]
+        submitted_rows = getattr(self, "_hybrid_submitted_load_rows", set())
+        if row_id in submitted_rows:
+            return
+        submitted_rows.add(row_id)
+        self._hybrid_submitted_load_rows = submitted_rows
+        for request_id, ucm_block_ids, total_ptrs in self.request_data:
+            if request_id in self._failure_req_ids:
+                continue
+            try:
+                shard_indexs = [shard_id] * len(ucm_block_ids)
+                row_ptrs = np.ascontiguousarray(total_ptrs[row_id])
+                task = self.store.load_data(ucm_block_ids, shard_indexs, row_ptrs)
+                self.load_tasks[row_id][request_id] = task
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit hybrid row {row_id} "
+                    f"load task error. {type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        metadata = self._get_connector_metadata()
+        self.load_tasks.clear()
+        self.request_data.clear()
+        self._failure_req_ids.clear()
+        self._hybrid_submitted_load_rows = set()
+        self._hybrid_completed_load_rows = set()
+        self.need_load = False
+
+        for request_id, request in metadata.request_meta.items():
+            if len(request.load_block_ids[0]) == 0:
+                continue
+
+            ucm_block_ids, vllm_block_ids = request.load_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM hybrid layerwise load request {request_id}",
+                )
+                if not ucm_block_ids:
+                    continue
+            self.need_load = True
+            if self.tp_rank % self.tp_size != 0 and not self.is_mla:
+                for i, ucm_block_id in enumerate(ucm_block_ids):
+                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                vllm_block_ids, layer_first=True
+            )
+            self.request_data.append((request_id, ucm_block_ids, total_ptrs))
+
+        if self.need_load and self.row_ids:
+            self._submit_request_load_tasks_for_row(self.row_ids[0], metadata)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._connector_metadata or not self.need_load:
+            return
+        metadata = self._get_connector_metadata()
+        current_layer_id = self.layer_name_to_id[layer_name]
+        row_id = self.hybrid_layout.layer_id_to_row_id.get(current_layer_id)
+        if row_id is None:
+            return
+        if row_id in self._hybrid_completed_load_rows:
+            return
+
+        row_tasks = self.load_tasks.pop(row_id, {})
+        for request_id, task in row_tasks.items():
+            try:
+                self.store.wait(task)
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} wait {layer_name} hybrid load failed. "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
+
+        self._hybrid_completed_load_rows.add(row_id)
+        next_row_id = row_id + 1
+        if next_row_id < len(self.row_ids):
+            self._submit_request_load_tasks_for_row(next_row_id, metadata)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        if not self._connector_metadata:
+            return
+        if self.is_mla and self.tp_rank % self.tp_size != 0:
+            return
+
+        layer_id = self.layer_name_to_id[layer_name]
+        row_id = self.row_last_layer_id_to_row_id.get(layer_id)
+        if row_id is None:
+            return
+
+        metadata = self._get_connector_metadata()
+        total_ucm_block_ids, total_vllm_block_ids = [], []
+        for request_id, request in metadata.request_meta.items():
+            if len(request.dump_block_ids[0]) == 0:
+                continue
+
+            ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM hybrid layerwise dump request {request_id}",
+                )
+                if not ucm_block_ids:
+                    continue
+            self.is_save = True
+            if self.tp_rank % self.tp_size != 0 and row_id == 0:
+                for i, ucm_block_id in enumerate(ucm_block_ids):
+                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            total_ucm_block_ids.extend(ucm_block_ids)
+            total_vllm_block_ids.extend(vllm_block_ids)
+
+        if not total_ucm_block_ids:
+            return
+
+        if self.dump_total_ptrs is None:
+            self.dump_total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                total_vllm_block_ids, layer_first=True
+            )
+        shard_id = self.hybrid_layout.row_shard_ids[row_id]
+        shard_indexs = [shard_id] * len(total_ucm_block_ids)
+        try:
+            row_ptrs = np.ascontiguousarray(self.dump_total_ptrs[row_id])
+            event_handle = self._get_dump_event_handle()
+            task = self.store.dump_data(
+                total_ucm_block_ids, shard_indexs, row_ptrs, event_handle
+            )
+            self.dump_tasks[layer_name] = task
+        except Exception as e:
+            logger.error(
+                f"submit hybrid row {row_id} dump task failed. "
+                f"{type(e).__name__}: {e}"
+            )
+
+    def wait_for_save(self) -> None:
+        if not self.is_save:
+            return
+        try:
+            for task in self.dump_tasks.values():
+                self.store.wait(task)
+        except Exception as e:
+            logger.error(
+                f"wait for hybrid layerwise dump kv cache failed. "
+                f"{type(e).__name__}: {e}"
+            )
+        self.dump_tasks.clear()
+        self.is_save = False
+        self.dump_total_ptrs = None
+        if self.enable_event_sync:
+            self.device.destroy_event_handles()
 
 
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
@@ -2630,12 +2885,16 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
             self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
-        elif use_layerwise:
-            self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
+        elif use_layerwise and use_hybrid_linear_attention:
+            self.connector = UCMHybridLinearAttentionLayerWiseConnector(
+                vllm_config, role, kv_cache_config
+            )
         elif use_hybrid_linear_attention:
             self.connector = UCMHybridLinearAttentionConnector(
                 vllm_config, role, kv_cache_config
             )
+        elif use_layerwise:
+            self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         elif use_hma:
             self.connector = UCMHMAConnector(vllm_config, role, kv_cache_config)
         else:
