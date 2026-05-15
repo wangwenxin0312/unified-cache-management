@@ -2247,21 +2247,39 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 },
             )
 
-        # When all the tokens are cached in ssd or hbm, we need to recompute
-        # at least one token so vLLM can produce logits for the first decode
-        # step.  For pure-attention models a single-token recompute is fine.
-        # For mamba-align hybrid models it is NOT: the mamba state stored at
-        # seq_len=P (= "state after all P tokens") would be used as the
-        # *initial* state for recomputing token P-1, which double-applies
-        # that token to the SSM recurrence and corrupts the output.
+        # When all the tokens are cached in ssd or hbm, vLLM still needs to
+        # run at least one forward-pass token to obtain the logits for the
+        # first decode step.
         #
-        # Safe fix: back off by one full LCM block instead of one token,
-        # provided the mamba state at the previous boundary (P - L) was also
-        # persisted (this is the case for chunked-prefill runs where every
-        # LCM boundary gets a checkpoint).  When that state is absent (e.g.
-        # single-pass non-chunked prefill), downgrade to 0 external hits so
-        # the model always recomputes from scratch for this request — correct
-        # output is more important than a cache hit.
+        # For pure-attention models subtracting 1 token is sufficient: the
+        # KV for position P-1 is already loaded and the attention output is
+        # deterministic.
+        #
+        # For mamba-align hybrid models this is BROKEN.  The stored mamba
+        # state has key seq_len=P, meaning it captures the SSM state AFTER
+        # all P tokens.  vLLM's mamba kernel selects the physical block for
+        # the initial state via:
+        #
+        #   start_idx = (seq_lens - 1) // block_size          (utils.py)
+        #
+        # For an extend step that ends at seq_lens=P, start_idx = N-1 (the
+        # last block).  Loading state_at_P into block N-1 and then running
+        # the scan for token P-1 applies x_{P-1} a second time to the SSM,
+        # producing corrupted output.
+        #
+        # Correct fix: back off by one full LCM block so vLLM recomputes the
+        # entire last block [P-L, P).  The mamba state for seq_len=(N-1)*L
+        # (= state BEFORE the last block) is then what we need in block N-1.
+        # Thanks to the "last non-zero" override in append_mamba_align_state_block,
+        # passing seq_len=(N-1)*L still writes into physical block N-1 (the
+        # block the kernel reads) while using the correct UCM key hash((N-1)*L).
+        #
+        # When the (N-1)*L state is absent (single-pass non-chunked prefill
+        # only saves the terminal state at P), we cannot safely resume.
+        # Downgrade to 0 external hits so vLLM performs a full fresh prefill.
+        # We must still set requests_meta so the dump path can persist the
+        # result; otherwise the store is never repopulated and every run pays
+        # the same penalty.
         num_total_hit_tokens = total_hit_block_num * lcm_block_size
         if num_total_hit_tokens == request.num_tokens and external_hit_tokens > 0:
             has_mamba_align = any(
@@ -2284,35 +2302,47 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                                     )
                                 except Exception as e:
                                     logger.warning(
-                                        f"mamba prev-boundary lookup failed: "
-                                        f"{type(e).__name__}: {e}"
+                                        "[mamba_align_fix] prev-boundary "
+                                        "lookup error: %s: %s",
+                                        type(e).__name__, e,
                                     )
-                            break
+                            break  # only need to check first mamba group
+
                 if prev_state_available:
-                    # The state at (N-1)*L is in store; back off by one full
-                    # block so the last block is recomputed with the correct
-                    # mamba initial state.
+                    # State at (N-1)*L is available.  Back off by one LCM
+                    # block: load N-1 attn blocks + mamba state at (N-1)*L,
+                    # recompute the last L tokens.
+                    # append_mamba_align_state_block will be called with
+                    # seq_len=(N-1)*L; its "last non-zero" override maps the
+                    # load destination to physical block N-1 (= start_idx for
+                    # vLLM's mamba kernel at seq_lens=P), while the UCM key
+                    # hash((N-1)*L) retrieves the correct initial SSM state.
                     logger.info(
-                        f"[mamba_align_fix] req={request.request_id[:8]} "
-                        f"backing off one LCM block: "
-                        f"external_hit_tokens {external_hit_tokens} -> "
-                        f"{external_hit_tokens - lcm_block_size}, "
-                        f"total_hit_block_num {total_hit_block_num} -> "
-                        f"{total_hit_block_num - 1}"
+                        "[mamba_align_fix] req=%s back-off one LCM block: "
+                        "external_hit %d->%d  total_hit_blocks %d->%d",
+                        request.request_id[:8],
+                        external_hit_tokens, external_hit_tokens - lcm_block_size,
+                        total_hit_block_num, total_hit_block_num - 1,
                     )
                     external_hit_tokens -= lcm_block_size
                     total_hit_block_num -= 1
                     num_total_hit_tokens = total_hit_block_num * lcm_block_size
                 else:
-                    # Previous-boundary state absent (non-chunked prefill);
-                    # downgrade to no external hit to force correct recompute.
+                    # State at (N-1)*L absent (non-chunked single-pass prefill
+                    # only persists the terminal state at P).  Force a full
+                    # fresh prefill — correct output > cache hit.
+                    # Keep requests_meta registration below so the dump path
+                    # can re-populate the store after this recompute; without
+                    # it the store stays stale and every subsequent run pays
+                    # the same penalty.
                     logger.info(
-                        f"[mamba_align_fix] req={request.request_id[:8]} "
-                        f"prev-boundary state at {prev_boundary} not in store "
-                        f"(likely non-chunked prefill); "
-                        "downgrading external hit to 0 to avoid wrong SSM state."
+                        "[mamba_align_fix] req=%s prev-boundary %d absent "
+                        "(non-chunked prefill); downgrading external hit to 0.",
+                        request.request_id[:8], prev_boundary,
                     )
-                    return 0, False
+                    external_hit_tokens = 0
+                    total_hit_block_num = hbm_hit_block_num
+                    num_total_hit_tokens = hbm_hit_block_num * lcm_block_size
             else:
                 external_hit_tokens -= 1
 
