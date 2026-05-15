@@ -2248,11 +2248,73 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             )
 
         # When all the tokens are cached in ssd or hbm, we need to recompute
-        # the last token. This branch will be removed once vLLM scheduler
-        # provides a better solution in the future.
+        # at least one token so vLLM can produce logits for the first decode
+        # step.  For pure-attention models a single-token recompute is fine.
+        # For mamba-align hybrid models it is NOT: the mamba state stored at
+        # seq_len=P (= "state after all P tokens") would be used as the
+        # *initial* state for recomputing token P-1, which double-applies
+        # that token to the SSM recurrence and corrupts the output.
+        #
+        # Safe fix: back off by one full LCM block instead of one token,
+        # provided the mamba state at the previous boundary (P - L) was also
+        # persisted (this is the case for chunked-prefill runs where every
+        # LCM boundary gets a checkpoint).  When that state is absent (e.g.
+        # single-pass non-chunked prefill), downgrade to 0 external hits so
+        # the model always recomputes from scratch for this request — correct
+        # output is more important than a cache hit.
         num_total_hit_tokens = total_hit_block_num * lcm_block_size
         if num_total_hit_tokens == request.num_tokens and external_hit_tokens > 0:
-            external_hit_tokens -= 1
+            has_mamba_align = any(
+                g.is_mamba_align
+                for g in self.group_manager.sliding_window_groups
+            )
+            if has_mamba_align and total_hit_block_num > 0:
+                prev_boundary = num_total_hit_tokens - lcm_block_size
+                prev_state_available = False
+                if prev_boundary > 0:
+                    for sw in self.group_manager.sliding_window_groups:
+                        if sw.is_mamba_align:
+                            prev_hash = self.group_manager.compute_mamba_align_state_hash(
+                                sw, prev_boundary, group_ucm_block_ids
+                            )
+                            if prev_hash is not None:
+                                try:
+                                    prev_state_available = all(
+                                        self.store.lookup([prev_hash])
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"mamba prev-boundary lookup failed: "
+                                        f"{type(e).__name__}: {e}"
+                                    )
+                            break
+                if prev_state_available:
+                    # The state at (N-1)*L is in store; back off by one full
+                    # block so the last block is recomputed with the correct
+                    # mamba initial state.
+                    logger.info(
+                        f"[mamba_align_fix] req={request.request_id[:8]} "
+                        f"backing off one LCM block: "
+                        f"external_hit_tokens {external_hit_tokens} -> "
+                        f"{external_hit_tokens - lcm_block_size}, "
+                        f"total_hit_block_num {total_hit_block_num} -> "
+                        f"{total_hit_block_num - 1}"
+                    )
+                    external_hit_tokens -= lcm_block_size
+                    total_hit_block_num -= 1
+                    num_total_hit_tokens = total_hit_block_num * lcm_block_size
+                else:
+                    # Previous-boundary state absent (non-chunked prefill);
+                    # downgrade to no external hit to force correct recompute.
+                    logger.info(
+                        f"[mamba_align_fix] req={request.request_id[:8]} "
+                        f"prev-boundary state at {prev_boundary} not in store "
+                        f"(likely non-chunked prefill); "
+                        "downgrading external hit to 0 to avoid wrong SSM state."
+                    )
+                    return 0, False
+            else:
+                external_hit_tokens -= 1
 
         self.requests_meta[request.request_id] = HMARequestMeta(
             ucm_block_ids=primary_block_ids,
