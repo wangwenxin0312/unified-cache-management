@@ -1728,6 +1728,7 @@ class HMAKVCacheLayout(KVCacheLayout):
         buffer_size_rows = []
         tensor_size_lists = []
         block_stride_lists = []
+        row_shared_by: list[tuple[str, ...]] = []
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             ptrs = []
@@ -1764,11 +1765,17 @@ class HMAKVCacheLayout(KVCacheLayout):
             buffer_size_rows.append(buffer_sizes)
             tensor_size_lists.append(tensor_sizes)
             block_stride_lists.append(block_strides)
+            row_shared_by.append(tuple(raw_tensor.shared_by))
 
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.buffer_sizes = np.asarray(buffer_size_rows, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
+        self.row_shared_by = row_shared_by
+        self.layer_name_to_row_ids = defaultdict(list)
+        for row_id, layer_names in enumerate(row_shared_by):
+            for layer_name in layer_names:
+                self.layer_name_to_row_ids[layer_name].append(row_id)
 
         logger.info(
             f"base_ptrs: {self.base_ptrs.shape}, tensor_size_lists: {self.tensor_size_lists.shape}"
@@ -1803,6 +1810,7 @@ class AscendDSV4Layout(HMAKVCacheLayout):
         buffer_size_rows = []
         tensor_size_lists = []
         block_stride_lists = []
+        row_shared_by: list[tuple[str, ...]] = []
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             ptrs = []
@@ -1845,11 +1853,17 @@ class AscendDSV4Layout(HMAKVCacheLayout):
             buffer_size_rows.append(buffer_sizes)
             tensor_size_lists.append(tensor_sizes)
             block_stride_lists.append(block_strides)
+            row_shared_by.append(tuple(raw_tensor.shared_by))
 
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.buffer_sizes = np.asarray(buffer_size_rows, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
+        self.row_shared_by = row_shared_by
+        self.layer_name_to_row_ids = defaultdict(list)
+        for row_id, layer_names in enumerate(row_shared_by):
+            for layer_name in layer_names:
+                self.layer_name_to_row_ids[layer_name].append(row_id)
 
         logger.info(
             f"base_ptrs: {self.base_ptrs.shape}, tensor_size_lists: {self.tensor_size_lists.shape}"
@@ -1999,11 +2013,13 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         buffer_size_rows = []
         tensor_size_lists = []
         block_stride_lists = []
+        row_shared_by: list[tuple[str, ...]] = []
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
             if not raw_tensor.shared_by:
                 continue
 
+            row_count_before = len(base_ptrs)
             shared_specs, shared_ptrs = self._collect_shared_tensor_info(
                 raw_tensor, kvcaches
             )
@@ -2048,10 +2064,18 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
                     block_stride_lists,
                 )
 
+            if len(base_ptrs) > row_count_before:
+                row_shared_by.append(tuple(raw_tensor.shared_by))
+
         self.base_ptrs = np.asarray(base_ptrs, dtype=np.uint64)
         self.buffer_sizes = np.asarray(buffer_size_rows, dtype=np.uint64)
         self.tensor_size_lists = np.asarray(tensor_size_lists, dtype=np.uint64)
         self.block_stride_lists = np.asarray(block_stride_lists, dtype=np.uint64)
+        self.row_shared_by = row_shared_by
+        self.layer_name_to_row_ids = defaultdict(list)
+        for row_id, layer_names in enumerate(row_shared_by):
+            for layer_name in layer_names:
+                self.layer_name_to_row_ids[layer_name].append(row_id)
 
 
 class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
@@ -2592,6 +2616,381 @@ class UCMHybridLinearAttentionConnector(UCMHMAConnector):
         )
 
 
+class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnector):
+    """Layerwise worker path for hybrid full-attention + linear-attention KV.
+
+    qwen3-next style models can let one raw KV tensor be shared by one
+    full-attention layer and one linear-attention/Mamba layer.  The scheduler
+    metadata must stay group-aware (inherited from ``UCMHMAConnector``), while
+    the worker copies one physical raw-tensor row at a time.  Rows whose first
+    or last participating layer has no KV-transfer hook fall back to a
+    synchronous load before forward / save at ``wait_for_save``.
+    """
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self.use_layerwise = True
+        self.load_tasks: dict[int, dict[str, Task]] = defaultdict(dict)
+        self.dump_tasks: dict[int, Task] = {}
+        self.need_load = False
+        self.is_save = False
+        self.request_data: list[tuple[str, list[bytes], np.ndarray]] = []
+        self.dump_total_ptrs: np.ndarray | None = None
+        self._failure_req_ids: set[str] = set()
+        self._submitted_load_rows: set[int] = set()
+        self._waited_load_rows: set[int] = set()
+        self._saved_row_ids: set[int] = set()
+        self._dump_block_ids_hashed = False
+        self._dump_data_ready = False
+        self._dump_ucm_block_ids: list[bytes] = []
+        self._dump_vllm_block_ids: list[int] = []
+        self.row_shard_ids: dict[int, int] = {}
+        self.layer_to_load_row_ids: dict[str, list[int]] = defaultdict(list)
+        self.layer_to_save_row_ids: dict[str, list[int]] = defaultdict(list)
+        self.rows_to_sync_load_at_start: set[int] = set()
+        self.rows_to_save_at_wait: set[int] = set()
+        self.deferred_load_row_order: list[int] = []
+        self._next_deferred_load_pos = 0
+        logger.info("Init UCMHybridLinearAttentionLayerWiseConnector.")
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        super().register_kv_caches(kv_caches)
+        self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
+        self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        self.first_layer_id = self.layer_ids[0]
+        self._build_layerwise_row_plan()
+
+    def _layer_has_kv_transfer_hook(self, layer_name: str) -> bool:
+        return any(
+            isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+            for spec in self.kv_cache_layout.layer_name_to_kv_cache_spec[layer_name]
+        )
+
+    def _build_layerwise_row_plan(self) -> None:
+        row_shared_by = getattr(self.kv_cache_layout, "row_shared_by", [])
+        if len(row_shared_by) != self.kv_cache_layout.base_ptrs.shape[0]:
+            raise RuntimeError(
+                "Hybrid layerwise layout is missing row-to-layer metadata: "
+                f"rows={self.kv_cache_layout.base_ptrs.shape[0]}, "
+                f"row_shared_by={len(row_shared_by)}"
+            )
+
+        first_row_sizes = self.kv_cache_layout.tensor_size_lists[0].tolist()
+        for row_id, row_sizes in enumerate(self.kv_cache_layout.tensor_size_lists):
+            if row_sizes.tolist() != first_row_sizes:
+                raise ValueError(
+                    "Hybrid layerwise UCM requires uniform row tensor sizes; "
+                    f"row 0={first_row_sizes}, row {row_id}={row_sizes.tolist()}"
+                )
+
+        self.row_shard_ids.clear()
+        self.layer_to_load_row_ids.clear()
+        self.layer_to_save_row_ids.clear()
+        self.rows_to_sync_load_at_start.clear()
+        self.rows_to_save_at_wait.clear()
+
+        for row_id, layer_names in enumerate(row_shared_by):
+            valid_layer_names = [
+                name for name in layer_names if name in self.layer_name_to_id
+            ]
+            if not valid_layer_names:
+                continue
+            ordered_layer_names = sorted(
+                valid_layer_names, key=lambda name: self.layer_name_to_id[name]
+            )
+            first_layer = ordered_layer_names[0]
+            last_layer = ordered_layer_names[-1]
+            hook_layers = [
+                name
+                for name in ordered_layer_names
+                if self._layer_has_kv_transfer_hook(name)
+            ]
+
+            self.row_shard_ids[row_id] = self.layer_name_to_id[first_layer]
+            if hook_layers and hook_layers[0] == first_layer:
+                self.layer_to_load_row_ids[first_layer].append(row_id)
+            else:
+                self.rows_to_sync_load_at_start.add(row_id)
+
+            if hook_layers and hook_layers[-1] == last_layer:
+                self.layer_to_save_row_ids[last_layer].append(row_id)
+            else:
+                self.rows_to_save_at_wait.add(row_id)
+
+        self.deferred_load_row_order = sorted(
+            [
+                row_id
+                for row_id in self.row_shard_ids
+                if row_id not in self.rows_to_sync_load_at_start
+            ],
+            key=lambda row_id: self.row_shard_ids[row_id],
+        )
+        logger.info(
+            "Hybrid layerwise row plan: "
+            f"rows={len(self.row_shard_ids)}, "
+            f"sync_load_rows={sorted(self.rows_to_sync_load_at_start)}, "
+            f"save_at_wait_rows={sorted(self.rows_to_save_at_wait)}"
+        )
+
+    def _submit_request_load_tasks_for_row(
+        self,
+        row_id: int,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        if row_id in self._submitted_load_rows:
+            return
+        self._submitted_load_rows.add(row_id)
+        shard_id = self.row_shard_ids[row_id]
+        for request_id, ucm_block_ids, total_ptrs in self.request_data:
+            if request_id in self._failure_req_ids:
+                continue
+            try:
+                shard_indexs = [shard_id] * len(ucm_block_ids)
+                row_ptrs = np.ascontiguousarray(total_ptrs[row_id])
+                task = self.store.load_data(ucm_block_ids, shard_indexs, row_ptrs)
+                self.load_tasks[row_id][request_id] = task
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit hybrid row {row_id} load "
+                    f"task error. {type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                self._failure_req_ids.add(request_id)
+
+    def _submit_load_rows(
+        self,
+        row_ids: list[int],
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        for row_id in row_ids:
+            self._submit_request_load_tasks_for_row(row_id, metadata)
+
+    def _submit_next_deferred_load_rows(
+        self,
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        while self._next_deferred_load_pos < len(self.deferred_load_row_order):
+            row_id = self.deferred_load_row_order[self._next_deferred_load_pos]
+            self._next_deferred_load_pos += 1
+            if row_id in self._submitted_load_rows:
+                continue
+            self._submit_request_load_tasks_for_row(row_id, metadata)
+            return
+
+    def _wait_for_load_rows(
+        self,
+        row_ids: list[int],
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        for row_id in row_ids:
+            if row_id in self._waited_load_rows:
+                continue
+            row_tasks = self.load_tasks.pop(row_id, {})
+            for request_id, task in row_tasks.items():
+                try:
+                    self.store.wait(task)
+                except Exception as e:
+                    logger.error(
+                        f"request {request_id} wait hybrid row {row_id} load "
+                        f"failed. {type(e).__name__}: {e}"
+                    )
+                    self._invalid_block_ids.update(
+                        metadata.request_meta[request_id].load_block_ids[1]
+                    )
+                    self._failure_req_ids.add(request_id)
+            self._waited_load_rows.add(row_id)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+
+        self.load_tasks.clear()
+        self.request_data.clear()
+        self._failure_req_ids.clear()
+        self._submitted_load_rows.clear()
+        self._waited_load_rows.clear()
+        self._next_deferred_load_pos = 0
+        self.need_load = False
+        self._dump_block_ids_hashed = False
+
+        for request_id, request in metadata.request_meta.items():
+            if len(request.load_block_ids[0]) == 0:
+                continue
+
+            self.need_load = True
+            ucm_block_ids, vllm_block_ids = request.load_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM hybrid layerwise load request {request_id}",
+                )
+                if len(ucm_block_ids) == 0:
+                    continue
+            if self.tp_rank != 0:
+                for i, ucm_block_id in enumerate(ucm_block_ids):
+                    ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+            total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                vllm_block_ids, layer_first=True
+            )
+            self.request_data.append((request_id, ucm_block_ids, total_ptrs))
+
+        self.need_load = bool(self.request_data)
+        if not self.need_load:
+            return
+
+        sync_rows = sorted(
+            self.rows_to_sync_load_at_start,
+            key=lambda row_id: self.row_shard_ids[row_id],
+        )
+        self._submit_load_rows(sync_rows, metadata)
+        self._wait_for_load_rows(sync_rows, metadata)
+        self._submit_next_deferred_load_rows(metadata)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._connector_metadata or not self.need_load:
+            return
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+
+        row_ids = self.layer_to_load_row_ids.get(layer_name, [])
+        if not row_ids:
+            return
+        self._wait_for_load_rows(row_ids, metadata)
+        self._submit_next_deferred_load_rows(metadata)
+
+    def _ensure_dump_block_ids_hashed(self, metadata: "UCMConnectorMetadata") -> None:
+        if self.tp_rank == 0 or self._dump_block_ids_hashed:
+            return
+        for request in metadata.request_meta.values():
+            ucm_block_ids, _ = request.dump_block_ids
+            for i, ucm_block_id in enumerate(ucm_block_ids):
+                ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+        self._dump_block_ids_hashed = True
+
+    def _prepare_dump_data(self, metadata: "UCMConnectorMetadata") -> bool:
+        if self._dump_data_ready:
+            return len(self._dump_ucm_block_ids) > 0
+
+        self._ensure_dump_block_ids_hashed(metadata)
+        total_ucm_block_ids: list[bytes] = []
+        total_vllm_block_ids: list[int] = []
+        for request_id, request in metadata.request_meta.items():
+            if len(request.dump_block_ids[0]) == 0:
+                continue
+            ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM hybrid layerwise dump request {request_id}",
+                )
+                if len(ucm_block_ids) == 0:
+                    continue
+            total_ucm_block_ids.extend(ucm_block_ids)
+            total_vllm_block_ids.extend(vllm_block_ids)
+
+        self._dump_ucm_block_ids = total_ucm_block_ids
+        self._dump_vllm_block_ids = total_vllm_block_ids
+        if total_vllm_block_ids:
+            self.dump_total_ptrs = self.kv_cache_layout.extract_block_addrs(
+                total_vllm_block_ids, layer_first=True
+            )
+        self._dump_data_ready = True
+        return len(total_ucm_block_ids) > 0
+
+    def _submit_save_rows(
+        self,
+        row_ids: list[int],
+        metadata: "UCMConnectorMetadata",
+    ) -> None:
+        if not row_ids or not self._prepare_dump_data(metadata):
+            return
+        assert self.dump_total_ptrs is not None
+        event_handle = self._get_dump_event_handle()
+        for row_id in row_ids:
+            if row_id in self._saved_row_ids:
+                continue
+            try:
+                shard_id = self.row_shard_ids[row_id]
+                shard_indexs = [shard_id] * len(self._dump_ucm_block_ids)
+                row_ptrs = np.ascontiguousarray(self.dump_total_ptrs[row_id])
+                task = self.store.dump_data(
+                    self._dump_ucm_block_ids,
+                    shard_indexs,
+                    row_ptrs,
+                    event_handle,
+                )
+                self.dump_tasks[row_id] = task
+                self._saved_row_ids.add(row_id)
+                self.is_save = True
+            except Exception as e:
+                logger.error(
+                    f"submit hybrid row {row_id} dump task failed. "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        if not self._connector_metadata:
+            return
+        if self.is_mla and self.tp_rank != 0:
+            return
+
+        row_ids = self.layer_to_save_row_ids.get(layer_name, [])
+        if not row_ids:
+            return
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+        self._submit_save_rows(row_ids, metadata)
+
+    def wait_for_save(self) -> None:
+        if self._connector_metadata:
+            metadata = self._get_connector_metadata()
+            assert isinstance(metadata, UCMConnectorMetadata)
+            fallback_rows = [
+                row_id
+                for row_id in sorted(
+                    self.rows_to_save_at_wait,
+                    key=lambda rid: self.row_shard_ids[rid],
+                )
+                if row_id not in self._saved_row_ids
+            ]
+            self._submit_save_rows(fallback_rows, metadata)
+
+        if self.is_save:
+            try:
+                for row_id in sorted(self.dump_tasks):
+                    self.store.wait(self.dump_tasks[row_id])
+            except Exception as e:
+                logger.error(
+                    f"wait for hybrid layerwise dump kv cache failed. "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        self.dump_tasks.clear()
+        self.is_save = False
+        self.dump_total_ptrs = None
+        self._saved_row_ids.clear()
+        self._dump_data_ready = False
+        self._dump_ucm_block_ids = []
+        self._dump_vllm_block_ids = []
+        if self.enable_event_sync:
+            self.device.destroy_event_handles()
+
+
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -2660,6 +3059,10 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
             self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
+        elif use_hybrid_linear_attention and use_layerwise:
+            self.connector = UCMHybridLinearAttentionLayerWiseConnector(
+                vllm_config, role, kv_cache_config
+            )
         elif use_layerwise:
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         elif use_hybrid_linear_attention:
