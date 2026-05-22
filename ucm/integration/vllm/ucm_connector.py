@@ -2421,16 +2421,15 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             group = groups_by_id[gid]
             state_idx = max((seq_len - 1) // group.block_size, 0)
             vllm_state_idx = state_idx
-            if reason == "load":
-                # For resumed mamba-align requests, vLLM keeps the cached
-                # prefix state at ``state_idx`` and allocates a fresh running
-                # state block at the tail of the block table. UCM must read
-                # the prefix hash but write into that current running block.
-                block_ids = req_meta.group_vllm_block_ids[gid]
-                for i in range(len(block_ids) - 1, -1, -1):
-                    if block_ids[i] != 0:
-                        vllm_state_idx = i
-                        break
+            # In mamba-align mode vLLM pads most logical state slots with
+            # block_id=0 and keeps the effective state in the current non-null
+            # physical page. This applies to both load and dump: otherwise dump
+            # can silently skip the mamba state and future lookups will miss.
+            block_ids = req_meta.group_vllm_block_ids[gid]
+            for i in range(len(block_ids) - 1, -1, -1):
+                if block_ids[i] != 0:
+                    vllm_state_idx = i
+                    break
 
             try:
                 vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
@@ -2444,6 +2443,14 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 )
                 return
             if vllm_block_id == 0:
+                logger.info(
+                    "HMA mamba-align state skipped null vLLM block: "
+                    f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                    f"seq_len={seq_len}, state_idx={state_idx}, "
+                    f"vllm_state_idx={vllm_state_idx}, "
+                    f"vllm_blocks_sample="
+                    f"{_short_list(req_meta.group_vllm_block_ids[gid])}"
+                )
                 return
             if group.is_mamba_align:
                 ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
@@ -2468,6 +2475,14 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                     f"seq_len={seq_len}, state_idx={state_idx}"
                 )
                 return
+            logger.info(
+                "HMA mamba-align state block appended: "
+                f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                f"seq_len={seq_len}, state_idx={state_idx}, "
+                f"vllm_state_idx={vllm_state_idx}, "
+                f"vllm_block_id={vllm_block_id}, "
+                f"ucm_hash={_short_hex_list([ucm_block_id], 1)}"
+            )
             dst_ucm_block_ids.append(ucm_block_id)
             dst_vllm_block_ids.append(vllm_block_id)
 
@@ -2768,7 +2783,7 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
 
     def _layer_has_kv_transfer_hook(self, layer_name: str) -> bool:
         return any(
-            isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+            isinstance(spec, (FullAttentionSpec, SlidingWindowSpec, MambaSpec))
             for spec in self.kv_cache_layout.layer_name_to_kv_cache_spec[layer_name]
         )
 
@@ -2822,6 +2837,12 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 self.layer_to_save_row_ids[last_layer].append(row_id)
             else:
                 self.rows_to_save_at_wait.add(row_id)
+            logger.info(
+                "Hybrid layerwise row ownership: "
+                f"row_id={row_id}, layers={ordered_layer_names}, "
+                f"hook_layers={hook_layers}, first_layer={first_layer}, "
+                f"last_layer={last_layer}, shard_id={self.row_shard_ids[row_id]}"
+            )
 
         self.deferred_load_row_order = sorted(
             [
@@ -3100,6 +3121,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
 
         row_ids = self.layer_to_save_row_ids.get(layer_name, [])
         if not row_ids:
+            logger.info(
+                "UCM hybrid layerwise save_kv_layer no owned rows: "
+                f"layer_name={layer_name}"
+            )
             return
         logger.info(
             "UCM hybrid layerwise save_kv_layer: "
