@@ -55,6 +55,10 @@ def _short_list(values: list[int], limit: int = 12) -> list[int]:
     return values[:limit]
 
 
+def _short_hex_list(values: list[bytes], limit: int = 4) -> list[str]:
+    return [value.hex()[:16] for value in values[:limit] if value]
+
+
 def _drop_null_vllm_blocks(
     ucm_block_ids: list[bytes],
     vllm_block_ids: list[int],
@@ -1576,6 +1580,7 @@ class KVCacheGroupManager:
         num_computed_tokens: int,
         store: "UcmKVStoreBaseV1",
         group_block_ids: list[list[bytes]],
+        request_id: str = "",
     ) -> tuple[int, int]:
         """Two-stage HMA lookup using precomputed per-group hashes.
 
@@ -1616,6 +1621,12 @@ class KVCacheGroupManager:
             fa_hbm_blocks = num_computed_tokens // fa.block_size
             fa_external = fa_block_ids[fa_hbm_blocks:]
             if not fa_external:
+                logger.info(
+                    "HMA lookup full-attn no external blocks: "
+                    f"request_id={request_id}, group_id={fa.group_id}, "
+                    f"block_size={fa.block_size}, hbm_blocks={fa_hbm_blocks}, "
+                    f"total_blocks={len(fa_block_ids)}"
+                )
                 candidates.append(0)
                 continue
             try:
@@ -1623,10 +1634,18 @@ class KVCacheGroupManager:
             except Exception as e:
                 logger.error(
                     f"full-attn group {fa.group_id} lookup error. "
-                    f"{type(e).__name__}: {e}"
+                    f"request_id={request_id}, {type(e).__name__}: {e}"
                 )
                 candidates.append(0)
                 continue
+            logger.info(
+                "HMA lookup full-attn prefix result: "
+                f"request_id={request_id}, group_id={fa.group_id}, "
+                f"block_size={fa.block_size}, hbm_blocks={fa_hbm_blocks}, "
+                f"external_blocks={len(fa_external)}, "
+                f"hit_blocks={max(fa_hit_blocks, 0)}, "
+                f"first_external={_short_hex_list(fa_external, 1)}"
+            )
             candidates.append(max(fa_hit_blocks, 0) * fa.block_size)
 
         # Resume boundary must be a multiple of lcm_block_size so every
@@ -1636,6 +1655,12 @@ class KVCacheGroupManager:
             min_external_hit_tokens // self.lcm_block_size
         ) * self.lcm_block_size
         if external_hit_tokens <= 0:
+            logger.info(
+                "HMA lookup downgraded after full-attn stage: "
+                f"request_id={request_id}, candidates_tokens={candidates}, "
+                f"lcm_block_size={self.lcm_block_size}, "
+                f"num_computed_tokens={num_computed_tokens}"
+            )
             return 0, 0
 
         # Stage 2: every SW group's tail window must be in the store.
@@ -1648,6 +1673,7 @@ class KVCacheGroupManager:
                 if mamba_state_hash is None:
                     logger.info(
                         f"mamba-align group {sw.group_id} state hash missing "
+                        f"for request {request_id} "
                         f"at total_hit_tokens={total_hit_tokens}, "
                         "downgrade external hit to 0."
                     )
@@ -1657,15 +1683,23 @@ class KVCacheGroupManager:
                 except Exception as e:
                     logger.error(
                         f"mamba-align group {sw.group_id} lookup error. "
-                        f"{type(e).__name__}: {e}"
+                        f"request_id={request_id}, {type(e).__name__}: {e}"
                     )
                     return 0, 0
                 if not all(results):
                     logger.info(
                         f"mamba-align group {sw.group_id} state miss: "
-                        f"hits={results}, downgrade external hit to 0."
+                        f"request_id={request_id}, hits={results}, "
+                        f"state_hash={_short_hex_list([mamba_state_hash], 1)}, "
+                        "downgrade external hit to 0."
                     )
                     return 0, 0
+                logger.info(
+                    "HMA lookup mamba-align state hit: "
+                    f"request_id={request_id}, group_id={sw.group_id}, "
+                    f"total_hit_tokens={total_hit_tokens}, "
+                    f"state_hash={_short_hex_list([mamba_state_hash], 1)}"
+                )
                 continue
 
             # When ``block_size > sliding_window`` (e.g. on Ascend) a single
@@ -1700,15 +1734,24 @@ class KVCacheGroupManager:
             except Exception as e:
                 logger.error(
                     f"sliding window group {sw.group_id} lookup error. "
-                    f"{type(e).__name__}: {e}"
+                    f"request_id={request_id}, {type(e).__name__}: {e}"
                 )
                 return 0, 0
             if not all(results):
                 logger.info(
                     f"sliding window group {sw.group_id} tail miss: "
-                    f"hits={results}, downgrade external hit to 0."
+                    f"request_id={request_id}, hits={results}, "
+                    f"tail_count={tail_count}, "
+                    f"tail_ids={_short_hex_list(tail_block_ids)}, "
+                    "downgrade external hit to 0."
                 )
                 return 0, 0
+            logger.info(
+                "HMA lookup sliding-window tail hit: "
+                f"request_id={request_id}, group_id={sw.group_id}, "
+                f"tail_count={tail_count}, hits={results}, "
+                f"tail_ids={_short_hex_list(tail_block_ids)}"
+            )
 
         return external_hit_tokens, external_hit_tokens // self.lcm_block_size
 
@@ -2166,14 +2209,30 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(
             request.all_token_ids
         )
+        group_block_counts = [
+            len(block_ids) for block_ids in group_ucm_block_ids
+        ]
         # Legacy ``ucm_block_ids`` mirrors the first full-attn group (by
         # group_id order) for callers that still consume the flat list.
         primary_full_attn = self.group_manager.full_attn_groups[0]
         primary_block_ids = group_ucm_block_ids[primary_full_attn.group_id]
+        logger.info(
+            "HMA get_num_new_matched_tokens lookup begin: "
+            f"request_id={request.request_id}, "
+            f"num_tokens={request.num_tokens}, "
+            f"all_token_ids={len(request.all_token_ids)}, "
+            f"num_computed_tokens={num_computed_tokens}, "
+            f"lcm_block_size={lcm_block_size}, "
+            f"hbm_lcm_blocks={hbm_hit_block_num}, "
+            f"group_block_counts={group_block_counts}"
+        )
 
         external_hit_tokens, external_hit_lcm_blocks = (
             self.group_manager.lookup_external_hit_tokens(
-                num_computed_tokens, self.store, group_ucm_block_ids
+                num_computed_tokens,
+                self.store,
+                group_ucm_block_ids,
+                request.request_id,
             )
         )
 
@@ -2213,6 +2272,12 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         # provides a better solution in the future.
         num_total_hit_tokens = total_hit_block_num * lcm_block_size
         if num_total_hit_tokens == request.num_tokens and external_hit_tokens > 0:
+            logger.info(
+                "HMA lookup hit reached full request length; "
+                f"request_id={request.request_id}, "
+                f"num_total_hit_tokens={num_total_hit_tokens}, "
+                "recompute one trailing token."
+            )
             external_hit_tokens -= 1
 
         self.requests_meta[request.request_id] = HMARequestMeta(
@@ -2225,6 +2290,14 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
             group_vllm_block_ids=[[] for _ in range(self.group_manager.num_groups)],
         )
 
+        logger.info(
+            "HMA get_num_new_matched_tokens result: "
+            f"request_id={request.request_id}, "
+            f"external_hit_tokens={external_hit_tokens}, "
+            f"external_hit_lcm_blocks={external_hit_lcm_blocks}, "
+            f"total_hit_lcm_blocks={total_hit_block_num}, "
+            f"token_processed={num_total_hit_tokens}"
+        )
         return external_hit_tokens, False
 
     def update_state_after_alloc(
@@ -2241,6 +2314,15 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                 f"HMA group count {self.group_manager.num_groups}"
             )
         req_meta.group_vllm_block_ids = [list(group) for group in block_ids]
+        logger.info(
+            "HMA update_state_after_alloc: "
+            f"request_id={request.request_id}, "
+            f"num_external_tokens={num_external_tokens}, "
+            f"group_vllm_block_counts="
+            f"{[len(group) for group in req_meta.group_vllm_block_ids]}, "
+            f"group_vllm_blocks_sample="
+            f"{[_short_list(list(group)) for group in req_meta.group_vllm_block_ids]}"
+        )
 
     def _generate_hma_dispatch_meta(
         self,
@@ -2484,6 +2566,17 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
                         b += lcm_block_size
             req_meta.token_processed += new_tokens
 
+        logger.info(
+            "HMA dispatch meta generated: "
+            f"request_id={request_id}, new_tokens={new_tokens}, "
+            f"need_load={need_load}, "
+            f"incoming_block_ids_are_full={incoming_block_ids_are_full}, "
+            f"external_hit_lcm_blocks={external_hit_lcm_blocks}, "
+            f"load_blocks={len(load_ucm_block_ids)}, "
+            f"dump_blocks={len(dump_ucm_block_ids)}, "
+            f"load_vllm_sample={_short_list(load_vllm_block_ids)}, "
+            f"dump_vllm_sample={_short_list(dump_vllm_block_ids)}"
+        )
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
@@ -2560,6 +2653,14 @@ class UCMHMAConnector(UCMDirectConnector, SupportsHMA):
         for request_id in scheduler_output.finished_req_ids:
             self.requests_meta.pop(request_id, None)
 
+        logger.info(
+            "HMA build_connector_meta: "
+            f"scheduled_new={len(scheduler_output.scheduled_new_reqs)}, "
+            f"scheduled_cached="
+            f"{len(scheduled_cached_reqs) if isinstance(scheduled_cached_reqs, list) else len(scheduled_cached_reqs.req_ids)}, "
+            f"finished={len(scheduler_output.finished_req_ids)}, "
+            f"dispatch_requests={list(requests_dispatch_meta.keys())}"
+        )
         return UCMConnectorMetadata(requests_dispatch_meta)
 
     def request_finished_all_groups(
@@ -2754,6 +2855,11 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 row_ptrs = np.ascontiguousarray(total_ptrs[row_id])
                 task = self.store.load_data(ucm_block_ids, shard_indexs, row_ptrs)
                 self.load_tasks[row_id][request_id] = task
+                logger.info(
+                    "UCM hybrid layerwise load row submitted: "
+                    f"request_id={request_id}, row_id={row_id}, "
+                    f"shard_id={shard_id}, blocks={len(ucm_block_ids)}"
+                )
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit hybrid row {row_id} load "
@@ -2822,6 +2928,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
 
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
+                logger.info(
+                    "UCM hybrid layerwise load skip empty request: "
+                    f"request_id={request_id}"
+                )
                 continue
 
             self.need_load = True
@@ -2841,14 +2951,30 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 vllm_block_ids, layer_first=True
             )
             self.request_data.append((request_id, ucm_block_ids, total_ptrs))
+            logger.info(
+                "UCM hybrid layerwise load prepared: "
+                f"request_id={request_id}, blocks={len(ucm_block_ids)}, "
+                f"vllm_blocks_sample={_short_list(vllm_block_ids)}, "
+                f"rows={self.kv_cache_layout.base_ptrs.shape[0]}"
+            )
 
         self.need_load = bool(self.request_data)
         if not self.need_load:
+            logger.info(
+                "UCM hybrid layerwise start_load_kv has no load work: "
+                f"metadata_requests={len(metadata.request_meta)}"
+            )
             return
 
         sync_rows = sorted(
             self.rows_to_sync_load_at_start,
             key=lambda row_id: self.row_shard_ids[row_id],
+        )
+        logger.info(
+            "UCM hybrid layerwise start_load_kv submit rows: "
+            f"sync_rows={sync_rows}, "
+            f"deferred_rows={self.deferred_load_row_order}, "
+            f"requests={[req_id for req_id, _, _ in self.request_data]}"
         )
         self._submit_load_rows(sync_rows, metadata)
         self._wait_for_load_rows(sync_rows, metadata)
@@ -2863,6 +2989,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         row_ids = self.layer_to_load_row_ids.get(layer_name, [])
         if not row_ids:
             return
+        logger.info(
+            "UCM hybrid layerwise wait_for_layer_load: "
+            f"layer_name={layer_name}, row_ids={row_ids}"
+        )
         self._wait_for_load_rows(row_ids, metadata)
         self._submit_next_deferred_load_rows(metadata)
 
@@ -2884,6 +3014,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         total_vllm_block_ids: list[int] = []
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
+                logger.info(
+                    "UCM hybrid layerwise dump skip empty request: "
+                    f"request_id={request_id}"
+                )
                 continue
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
             if self._skip_null_vllm_blocks:
@@ -2896,6 +3030,11 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                     continue
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
+            logger.info(
+                "UCM hybrid layerwise dump prepared request: "
+                f"request_id={request_id}, blocks={len(ucm_block_ids)}, "
+                f"vllm_blocks_sample={_short_list(vllm_block_ids)}"
+            )
 
         self._dump_ucm_block_ids = total_ucm_block_ids
         self._dump_vllm_block_ids = total_vllm_block_ids
@@ -2904,6 +3043,11 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 total_vllm_block_ids, layer_first=True
             )
         self._dump_data_ready = True
+        logger.info(
+            "UCM hybrid layerwise dump data ready: "
+            f"total_blocks={len(total_ucm_block_ids)}, "
+            f"vllm_blocks_sample={_short_list(total_vllm_block_ids)}"
+        )
         return len(total_ucm_block_ids) > 0
 
     def _submit_save_rows(
@@ -2931,6 +3075,11 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 self.dump_tasks[row_id] = task
                 self._saved_row_ids.add(row_id)
                 self.is_save = True
+                logger.info(
+                    "UCM hybrid layerwise dump row submitted: "
+                    f"row_id={row_id}, shard_id={shard_id}, "
+                    f"blocks={len(self._dump_ucm_block_ids)}"
+                )
             except Exception as e:
                 logger.error(
                     f"submit hybrid row {row_id} dump task failed. "
@@ -2952,6 +3101,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         row_ids = self.layer_to_save_row_ids.get(layer_name, [])
         if not row_ids:
             return
+        logger.info(
+            "UCM hybrid layerwise save_kv_layer: "
+            f"layer_name={layer_name}, row_ids={row_ids}"
+        )
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
         self._submit_save_rows(row_ids, metadata)
@@ -3048,6 +3201,14 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         use_hybrid_linear_attention = use_hybrid_linear_attention_layout(
             kv_cache_config
         )
+        logger.info(
+            "UCMConnector selection inputs: "
+            f"role={role}, use_layerwise={use_layerwise}, "
+            f"use_lite={use_lite}, use_ratio_rate={use_ratio_rate}, "
+            f"use_cp_parallel={use_cp_parallel}, use_hma={use_hma}, "
+            f"use_hybrid_linear_attention={use_hybrid_linear_attention}, "
+            f"kv_cache_config_is_none={kv_cache_config is None}"
+        )
 
         from ucm.integration.vllm.hma_connector import UCMFAWAConnector
 
@@ -3073,6 +3234,10 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         #     self.connector = UCMHMAConnector(vllm_config, role, kv_cache_config)
         else:
             self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
+        logger.info(
+            "UCMConnector selected connector: "
+            f"{type(self.connector).__name__} for role={role}"
+        )
 
     def get_num_new_matched_tokens(
         self,
