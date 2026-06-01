@@ -41,6 +41,10 @@ class Device(ABC):
         pass
 
     @abstractmethod
+    def destroy_event_handle(self, event_handle: int):
+        pass
+
+    @abstractmethod
     def get_cpu_affinity(self, local_rank: int) -> Optional[str]:
         """
         Return CPU affinity as a cpulist string, e.g. "0-43,88-131".
@@ -117,6 +121,9 @@ class CudaDevice(Device):
 
     def destroy_event_handles(self):
         self.events.clear()
+
+    def destroy_event_handle(self, event_handle: int):
+        self.events.pop(event_handle, None)
 
     def get_cpu_affinity(self, local_rank: int) -> Optional[str]:
         """
@@ -235,6 +242,7 @@ class NpuDevice(Device):
             ret = acl.rt.record_event(event, stream)
             if ret != 0:
                 logger.error(f"acl record_event failed: {ret}")
+                acl.rt.destroy_event(event)
                 return 0
             handle = int(event)
             if not handle:
@@ -256,6 +264,16 @@ class NpuDevice(Device):
             except Exception as e:
                 logger.error(f"destroy npu event failed. {e}")
         self.events.clear()
+
+    def destroy_event_handle(self, event_handle: int):
+        import acl
+
+        event = self.events.pop(event_handle, None)
+        if event is not None:
+            try:
+                acl.rt.destroy_event(event)
+            except Exception as e:
+                logger.error(f"destroy npu event failed. {e}")
 
     def _execute_command(self, cmd_list: List[str]) -> str:
         try:
