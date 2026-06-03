@@ -2752,11 +2752,20 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self.load_tasks: dict[int, list[tuple[Task, tuple[str, ...]]]] = defaultdict(
             list
         )
-        self.dump_tasks: dict[int, list[Task]] = defaultdict(list)
+        # (task, event_handle) pairs accumulated during save_kv_layer calls;
+        # moved to _pending_dump_tasks in wait_for_save for async completion.
+        self._row_dump_tasks: list[tuple[Task, int]] = []
         self.request_data: list[tuple[str, list[bytes], list[int]]] = []
         self._failure_req_ids: set[str] = set()
         self._submitted_load_rows: set[int] = set()
         self._dump_transfer_data: tuple[list[bytes], list[int]] | None = None
+        # Pre-computed per-row address arrays, keyed by row_id.
+        self._load_row_ptrs: dict[int, np.ndarray] = {}
+        self._dump_row_ptrs: dict[int, np.ndarray] = {}
+        # request_ids that have pending async dump tasks for this step.
+        self._step_dump_request_ids: set[str] = set()
+        # Populated by register_kv_caches; used for O(1) prefetch index lookup.
+        self._row_id_to_idx: dict[int, int] = {}
         prefetch_rows_config = self.launch_config.get(
             "hybrid_layerwise_prefetch_rows", 2
         )
@@ -2793,6 +2802,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             )
             for row_id, layer_names in row_to_layers.items()
         }
+        # O(1) lookup used by wait_for_layer_load to find the next prefetch row.
+        self._row_id_to_idx: dict[int, int] = {
+            row_id: idx for idx, row_id in enumerate(self.row_ids)
+        }
         logger.info(
             "Hybrid layerwise layout: "
             f"rows={len(self.row_ids)}, row_ids={_short_list(self.row_ids)}, "
@@ -2821,25 +2834,24 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         metadata: "UCMConnectorMetadata",
     ) -> None:
         total_ucm_block_ids: list[bytes] = []
-        row_ptrs_parts: list[np.ndarray] = []
         request_ids: list[str] = []
-        for request_id, ucm_block_ids, vllm_block_ids in self.request_data:
+        for request_id, ucm_block_ids, _ in self.request_data:
             if request_id in self._failure_req_ids:
                 continue
             total_ucm_block_ids.extend(ucm_block_ids)
-            row_ptrs_parts.append(
-                self.kv_cache_layout.extract_block_addrs_for_row(vllm_block_ids, row_id)
-            )
             request_ids.append(request_id)
         if not total_ucm_block_ids:
             self._submitted_load_rows.add(row_id)
             return
-        try:
-            row_ptrs = (
-                np.ascontiguousarray(row_ptrs_parts[0])
-                if len(row_ptrs_parts) == 1
-                else np.ascontiguousarray(np.concatenate(row_ptrs_parts, axis=0))
+        # Use the pre-computed row ptrs from start_load_kv to avoid
+        # repeated extract_block_addrs_for_row calls across rows.
+        row_ptrs = self._load_row_ptrs.get(row_id)
+        if row_ptrs is None:
+            all_vllm = [bid for _, _, bids in self.request_data for bid in bids]
+            row_ptrs = np.ascontiguousarray(
+                self.kv_cache_layout.extract_block_addrs_for_row(all_vllm, row_id)
             )
+        try:
             shard_indexs = [row_id] * len(total_ucm_block_ids)
             task = self.store.load_data(total_ucm_block_ids, shard_indexs, row_ptrs)
             self.load_tasks[row_id].append((task, tuple(request_ids)))
@@ -2877,6 +2889,9 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self._failure_req_ids.clear()
         self._submitted_load_rows.clear()
         self._dump_transfer_data = None
+        self._load_row_ptrs.clear()
+        self._dump_row_ptrs.clear()
+        self._step_dump_request_ids.clear()
         self.need_load = False
 
         for request_id, request in metadata.request_meta.items():
@@ -2897,6 +2912,16 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             self.request_data.append((request_id, ucm_block_ids, vllm_block_ids))
 
         if self.need_load and self.row_ids:
+            # Pre-compute per-row address arrays once for ALL load blocks combined.
+            # _submit_request_load_tasks_for_row will use these cached arrays instead
+            # of calling extract_block_addrs_for_row N_requests times per row.
+            all_vllm_load_ids = [bid for _, _, bids in self.request_data for bid in bids]
+            for row_id in self.row_ids:
+                self._load_row_ptrs[row_id] = np.ascontiguousarray(
+                    self.kv_cache_layout.extract_block_addrs_for_row(
+                        all_vllm_load_ids, row_id
+                    )
+                )
             self._submit_prefetch_rows(0, metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -2920,10 +2945,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 )
                 self._mark_load_failed(metadata, request_ids)
 
-        try:
-            next_row_idx = self.row_ids.index(row_id) + self._load_prefetch_rows
-        except (ValueError, IndexError):
+        cur_idx = self._row_id_to_idx.get(row_id)
+        if cur_idx is None:
             return
+        next_row_idx = cur_idx + self._load_prefetch_rows
         if next_row_idx < len(self.row_ids):
             self._submit_request_load_tasks_for_row_once(
                 self.row_ids[next_row_idx], metadata
@@ -2950,39 +2975,48 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
         if self._dump_transfer_data is None:
-            self._dump_transfer_data = self._build_dump_transfer_data(metadata, row_id)
+            self._dump_transfer_data = self._build_dump_transfer_data(metadata)
         total_ucm_block_ids, total_vllm_block_ids = self._dump_transfer_data
 
         if not total_ucm_block_ids:
             return
 
         self.is_save = True
-        self._wait_dump_tasks_for_row(row_id)
-        row_ptrs = self.kv_cache_layout.extract_block_addrs_for_row(
-            total_vllm_block_ids, row_id
-        )
+        # Use the pre-computed per-row ptrs to avoid re-calling extract_block_addrs_for_row.
+        row_ptrs = self._dump_row_ptrs.get(row_id)
+        if row_ptrs is None:
+            row_ptrs = np.ascontiguousarray(
+                self.kv_cache_layout.extract_block_addrs_for_row(
+                    total_vllm_block_ids, row_id
+                )
+            )
         shard_indexs = [row_id] * len(total_ucm_block_ids)
+        event_handle = 0
         try:
-            row_ptrs = np.ascontiguousarray(row_ptrs)
             event_handle = self._get_dump_event_handle()
             task = self.store.dump_data(
                 total_ucm_block_ids, shard_indexs, row_ptrs, event_handle
             )
-            self.dump_tasks[row_id].append(task)
+            # Accumulate tasks; they are committed to _pending_dump_tasks
+            # in wait_for_save so that dump I/O runs asynchronously while
+            # the next forward step is already executing.
+            self._row_dump_tasks.append((task, event_handle))
         except Exception as e:
             logger.error(
                 f"submit hybrid layerwise row {row_id} dump task failed. "
                 f"{type(e).__name__}: {e}"
             )
+            if self.enable_event_sync and event_handle and self.device is not None:
+                self.device.destroy_event_handle(event_handle)
 
     def _build_dump_transfer_data(
         self,
         metadata: "UCMConnectorMetadata",
-        row_id: int,
     ) -> tuple[list[bytes], list[int]]:
+        """Collect all dump blocks and pre-compute per-row address arrays."""
         total_ucm_block_ids: list[bytes] = []
         total_vllm_block_ids: list[int] = []
-        for _, request in metadata.request_meta.items():
+        for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
 
@@ -2991,33 +3025,71 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
                     ucm_block_ids,
                     vllm_block_ids,
-                    f"UCM hybrid layerwise dump row {row_id}",
+                    f"UCM hybrid layerwise dump request {request_id}",
                 )
                 if len(ucm_block_ids) == 0:
                     continue
+            self._step_dump_request_ids.add(request_id)
             ucm_block_ids = self._rank_scoped_ucm_block_ids(ucm_block_ids)
             total_ucm_block_ids.extend(ucm_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
-        return total_ucm_block_ids, total_vllm_block_ids
 
-    def _wait_dump_tasks_for_row(self, row_id: int) -> None:
-        row_tasks = self.dump_tasks.pop(row_id, [])
-        for task in row_tasks:
-            self.store.wait(task)
+        # Pre-compute address arrays for all rows so save_kv_layer can look them
+        # up by row_id without calling extract_block_addrs_for_row repeatedly.
+        if total_vllm_block_ids:
+            for row_id in self.row_ids:
+                self._dump_row_ptrs[row_id] = np.ascontiguousarray(
+                    self.kv_cache_layout.extract_block_addrs_for_row(
+                        total_vllm_block_ids, row_id
+                    )
+                )
+        return total_ucm_block_ids, total_vllm_block_ids
 
     def wait_for_save(self) -> None:
         if not self.is_save:
             return
-        try:
-            for row_id in self.row_ids:
-                self._wait_dump_tasks_for_row(row_id)
-        except Exception as e:
-            logger.error(f"wait for dump kv cache failed. {type(e).__name__}: {e}")
-        self.dump_tasks.clear()
+
+        # Move all row dump tasks to the inherited _pending_dump_tasks list so
+        # that dump I/O completes asynchronously while the next forward step runs.
+        # get_finished() will block on them once the request is truly finished.
+        if self._step_dump_request_ids and self._row_dump_tasks:
+            self._async_dump_req_ids.update(self._step_dump_request_ids)
+            for task, event_handle in self._row_dump_tasks:
+                self._pending_dump_tasks.append(
+                    PendingDumpTask(
+                        task=task,
+                        request_ids=set(self._step_dump_request_ids),
+                        event_handle=event_handle,
+                    )
+                )
+        elif self._row_dump_tasks:
+            # Fallback: no request tracking available; wait synchronously.
+            for task, event_handle in self._row_dump_tasks:
+                try:
+                    self.store.wait(task)
+                except Exception as e:
+                    logger.error(
+                        f"wait for dump kv cache failed. {type(e).__name__}: {e}"
+                    )
+                finally:
+                    if self.enable_event_sync and event_handle and self.device:
+                        self.device.destroy_event_handle(event_handle)
+
+        self._row_dump_tasks.clear()
         self._dump_transfer_data = None
+        self._dump_row_ptrs.clear()
         self.is_save = False
-        if self.enable_event_sync:
-            self.device.destroy_event_handles()
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, object] | None]:
+        # Keep blocks allocated until the async dump for this request finishes.
+        if request.request_id in self._async_dump_req_ids:
+            self._async_dump_req_ids.discard(request.request_id)
+            return True, None
+        return False, None
 
 
 class UCMConnector(KVConnectorBase_V1, SupportsHMA):
