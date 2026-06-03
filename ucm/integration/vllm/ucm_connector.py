@@ -58,6 +58,93 @@ from ucm.sparse.state import has_ucm_sparse
 
 logger = init_logger(__name__)
 
+_GIB = 1 << 30
+_CACHE_BUFFER_CAPACITY_KEY = "cache_buffer_capacity_gb"
+_CACHE_STORE_DEFAULT_BUFFER_CAPACITY_GB = 256
+_CACHE_STORE_DEFAULT_UNSHARED_BUFFER_CAPACITY_GB = 32
+_CACHE_STORE_COMPACT_CAPACITY_THRESHOLD_GB = 32
+_CACHE_STORE_MIN_BUFFER_NUMBER = 1024
+_CACHE_STORE_DEFAULT_LOAD_EXCLUSIVE_BUFFER_NUMBER = 1024
+
+
+def _normalize_tensor_size_list(tensor_size_list: Any) -> list[int]:
+    if isinstance(tensor_size_list, np.ndarray):
+        return [int(v) for v in tensor_size_list.reshape(-1).tolist()]
+    if isinstance(tensor_size_list, (list, tuple)):
+        return [int(v) for v in tensor_size_list]
+    return [int(tensor_size_list)]
+
+
+def _cache_store_required_capacity_gb(
+    config: dict[str, Any],
+    shard_size: int,
+) -> tuple[int, int]:
+    try:
+        load_exclusive_buffer_number = int(
+            config.get(
+                "cache_load_exclusive_buffer_number",
+                _CACHE_STORE_DEFAULT_LOAD_EXCLUSIVE_BUFFER_NUMBER,
+            )
+        )
+    except (TypeError, ValueError):
+        load_exclusive_buffer_number = _CACHE_STORE_DEFAULT_LOAD_EXCLUSIVE_BUFFER_NUMBER
+
+    required_buffer_number = max(
+        _CACHE_STORE_MIN_BUFFER_NUMBER,
+        load_exclusive_buffer_number * 2,
+    )
+    required_capacity_bytes = int(shard_size) * required_buffer_number
+    return math.ceil(required_capacity_bytes / _GIB), required_buffer_number
+
+
+def _ensure_cache_store_buffer_capacity(config: dict[str, Any], shard_size: int) -> None:
+    if shard_size <= 0:
+        return
+
+    required_capacity_gb, required_buffer_number = _cache_store_required_capacity_gb(
+        config, shard_size
+    )
+    required_capacity_bytes = required_capacity_gb * _GIB
+
+    configured_capacity = config.get(_CACHE_BUFFER_CAPACITY_KEY)
+    if configured_capacity is None:
+        share_buffer_enable = bool(config.get("share_buffer_enable", True))
+        current_capacity_gb = (
+            _CACHE_STORE_DEFAULT_BUFFER_CAPACITY_GB
+            if share_buffer_enable
+            else _CACHE_STORE_DEFAULT_UNSHARED_BUFFER_CAPACITY_GB
+        )
+        source = "default"
+    else:
+        try:
+            current_capacity_gb = int(configured_capacity)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid {_CACHE_BUFFER_CAPACITY_KEY}={configured_capacity}; "
+                "skip automatic capacity adjustment."
+            )
+            return
+        source = "configured"
+
+    if current_capacity_gb * _GIB >= required_capacity_bytes:
+        return
+    if required_capacity_gb <= _CACHE_STORE_COMPACT_CAPACITY_THRESHOLD_GB:
+        logger.warning(
+            f"{_CACHE_BUFFER_CAPACITY_KEY}={source} {current_capacity_gb}GB "
+            f"is smaller than required {required_capacity_gb}GB for "
+            f"shard_size={shard_size}, required_buffer_number={required_buffer_number}; "
+            "keep it unchanged because the required capacity does not exceed "
+            f"{_CACHE_STORE_COMPACT_CAPACITY_THRESHOLD_GB}GB."
+        )
+        return
+
+    config[_CACHE_BUFFER_CAPACITY_KEY] = required_capacity_gb
+    logger.warning(
+        f"Increase {_CACHE_BUFFER_CAPACITY_KEY} from {source} "
+        f"{current_capacity_gb}GB to {required_capacity_gb}GB for "
+        f"shard_size={shard_size}, required_buffer_number={required_buffer_number}."
+    )
+
 
 def _short_list(values: list[int], limit: int = 12) -> list[int]:
     return values[:limit]
@@ -138,6 +225,25 @@ class RequestDispatchMeta:
         list[bytes], list[int]
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
+
+
+@dataclass
+class SegmentedShardEntry:
+    tensor_index: int
+    offset: int
+    shard_index: int
+
+
+@dataclass
+class SegmentedShardBucket:
+    bucket_id: int
+    shard_size: int
+    entries: list[SegmentedShardEntry]
+    store: Optional[UcmKVStoreBaseV1] = None
+
+    @property
+    def block_size(self) -> int:
+        return self.shard_size * len(self.entries)
 
 
 class KVCacheLayout:
@@ -285,8 +391,12 @@ class PendingDumpTask:
 class RequestHasher:
     """hash(md5) request to generate ucm block id"""
 
-    def __init__(self, vllm_config, rank_id):
-        meta = f"{vllm_config.model_config.model}:{vllm_config.parallel_config.tensor_parallel_size}:{vllm_config.model_config.dtype}:{rank_id}"
+    def __init__(self, vllm_config, rank_id, namespace: str = ""):
+        meta = (
+            f"{vllm_config.model_config.model}:"
+            f"{vllm_config.parallel_config.tensor_parallel_size}:"
+            f"{vllm_config.model_config.dtype}:{rank_id}:{namespace}"
+        )
         self.meta_bytes = meta.encode("utf-8")
 
     def __call__(self, input_data) -> bytes:
@@ -395,14 +505,18 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         defer_scheduler_store = getattr(self, "_defer_scheduler_store", False)
         if role == KVConnectorRole.SCHEDULER:
-            self.request_hasher = RequestHasher(vllm_config, 0)
+            self.request_hasher = RequestHasher(
+                vllm_config, 0, self._request_hash_namespace()
+            )
             self._seed = self.request_hasher("UCM_HASH_SEED")
             # init scheduler-size connector
             if not defer_scheduler_store:
                 self.store = self._create_store(None)
         else:
             self.request_hasher = RequestHasher(
-                vllm_config, self.tp_rank % self.tp_size
+                vllm_config,
+                self.tp_rank % self.tp_size,
+                self._request_hash_namespace(),
             )
             self._connector_worker_meta = UCMWorkerMetadata()
 
@@ -449,6 +563,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 "connector_load_invalid_blocks_total": float(len(new_invalid_blocks)),
             }
         )
+    def _request_hash_namespace(self) -> str:
+        return str(self.launch_config.get("request_hash_namespace", ""))
 
     def generate_hash(
         self, block_size: int, token_ids: List[int], parent_block_hash_value: bytes
@@ -473,7 +589,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
     def _create_store(
         self,
         kv_cache_layout: Optional[KVCacheLayout],
-        cpu_affinity_cores: Optional[list[int]] = None,
+        tensor_size_list_override: Optional[list[int]] = None,
+        shard_size_override: Optional[int] = None,
+        block_size_override: Optional[int] = None,
+        unique_id_suffix: str = "",
+        compact_cache_buffer_capacity: bool = False,
     ) -> UcmKVStoreBaseV1:
         if len(self.connector_configs) != 1:
             raise RuntimeError(
@@ -489,14 +609,63 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends
-        config["unique_id"] = f"{self.engine_id}"
+        config["unique_id"] = f"{self.engine_id}{unique_id_suffix}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.local_rank
-            config["tensor_size_list"] = (
-                kv_cache_layout.tensor_size_list * self.blocks_per_chunk
+            tensor_size_list = _normalize_tensor_size_list(
+                tensor_size_list_override
+                if tensor_size_list_override is not None
+                else kv_cache_layout.tensor_size_list
             )
-            config["shard_size"] = kv_cache_layout.shard_size * self.blocks_per_chunk
-            config["block_size"] = kv_cache_layout.block_size * self.blocks_per_chunk
+            config["tensor_size_list"] = tensor_size_list * self.blocks_per_chunk
+            shard_size = (
+                shard_size_override
+                if shard_size_override is not None
+                else kv_cache_layout.shard_size
+            )
+            block_size = (
+                block_size_override
+                if block_size_override is not None
+                else kv_cache_layout.block_size
+            )
+            config["shard_size"] = shard_size * self.blocks_per_chunk
+            config["block_size"] = block_size * self.blocks_per_chunk
+            if compact_cache_buffer_capacity:
+                required_capacity_gb, required_buffer_number = (
+                    _cache_store_required_capacity_gb(config, config["shard_size"])
+                )
+                configured_capacity = config.get(_CACHE_BUFFER_CAPACITY_KEY)
+                if configured_capacity is None:
+                    config[_CACHE_BUFFER_CAPACITY_KEY] = (
+                        _CACHE_STORE_COMPACT_CAPACITY_THRESHOLD_GB
+                    )
+                    logger.info(
+                        f"Set {_CACHE_BUFFER_CAPACITY_KEY} to "
+                        f"{config[_CACHE_BUFFER_CAPACITY_KEY]}GB "
+                        f"for compact segmented shard_size={config['shard_size']}, "
+                        f"required_buffer_number={required_buffer_number}."
+                    )
+                else:
+                    try:
+                        configured_capacity_gb = int(configured_capacity)
+                    except (TypeError, ValueError):
+                        configured_capacity_gb = 0
+                    if (
+                        configured_capacity_gb
+                        > _CACHE_STORE_COMPACT_CAPACITY_THRESHOLD_GB
+                    ):
+                        config[_CACHE_BUFFER_CAPACITY_KEY] = max(
+                            _CACHE_STORE_COMPACT_CAPACITY_THRESHOLD_GB,
+                            required_capacity_gb,
+                        )
+                        logger.info(
+                            f"Adjust {_CACHE_BUFFER_CAPACITY_KEY} from "
+                            f"{configured_capacity_gb}GB to "
+                            f"{config[_CACHE_BUFFER_CAPACITY_KEY]}GB "
+                            f"for compact segmented shard_size={config['shard_size']}, "
+                            f"required_buffer_number={required_buffer_number}."
+                        )
+            _ensure_cache_store_buffer_capacity(config, config["shard_size"])
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
             buffer_addrs = kv_cache_layout.base_ptrs.reshape(-1).tolist()
             buffer_sizes = kv_cache_layout.buffer_sizes.reshape(-1).tolist()
@@ -512,8 +681,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 gpu_kv_buffer_sizes.append(key[1])
             config["gpu_kv_buffer_addrs"] = gpu_kv_buffer_addrs
             config["gpu_kv_buffer_sizes"] = gpu_kv_buffer_sizes
-            if cpu_affinity_cores:
-                config["cpu_affinity_cores"] = list(cpu_affinity_cores)
         else:
             config_base = self.block_size * self.element_size * self.head_size
             config["block_size"] = (
@@ -2180,6 +2347,20 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         # tensors.  Those rows naturally have a different number of physical
         # slices, so keep the UCM schema flattened instead of forcing a
         # rectangular layer-by-slice matrix.
+        self.row_slices: list[slice] = []
+        self.row_tensor_size_lists: list[list[int]] = [
+            [int(size) for size in row] for row in tensor_size_lists
+        ]
+        self.row_shard_sizes: list[int] = [
+            sum(row) for row in self.row_tensor_size_lists
+        ]
+
+        offset = 0
+        for row in tensor_size_lists:
+            next_offset = offset + len(row)
+            self.row_slices.append(slice(offset, next_offset))
+            offset = next_offset
+
         self.base_ptrs = np.asarray(
             [ptr for row in base_ptrs for ptr in row], dtype=np.uint64
         )
@@ -2202,6 +2383,20 @@ class HybridLinearAttentionLayout(HMAKVCacheLayout):
         return (
             vllm_block_ids_np[:, None] * self.block_stride_lists[None, :]
             + self.base_ptrs[None, :]
+        )
+
+    def extract_block_addrs_for_row(
+        self, vllm_block_ids: List[int], row_id: int
+    ) -> np.ndarray:
+        if row_id < 0 or row_id >= len(self.row_slices):
+            raise ValueError(
+                f"Invalid hybrid row_id={row_id}; row_count={len(self.row_slices)}"
+            )
+        row_slice = self.row_slices[row_id]
+        vllm_block_ids_np = np.asarray(vllm_block_ids, dtype=np.uint64)
+        return (
+            vllm_block_ids_np[:, None] * self.block_stride_lists[row_slice][None, :]
+            + self.base_ptrs[row_slice][None, :]
         )
 
     def _collect_shared_tensor_info(
@@ -2909,6 +3104,507 @@ class UCMHybridLinearAttentionConnector(UCMHMAConnector):
         )
 
 
+class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnector):
+    """Whole-block hybrid connector with smaller fixed-size store shards."""
+
+    def _request_hash_namespace(self) -> str:
+        user_namespace = super()._request_hash_namespace()
+        unified_store = self.launch_config.get("hybrid_segmented_unified_store", True)
+        max_shard_size = self.launch_config.get(
+            "hybrid_segmented_max_shard_size_bytes", 1 << 20
+        )
+        common_shard_size = self.launch_config.get(
+            "hybrid_segmented_common_shard_size_bytes", "auto"
+        )
+        min_common_shard_size = self.launch_config.get(
+            "hybrid_segmented_min_common_shard_size_bytes", 4096
+        )
+        max_shards_per_block = self.launch_config.get(
+            "hybrid_segmented_max_shards_per_block", 16384
+        )
+        return (
+            f"{user_namespace}:hybrid-segmented-v2:"
+            f"unified={unified_store}:"
+            f"max_shard={max_shard_size}:"
+            f"common={common_shard_size}:"
+            f"min_common={min_common_shard_size}:"
+            f"max_shards={max_shards_per_block}"
+        )
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        max_shard_size = self.launch_config.get(
+            "hybrid_segmented_max_shard_size_bytes", 1 << 20
+        )
+        try:
+            self._max_segmented_shard_size = max(1, int(max_shard_size))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid hybrid_segmented_max_shard_size_bytes=%r; fallback to 1MiB.",
+                max_shard_size,
+            )
+            self._max_segmented_shard_size = 1 << 20
+        trigger_shard_size = self.launch_config.get(
+            "hybrid_segmented_trigger_shard_size_bytes",
+            self._max_segmented_shard_size,
+        )
+        try:
+            self._segmented_trigger_shard_size = max(1, int(trigger_shard_size))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid hybrid_segmented_trigger_shard_size_bytes=%r; "
+                "fallback to max_shard_size.",
+                trigger_shard_size,
+            )
+            self._segmented_trigger_shard_size = self._max_segmented_shard_size
+        self._use_unified_segmented_store = self.launch_config.get(
+            "hybrid_segmented_unified_store", True
+        )
+        common_shard_size = self.launch_config.get(
+            "hybrid_segmented_common_shard_size_bytes"
+        )
+        self._common_segmented_shard_size: Optional[int] = None
+        if common_shard_size is not None:
+            try:
+                self._common_segmented_shard_size = max(1, int(common_shard_size))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid hybrid_segmented_common_shard_size_bytes=%r; "
+                    "fallback to auto gcd.",
+                    common_shard_size,
+                )
+        min_common_shard_size = self.launch_config.get(
+            "hybrid_segmented_min_common_shard_size_bytes", 4096
+        )
+        try:
+            self._min_common_segmented_shard_size = max(1, int(min_common_shard_size))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid hybrid_segmented_min_common_shard_size_bytes=%r; "
+                "fallback to 4096.",
+                min_common_shard_size,
+            )
+            self._min_common_segmented_shard_size = 4096
+        max_shards_per_block = self.launch_config.get(
+            "hybrid_segmented_max_shards_per_block", 16384
+        )
+        try:
+            self._max_segmented_shards_per_block = max(1, int(max_shards_per_block))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid hybrid_segmented_max_shards_per_block=%r; fallback to 16384.",
+                max_shards_per_block,
+            )
+            self._max_segmented_shards_per_block = 16384
+        self._use_segmented_store = False
+        self.segment_buckets: list[SegmentedShardBucket] = []
+        self._primary_segment_bucket_id = 0
+        logger.info(
+            "Init UCMHybridLinearAttentionSegmentedConnector "
+            f"with max_shard_size={self._max_segmented_shard_size}, "
+            f"trigger_shard_size={self._segmented_trigger_shard_size}, "
+            f"unified_store={self._use_unified_segmented_store}, "
+            f"min_common_shard_size={self._min_common_segmented_shard_size}, "
+            f"max_shards_per_block={self._max_segmented_shards_per_block}."
+        )
+
+    def _choose_segment_size(self, tensor_size: int) -> int:
+        if tensor_size <= self._max_segmented_shard_size:
+            return tensor_size
+
+        min_parts = math.ceil(tensor_size / self._max_segmented_shard_size)
+        for parts in range(min_parts, tensor_size + 1):
+            if tensor_size % parts == 0:
+                return tensor_size // parts
+        return 1
+
+    def _choose_common_segment_size(self, tensor_sizes: list[int]) -> Optional[int]:
+        if not self._use_unified_segmented_store:
+            return None
+
+        if self._common_segmented_shard_size is not None:
+            common_segment_size = self._common_segmented_shard_size
+            if any(
+                tensor_size % common_segment_size != 0
+                for tensor_size in tensor_sizes
+            ):
+                logger.warning(
+                    "Configured hybrid_segmented_common_shard_size_bytes=%s does not "
+                    "divide all tensor sizes %s; fallback to size buckets.",
+                    common_segment_size,
+                    _short_list(tensor_sizes),
+                )
+                return None
+        else:
+            common_segment_size = tensor_sizes[0]
+            for tensor_size in tensor_sizes[1:]:
+                common_segment_size = math.gcd(common_segment_size, tensor_size)
+            if common_segment_size <= 0:
+                return None
+            common_segment_size = self._choose_segment_size(common_segment_size)
+            if common_segment_size < self._min_common_segmented_shard_size:
+                logger.warning(
+                    "Hybrid unified segmented store common shard is too small: "
+                    f"common_shard_size={common_segment_size}, "
+                    f"limit={self._min_common_segmented_shard_size}; "
+                    "fallback to size buckets."
+                )
+                return None
+
+        shard_count = sum(
+            tensor_size // common_segment_size for tensor_size in tensor_sizes
+        )
+        if shard_count > self._max_segmented_shards_per_block:
+            logger.warning(
+                "Hybrid unified segmented store would create too many shards: "
+                f"common_shard_size={common_segment_size}, "
+                f"shards_per_block={shard_count}, "
+                f"limit={self._max_segmented_shards_per_block}; "
+                "fallback to size buckets."
+            )
+            return None
+        return common_segment_size
+
+    def _build_segment_buckets(self) -> list[SegmentedShardBucket]:
+        tensor_sizes = [
+            int(v) for v in self.kv_cache_layout.tensor_size_lists.reshape(-1).tolist()
+        ]
+        common_segment_size = self._choose_common_segment_size(tensor_sizes)
+        if common_segment_size is not None:
+            entries = []
+            for tensor_index, tensor_size in enumerate(tensor_sizes):
+                for offset in range(0, tensor_size, common_segment_size):
+                    entries.append(
+                        SegmentedShardEntry(
+                            tensor_index=tensor_index,
+                            offset=offset,
+                            shard_index=len(entries),
+                        )
+                    )
+            logger.info(
+                "Hybrid unified segmented bucket: "
+                f"common_shard_size={common_segment_size}, "
+                f"shards_per_block={len(entries)}, "
+                f"tensor_sizes={_short_list(tensor_sizes)}"
+            )
+            return [
+                SegmentedShardBucket(
+                    bucket_id=0,
+                    shard_size=common_segment_size,
+                    entries=entries,
+                )
+            ]
+
+        buckets_by_size: dict[int, list[tuple[int, int]]] = defaultdict(list)
+
+        for tensor_index, tensor_size in enumerate(tensor_sizes):
+            segment_size = self._choose_segment_size(tensor_size)
+            if tensor_size % segment_size != 0:
+                raise ValueError(
+                    "Segment size must divide tensor size exactly: "
+                    f"tensor_index={tensor_index}, tensor_size={tensor_size}, "
+                    f"segment_size={segment_size}"
+                )
+            for offset in range(0, tensor_size, segment_size):
+                buckets_by_size[segment_size].append((tensor_index, offset))
+
+        buckets: list[SegmentedShardBucket] = []
+        for bucket_id, shard_size in enumerate(sorted(buckets_by_size, reverse=True)):
+            entries = [
+                SegmentedShardEntry(
+                    tensor_index=tensor_index,
+                    offset=offset,
+                    shard_index=shard_index,
+                )
+                for shard_index, (tensor_index, offset) in enumerate(
+                    buckets_by_size[shard_size]
+                )
+            ]
+            buckets.append(
+                SegmentedShardBucket(
+                    bucket_id=bucket_id,
+                    shard_size=shard_size,
+                    entries=entries,
+                )
+            )
+
+        if not buckets:
+            raise RuntimeError("No segmented shard buckets were built for hybrid layout.")
+        return buckets
+
+    def _bucket_unique_id_suffix(self, bucket: SegmentedShardBucket) -> str:
+        return "" if bucket.bucket_id == self._primary_segment_bucket_id else (
+            f"-seg{bucket.bucket_id}"
+        )
+
+    def _bucket_block_ids(
+        self,
+        block_ids: list[bytes],
+        bucket: SegmentedShardBucket,
+    ) -> list[bytes]:
+        if bucket.bucket_id == self._primary_segment_bucket_id:
+            return block_ids
+        return [
+            self.request_hasher((bucket.bucket_id, block_id)) for block_id in block_ids
+        ]
+
+    def _build_bucket_task_data(
+        self,
+        block_ids: list[bytes],
+        vllm_block_ids: list[int],
+        bucket: SegmentedShardBucket,
+    ) -> tuple[list[bytes], list[int], np.ndarray]:
+        bucket_block_ids = self._bucket_block_ids(block_ids, bucket)
+        base_ptrs = self.kv_cache_layout.base_ptrs.reshape(-1)
+        strides = self.kv_cache_layout.block_stride_lists.reshape(-1)
+
+        task_block_ids: list[bytes] = []
+        shard_indexs: list[int] = []
+        ptrs: list[list[int]] = []
+        for block_id, vllm_block_id in zip(bucket_block_ids, vllm_block_ids):
+            for entry in bucket.entries:
+                task_block_ids.append(block_id)
+                shard_indexs.append(entry.shard_index)
+                ptr = (
+                    int(base_ptrs[entry.tensor_index])
+                    + int(vllm_block_id) * int(strides[entry.tensor_index])
+                    + entry.offset
+                )
+                ptrs.append([ptr])
+
+        return task_block_ids, shard_indexs, np.asarray(ptrs, dtype=np.uint64)
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
+            for layer_name, value in kv_caches.items():
+                kv_cache, _ = value
+                self.kv_caches[layer_name] = kv_cache
+        else:
+            self.kv_caches = kv_caches
+
+        self.kv_cache_layout = self._create_kv_cache_layout(self.kv_caches)
+        self.block_data_size = self.kv_cache_layout.block_size
+        self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
+        self.layer_ids = sorted(set(self.layer_name_to_id.values()))
+        self.first_layer_id = self.layer_ids[0]
+        self.device = create_device()
+
+        if self.kv_cache_layout.shard_size <= self._segmented_trigger_shard_size:
+            self.store = self._create_store(self.kv_cache_layout)
+
+        self.segment_buckets = self._build_segment_buckets()
+        self._use_segmented_store = True
+        primary_bucket = max(self.segment_buckets, key=lambda b: b.block_size)
+        self._primary_segment_bucket_id = primary_bucket.bucket_id
+        for bucket in self.segment_buckets:
+            bucket.store = self._create_store(
+                self.kv_cache_layout,
+                tensor_size_list_override=[bucket.shard_size],
+                shard_size_override=bucket.shard_size,
+                block_size_override=bucket.block_size,
+                unique_id_suffix=self._bucket_unique_id_suffix(bucket),
+                compact_cache_buffer_capacity=True,
+            )
+        self.store = primary_bucket.store
+
+        logger.info(
+            "Hybrid segmented layout: "
+            f"block_size={self.block_data_size}, "
+            f"buckets={[(b.bucket_id, b.shard_size, len(b.entries)) for b in self.segment_buckets]}, "
+            f"primary_bucket={self._primary_segment_bucket_id}"
+        )
+
+    def _rank_scoped_ucm_block_ids(self, ucm_block_ids: list[bytes]) -> list[bytes]:
+        if self.tp_rank == 0 or self.is_mla:
+            return list(ucm_block_ids)
+        return [self.request_hasher(ucm_block_id) for ucm_block_id in ucm_block_ids]
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        if not self._use_segmented_store:
+            return super().start_load_kv(forward_context, **kwargs)
+
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+
+        request_to_tasks: dict[
+            str, list[tuple[UcmKVStoreBaseV1, Task]]
+        ] = defaultdict(list)
+        request_to_load_blocks: dict[str, int] = {}
+        is_load = False
+        num_loaded_block = 0
+        num_loaded_request = 0
+        load_start_time = time.perf_counter() * 1000
+
+        for request_id, request in metadata.request_meta.items():
+            if len(request.load_block_ids[0]) == 0:
+                continue
+            is_load = True
+            num_loaded_block += len(request.load_block_ids[0])
+            num_loaded_request += 1
+
+            ucm_block_ids, vllm_block_ids = request.load_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM hybrid segmented load request {request_id}",
+                )
+                if len(ucm_block_ids) == 0:
+                    num_loaded_block -= len(request.load_block_ids[0])
+                    num_loaded_request -= 1
+                    continue
+                num_loaded_block -= len(request.load_block_ids[0]) - len(ucm_block_ids)
+
+            ucm_block_ids = self._rank_scoped_ucm_block_ids(ucm_block_ids)
+            try:
+                for bucket in self.segment_buckets:
+                    assert bucket.store is not None
+                    task_ids, shard_indexs, ptrs = self._build_bucket_task_data(
+                        ucm_block_ids, vllm_block_ids, bucket
+                    )
+                    task = bucket.store.load_data(task_ids, shard_indexs, ptrs)
+                    request_to_tasks[request_id].append((bucket.store, task))
+                request_to_load_blocks[request_id] = len(ucm_block_ids)
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit segmented load task error. "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                num_loaded_block -= len(ucm_block_ids)
+
+        for request_id, tasks in request_to_tasks.items():
+            try:
+                for store, task in tasks:
+                    store.wait(task)
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} wait segmented load task error. "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(
+                    metadata.request_meta[request_id].load_block_ids[1]
+                )
+                num_loaded_block -= request_to_load_blocks.get(request_id, 0)
+
+        load_end_time = time.perf_counter() * 1000
+        load_speed = (
+            num_loaded_block
+            * self.block_data_size
+            / max(load_end_time - load_start_time, 1e-6)
+            / 1024
+            / 1024
+        )
+        if self.metrics_config and is_load:
+            ucmmetrics.update_stats(
+                {
+                    "load_requests_num": num_loaded_request,
+                    "load_blocks_num": num_loaded_block,
+                    "load_duration": load_end_time - load_start_time,
+                    "load_speed": load_speed,
+                }
+            )
+
+    def wait_for_save(self) -> None:
+        if not self._use_segmented_store:
+            return super().wait_for_save()
+
+        if self.is_mla and self.tp_rank != 0:
+            return
+
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMConnectorMetadata)
+
+        is_save = False
+        num_saved_block = 0
+        num_saved_request = 0
+        total_ucm_block_ids: list[bytes] = []
+        total_vllm_block_ids: list[int] = []
+        for request_id, request in metadata.request_meta.items():
+            if len(request.dump_block_ids[0]) == 0:
+                continue
+
+            ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            if self._skip_null_vllm_blocks:
+                ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                    ucm_block_ids,
+                    vllm_block_ids,
+                    f"UCM hybrid segmented dump request {request_id}",
+                )
+                if len(ucm_block_ids) == 0:
+                    continue
+            is_save = True
+            num_saved_block += len(ucm_block_ids)
+            num_saved_request += 1
+            total_ucm_block_ids.extend(self._rank_scoped_ucm_block_ids(ucm_block_ids))
+            total_vllm_block_ids.extend(vllm_block_ids)
+
+        if not is_save:
+            return
+
+        event_handle = self._get_dump_event_handle()
+        save_start_time = time.perf_counter() * 1000
+        primary_bucket = next(
+            b
+            for b in self.segment_buckets
+            if b.bucket_id == self._primary_segment_bucket_id
+        )
+        secondary_buckets = [
+            b for b in self.segment_buckets if b.bucket_id != self._primary_segment_bucket_id
+        ]
+
+        try:
+            for bucket in secondary_buckets:
+                assert bucket.store is not None
+                task_ids, shard_indexs, ptrs = self._build_bucket_task_data(
+                    total_ucm_block_ids, total_vllm_block_ids, bucket
+                )
+                task = bucket.store.dump_data(
+                    task_ids, shard_indexs, ptrs, event_handle
+                )
+                bucket.store.wait(task)
+
+            assert primary_bucket.store is not None
+            task_ids, shard_indexs, ptrs = self._build_bucket_task_data(
+                total_ucm_block_ids, total_vllm_block_ids, primary_bucket
+            )
+            task = primary_bucket.store.dump_data(
+                task_ids, shard_indexs, ptrs, event_handle
+            )
+            primary_bucket.store.wait(task)
+
+            save_end_time = time.perf_counter() * 1000
+            save_speed = (
+                num_saved_block
+                * self.block_data_size
+                / max(save_end_time - save_start_time, 1e-6)
+                / 1024
+                / 1024
+            )
+            if self.metrics_config:
+                ucmmetrics.update_stats(
+                    {
+                        "save_requests_num": num_saved_request,
+                        "save_blocks_num": num_saved_block,
+                        "save_duration": save_end_time - save_start_time,
+                        "save_speed": save_speed,
+                    }
+                )
+        except Exception as e:
+            logger.error(
+                f"wait for segmented dump kv cache failed. {type(e).__name__}: {e}"
+            )
+        if self.enable_event_sync:
+            self.device.destroy_event_handles()
+
+
 class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnector):
     """Layerwise connector for full-attention + linear-attention hybrid layouts."""
 
@@ -2919,6 +3615,9 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+        self.launch_config = copy.deepcopy(self.launch_config)
+        self.launch_config["use_layerwise"] = True
+        self.use_layerwise = True
         self.load_tasks: dict[int, list[tuple[Task, tuple[str, ...]]]] = defaultdict(
             list
         )
@@ -2938,7 +3637,6 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 prefetch_rows_config,
             )
             self._load_prefetch_rows = 2
-        self.use_layerwise = True
         self.is_save = False
         self.need_load = False
         logger.info(
@@ -2947,12 +3645,50 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        super().register_kv_caches(kv_caches)
+        self.kv_caches = kv_caches
+
+        self.kv_cache_layout = self._create_kv_cache_layout(self.kv_caches)
+        self.block_data_size = int(self.kv_cache_layout.tensor_size_lists.sum())
         self.layer_name_to_id = self.kv_cache_layout.layer_name_to_id
         self.layer_ids = sorted(set(self.layer_name_to_id.values()))
         self.first_layer_id = self.layer_ids[0]
         self.layer_name_to_row = getattr(self.kv_cache_layout, "layer_name_to_row", {})
         self.row_ids = sorted(set(self.layer_name_to_row.values()))
+        row_tensor_size_lists = getattr(
+            self.kv_cache_layout, "row_tensor_size_lists", []
+        )
+        if not self.row_ids:
+            raise RuntimeError("Hybrid layerwise layout has no cache rows.")
+        if max(self.row_ids) >= len(row_tensor_size_lists):
+            raise RuntimeError(
+                "Hybrid layerwise row mapping is inconsistent with layout rows: "
+                f"row_ids={_short_list(self.row_ids)}, "
+                f"row_tensor_size_lists={len(row_tensor_size_lists)}"
+            )
+
+        first_row_id = self.row_ids[0]
+        row_tensor_size_list = list(row_tensor_size_lists[first_row_id])
+        row_shard_size = sum(row_tensor_size_list)
+        for row_id in self.row_ids:
+            tensor_size_list = list(row_tensor_size_lists[row_id])
+            if tensor_size_list != row_tensor_size_list:
+                raise RuntimeError(
+                    "Hybrid layerwise rows must share the same tensor layout for "
+                    "one row-sharded store: "
+                    f"row_id={row_id}, tensor_size_list={tensor_size_list}, "
+                    f"expected={row_tensor_size_list}"
+                )
+
+        self.device = create_device()
+
+        self.store = self._create_store(
+            self.kv_cache_layout,
+            tensor_size_list_override=row_tensor_size_list,
+            shard_size_override=row_shard_size,
+            block_size_override=row_shard_size * (max(self.row_ids) + 1),
+            compact_cache_buffer_capacity=True,
+        )
+
         row_to_layers: dict[int, list[str]] = defaultdict(list)
         for layer_name, row_id in self.layer_name_to_row.items():
             row_to_layers[row_id].append(layer_name)
@@ -2966,6 +3702,8 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         logger.info(
             "Hybrid layerwise layout: "
             f"rows={len(self.row_ids)}, row_ids={_short_list(self.row_ids)}, "
+            f"row_shard_size={row_shard_size}, "
+            f"row_tensor_size_list={row_tensor_size_list}, "
             f"row_save_layers={len(self.row_save_layer)}"
         )
 
@@ -3247,6 +3985,22 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         use_hybrid_linear_attention = use_hybrid_linear_attention_layout(
             kv_cache_config
         )
+        use_hybrid_linear_attention_layerwise = (
+            use_hybrid_linear_attention
+            and use_layerwise
+            and self.launch_config.get("hybrid_linear_attention_layerwise", True)
+        )
+        use_hybrid_linear_attention_segmented = (
+            use_hybrid_linear_attention
+            and not use_hybrid_linear_attention_layerwise
+            and self.launch_config.get("hybrid_linear_attention_segmented", True)
+        )
+        if use_hybrid_linear_attention_segmented:
+            logger.info(
+                "Hybrid linear attention detected; enabling segmented whole-block "
+                "UCM connector to avoid merged large shard/block I/O. Set "
+                "hybrid_linear_attention_segmented=false to disable."
+            )
 
         from ucm.integration.vllm.hma_connector import UCMFAWAConnector
 
@@ -3258,8 +4012,12 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMMockConnector(vllm_config, role, kv_cache_config)
         elif use_cp_parallel:
             self.connector = UCMCPConnector(vllm_config, role, kv_cache_config)
-        elif use_hybrid_linear_attention and use_layerwise:
+        elif use_hybrid_linear_attention_layerwise:
             self.connector = UCMHybridLinearAttentionLayerWiseConnector(
+                vllm_config, role, kv_cache_config
+            )
+        elif use_hybrid_linear_attention_segmented:
+            self.connector = UCMHybridLinearAttentionSegmentedConnector(
                 vllm_config, role, kv_cache_config
             )
         elif use_hybrid_linear_attention:
@@ -3270,6 +4028,8 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector = UCMLayerWiseConnector(vllm_config, role, kv_cache_config)
         else:
             self.connector = UCMDirectConnector(vllm_config, role, kv_cache_config)
+
+        logger.info(f"Selected UCM connector: {self.connector.__class__.__name__}")
 
     def get_num_new_matched_tokens(
         self,
