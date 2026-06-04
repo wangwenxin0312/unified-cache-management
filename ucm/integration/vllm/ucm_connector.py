@@ -3120,7 +3120,7 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
             "hybrid_segmented_min_common_shard_size_bytes", 4096
         )
         max_shards_per_block = self.launch_config.get(
-            "hybrid_segmented_max_shards_per_block", 16384
+            "hybrid_segmented_max_shards_per_block", 1024
         )
         return (
             f"{user_namespace}:hybrid-segmented-v2:"
@@ -3191,16 +3191,38 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
             )
             self._min_common_segmented_shard_size = 4096
         max_shards_per_block = self.launch_config.get(
-            "hybrid_segmented_max_shards_per_block", 16384
+            "hybrid_segmented_max_shards_per_block", 1024
         )
         try:
             self._max_segmented_shards_per_block = max(1, int(max_shards_per_block))
         except (TypeError, ValueError):
             logger.warning(
-                "Invalid hybrid_segmented_max_shards_per_block=%r; fallback to 16384.",
+                "Invalid hybrid_segmented_max_shards_per_block=%r; fallback to 1024.",
                 max_shards_per_block,
             )
-            self._max_segmented_shards_per_block = 16384
+            self._max_segmented_shards_per_block = 1024
+        max_task_items = self.launch_config.get(
+            "hybrid_segmented_max_task_items", 8192
+        )
+        try:
+            self._max_segmented_task_items = max(1, int(max_task_items))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid hybrid_segmented_max_task_items=%r; fallback to 8192.",
+                max_task_items,
+            )
+            self._max_segmented_task_items = 8192
+        max_inflight_tasks = self.launch_config.get(
+            "hybrid_segmented_max_inflight_tasks", 8
+        )
+        try:
+            self._max_segmented_inflight_tasks = max(1, int(max_inflight_tasks))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid hybrid_segmented_max_inflight_tasks=%r; fallback to 8.",
+                max_inflight_tasks,
+            )
+            self._max_segmented_inflight_tasks = 8
         self._use_segmented_store = False
         self.segment_buckets: list[SegmentedShardBucket] = []
         self._primary_segment_bucket_id = 0
@@ -3210,7 +3232,9 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
             f"trigger_shard_size={self._segmented_trigger_shard_size}, "
             f"unified_store={self._use_unified_segmented_store}, "
             f"min_common_shard_size={self._min_common_segmented_shard_size}, "
-            f"max_shards_per_block={self._max_segmented_shards_per_block}."
+            f"max_shards_per_block={self._max_segmented_shards_per_block}, "
+            f"max_task_items={self._max_segmented_task_items}, "
+            f"max_inflight_tasks={self._max_segmented_inflight_tasks}."
         )
 
     def _choose_segment_size(self, tensor_size: int) -> int:
@@ -3265,7 +3289,7 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
                 f"common_shard_size={common_segment_size}, "
                 f"shards_per_block={shard_count}, "
                 f"limit={self._max_segmented_shards_per_block}; "
-                "fallback to size buckets."
+                "fallback to size buckets to reduce small IO and metadata overhead."
             )
             return None
         return common_segment_size
@@ -3379,6 +3403,16 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
 
         return task_block_ids, shard_indexs, np.asarray(ptrs, dtype=np.uint64)
 
+    def _iter_segmented_task_chunks(
+        self,
+        task_block_ids: list[bytes],
+        shard_indexs: list[int],
+        ptrs: np.ndarray,
+    ):
+        for start in range(0, len(task_block_ids), self._max_segmented_task_items):
+            end = min(start + self._max_segmented_task_items, len(task_block_ids))
+            yield task_block_ids[start:end], shard_indexs[start:end], ptrs[start:end]
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
             for layer_name, value in kv_caches.items():
@@ -3431,14 +3465,32 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
-        request_to_tasks: dict[
-            str, list[tuple[UcmKVStoreBaseV1, Task]]
-        ] = defaultdict(list)
+        pending_tasks: list[tuple[str, UcmKVStoreBaseV1, Task]] = []
+        failed_requests: set[str] = set()
         request_to_load_blocks: dict[str, int] = {}
         is_load = False
         num_loaded_block = 0
         num_loaded_request = 0
         load_start_time = time.perf_counter() * 1000
+
+        def wait_pending_tasks() -> None:
+            nonlocal num_loaded_block
+            for request_id, store, task in pending_tasks:
+                try:
+                    store.wait(task)
+                except Exception as e:
+                    if request_id in failed_requests:
+                        continue
+                    logger.error(
+                        f"request {request_id} wait segmented load task error. "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    self._invalid_block_ids.update(
+                        metadata.request_meta[request_id].load_block_ids[1]
+                    )
+                    num_loaded_block -= request_to_load_blocks.get(request_id, 0)
+                    failed_requests.add(request_id)
+            pending_tasks.clear()
 
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
@@ -3461,15 +3513,25 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
                 num_loaded_block -= len(request.load_block_ids[0]) - len(ucm_block_ids)
 
             ucm_block_ids = self._rank_scoped_ucm_block_ids(ucm_block_ids)
+            request_to_load_blocks[request_id] = len(ucm_block_ids)
             try:
                 for bucket in self.segment_buckets:
                     assert bucket.store is not None
                     task_ids, shard_indexs, ptrs = self._build_bucket_task_data(
                         ucm_block_ids, vllm_block_ids, bucket
                     )
-                    task = bucket.store.load_data(task_ids, shard_indexs, ptrs)
-                    request_to_tasks[request_id].append((bucket.store, task))
-                request_to_load_blocks[request_id] = len(ucm_block_ids)
+                    for chunk_ids, chunk_shards, chunk_ptrs in (
+                        self._iter_segmented_task_chunks(task_ids, shard_indexs, ptrs)
+                    ):
+                        task = bucket.store.load_data(
+                            chunk_ids, chunk_shards, chunk_ptrs
+                        )
+                        pending_tasks.append((request_id, bucket.store, task))
+                        if (
+                            len(pending_tasks)
+                            >= self._max_segmented_inflight_tasks
+                        ):
+                            wait_pending_tasks()
             except Exception as e:
                 logger.error(
                     f"request {request_id} submit segmented load task error. "
@@ -3479,20 +3541,9 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
                 num_loaded_block -= len(ucm_block_ids)
+                failed_requests.add(request_id)
 
-        for request_id, tasks in request_to_tasks.items():
-            try:
-                for store, task in tasks:
-                    store.wait(task)
-            except Exception as e:
-                logger.error(
-                    f"request {request_id} wait segmented load task error. "
-                    f"{type(e).__name__}: {e}"
-                )
-                self._invalid_block_ids.update(
-                    metadata.request_meta[request_id].load_block_ids[1]
-                )
-                num_loaded_block -= request_to_load_blocks.get(request_id, 0)
+        wait_pending_tasks()
 
         load_end_time = time.perf_counter() * 1000
         load_speed = (
@@ -3561,24 +3612,43 @@ class UCMHybridLinearAttentionSegmentedConnector(UCMHybridLinearAttentionConnect
         ]
 
         try:
+            pending_tasks: list[tuple[UcmKVStoreBaseV1, Task]] = []
+
+            def wait_pending_tasks() -> None:
+                for store, task in pending_tasks:
+                    store.wait(task)
+                pending_tasks.clear()
+
             for bucket in secondary_buckets:
                 assert bucket.store is not None
                 task_ids, shard_indexs, ptrs = self._build_bucket_task_data(
                     total_ucm_block_ids, total_vllm_block_ids, bucket
                 )
-                task = bucket.store.dump_data(
-                    task_ids, shard_indexs, ptrs, event_handle
-                )
-                bucket.store.wait(task)
+                for chunk_ids, chunk_shards, chunk_ptrs in (
+                    self._iter_segmented_task_chunks(task_ids, shard_indexs, ptrs)
+                ):
+                    task = bucket.store.dump_data(
+                        chunk_ids, chunk_shards, chunk_ptrs, event_handle
+                    )
+                    pending_tasks.append((bucket.store, task))
+                    if len(pending_tasks) >= self._max_segmented_inflight_tasks:
+                        wait_pending_tasks()
+                wait_pending_tasks()
 
             assert primary_bucket.store is not None
             task_ids, shard_indexs, ptrs = self._build_bucket_task_data(
                 total_ucm_block_ids, total_vllm_block_ids, primary_bucket
             )
-            task = primary_bucket.store.dump_data(
-                task_ids, shard_indexs, ptrs, event_handle
-            )
-            primary_bucket.store.wait(task)
+            for chunk_ids, chunk_shards, chunk_ptrs in (
+                self._iter_segmented_task_chunks(task_ids, shard_indexs, ptrs)
+            ):
+                task = primary_bucket.store.dump_data(
+                    chunk_ids, chunk_shards, chunk_ptrs, event_handle
+                )
+                pending_tasks.append((primary_bucket.store, task))
+                if len(pending_tasks) >= self._max_segmented_inflight_tasks:
+                    wait_pending_tasks()
+            wait_pending_tasks()
 
             save_end_time = time.perf_counter() * 1000
             save_speed = (
@@ -3645,7 +3715,12 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        self.kv_caches = kv_caches
+        if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
+            for layer_name, value in kv_caches.items():
+                kv_cache, _ = value
+                self.kv_caches[layer_name] = kv_cache
+        else:
+            self.kv_caches = kv_caches
 
         self.kv_cache_layout = self._create_kv_cache_layout(self.kv_caches)
         self.block_data_size = int(self.kv_cache_layout.tensor_size_lists.sum())
@@ -3985,13 +4060,20 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         use_hybrid_linear_attention = use_hybrid_linear_attention_layout(
             kv_cache_config
         )
+        from ucm.integration.vllm.hybrid_connector import UCMHybridFAWAConnector
+
+        use_hybrid_fawa = UCMHybridFAWAConnector.can_handle_kv_cache_config(
+            kv_cache_config
+        )
         use_hybrid_linear_attention_layerwise = (
             use_hybrid_linear_attention
+            and not use_hybrid_fawa
             and use_layerwise
             and self.launch_config.get("hybrid_linear_attention_layerwise", True)
         )
         use_hybrid_linear_attention_segmented = (
             use_hybrid_linear_attention
+            and not use_hybrid_fawa
             and not use_hybrid_linear_attention_layerwise
             and self.launch_config.get("hybrid_linear_attention_segmented", True)
         )
@@ -4004,7 +4086,11 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
 
         from ucm.integration.vllm.hma_connector import UCMFAWAConnector
 
-        if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
+        if use_hybrid_fawa:
+            self.connector = UCMHybridFAWAConnector(
+                vllm_config, role, kv_cache_config
+            )
+        elif UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
         elif use_lite:
             self.connector = UCMLiteConnector(vllm_config, role, kv_cache_config)

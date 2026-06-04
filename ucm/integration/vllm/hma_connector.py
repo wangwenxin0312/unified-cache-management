@@ -15,7 +15,10 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.device import create_device
-from ucm.integration.vllm.ucm_connector import UCMDirectConnector
+from ucm.integration.vllm.ucm_connector import (
+    UCMDirectConnector,
+    _ensure_cache_store_buffer_capacity,
+)
 from ucm.logger import init_logger
 from ucm.sparse.utils import round_up
 from ucm.store.factory_v1 import UcmConnectorFactoryV1
@@ -589,6 +592,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     f"GC file size of {label} does not match real file size. "
                     f"Worker: {padded_size}, Scheduler: {self.file_size[label]}"
                 )
+            _ensure_cache_store_buffer_capacity(config, padded_size)
             # MLA stores aggregate TP shards under one logical rank group.
             config["local_rank_size"] = self.tp_size if self.is_mla else 1
             if cpu_affinity_cores:
