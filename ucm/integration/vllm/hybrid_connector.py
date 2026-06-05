@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     MambaSpec,
@@ -21,12 +22,15 @@ from ucm.integration.vllm.hma_connector import (
     UCMFAWAConnectorMetadata,
 )
 from ucm.integration.vllm.ucm_connector import (
+    _ensure_cache_store_buffer_capacity,
     _attention_component_sizes,
     _mamba_component_sizes,
     layer_name_to_kv_cache_spec,
     use_hybrid_linear_attention_layout,
 )
 from ucm.logger import init_logger
+from ucm.sparse.utils import round_up
+from ucm.store.factory_v1 import UcmConnectorFactoryV1
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -531,6 +535,9 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                 "Hybrid FAWA requires at least one full-attention group and "
                 "one state group."
             )
+        self._wa_state_row_count_hint = sum(
+            len(groups[group_id].layer_names) for group_id in self.window_group_ids
+        )
 
     def _base_store_config(self, store_suffix: str):
         name, module_path, config = super()._base_store_config(store_suffix)
@@ -546,6 +553,126 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                 namespaced_backends.append(backend_path)
             config["storage_backends"] = namespaced_backends
         return name, module_path, config
+
+    def _wa_state_row_sharding_enabled(self) -> bool:
+        return bool(
+            self.launch_config.get("hybrid_fawa_wa_state_row_sharding", True)
+        )
+
+    def _build_wa_state_row_specs(
+        self,
+        group_layouts: dict[int, HybridFAWAGroupLayout],
+    ) -> list[tuple[int, slice, list[int]]]:
+        specs: list[tuple[int, slice, list[int]]] = []
+        for group_id in self.window_group_ids:
+            layout = group_layouts.get(group_id)
+            if layout is None or getattr(layout, "component_kind", None) != "state":
+                continue
+
+            view_meta = getattr(layout, "view_meta", [])
+            start = 0
+            tensor_count = len(layout.tensor_sizes)
+            while start < tensor_count:
+                layer_name = (
+                    view_meta[start].get("layer_name")
+                    if start < len(view_meta) and isinstance(view_meta[start], dict)
+                    else None
+                )
+                end = start + 1
+                if layer_name is not None:
+                    while (
+                        end < tensor_count
+                        and end < len(view_meta)
+                        and isinstance(view_meta[end], dict)
+                        and view_meta[end].get("layer_name") == layer_name
+                    ):
+                        end += 1
+                elif start + 1 < tensor_count:
+                    # Raw fallback layouts expose state components in conv/ssm pairs.
+                    end = start + 2
+
+                row_slice = slice(start, end)
+                row_sizes = [
+                    int(size) for size in layout.tensor_sizes[row_slice].tolist()
+                ]
+                specs.append((group_id, row_slice, row_sizes))
+                start = end
+        return specs
+
+    def _create_wa_row_sharded_store(
+        self,
+        tensor_size_list: list[int],
+        row_count: int,
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ):
+        name, module_path, config = self._base_store_config("wa")
+        if self._role == KVConnectorRole.WORKER:
+            row_shard_size = round_up(sum(tensor_size_list), 4096)
+            config["device_id"] = self.local_rank
+            config["tensor_size_list"] = tensor_size_list
+            config["shard_size"] = row_shard_size
+            config["block_size"] = row_shard_size
+            _ensure_cache_store_buffer_capacity(config, row_shard_size)
+            config["local_rank_size"] = self.tp_size if self.is_mla else 1
+            if cpu_affinity_cores:
+                config["cpu_affinity_cores"] = list(cpu_affinity_cores)
+        logger.info(
+            "create hybrid FAWA WA row-sharded "
+            f"{name} with row_count={row_count}, "
+            f"config: {self._summarize_store_config(config)}"
+        )
+        return UcmConnectorFactoryV1.create_connector(name, config, module_path)
+
+    def _create_wa_store(
+        self,
+        group_layouts: Optional[dict[int, HybridFAWAGroupLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ):
+        self._wa_state_row_sharded = False
+        self._wa_state_row_specs: list[tuple[int, slice, list[int]]] = []
+
+        if not self._wa_state_row_sharding_enabled():
+            return super()._create_wa_store(group_layouts, cpu_affinity_cores)
+
+        if self._role != KVConnectorRole.WORKER:
+            self._wa_state_row_sharded = True
+            return self._create_wa_row_sharded_store([], 0, cpu_affinity_cores)
+
+        if group_layouts is None:
+            raise RuntimeError("Worker hybrid FAWA WA store needs layouts.")
+
+        row_specs = self._build_wa_state_row_specs(group_layouts)
+        if not row_specs:
+            logger.warning(
+                "Hybrid FAWA WA row-sharded layout is empty; fallback to wide WA store."
+            )
+            return super()._create_wa_store(group_layouts, cpu_affinity_cores)
+
+        row_tensor_size_list = list(row_specs[0][2])
+        for group_id, row_slice, tensor_size_list in row_specs:
+            if tensor_size_list != row_tensor_size_list:
+                logger.warning(
+                    "Hybrid FAWA WA row-sharded rows must share one tensor layout; "
+                    "fallback to wide WA store: "
+                    f"group_id={group_id}, row_slice={row_slice}, "
+                    f"tensor_size_list={tensor_size_list}, "
+                    f"expected={row_tensor_size_list}"
+                )
+                return super()._create_wa_store(group_layouts, cpu_affinity_cores)
+
+        self._wa_state_row_sharded = True
+        self._wa_state_row_specs = row_specs
+        logger.info(
+            "Hybrid FAWA WA row-sharded layout: "
+            f"rows={len(row_specs)}, "
+            f"row_tensor_size_list={row_tensor_size_list}, "
+            f"row_shard_size={sum(row_tensor_size_list)}"
+        )
+        return self._create_wa_row_sharded_store(
+            row_tensor_size_list,
+            len(row_specs),
+            cpu_affinity_cores,
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.kv_caches = kv_caches
@@ -631,6 +758,78 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
 
         return np.concatenate(all_ptrs, axis=1)
 
+    def _wa_state_row_count(self) -> int:
+        row_specs = getattr(self, "_wa_state_row_specs", [])
+        if row_specs:
+            return len(row_specs)
+        return int(getattr(self, "_wa_state_row_count_hint", 0))
+
+    def _wa_state_row_store_keys(self, store_key: bytes) -> list[bytes]:
+        return [
+            self.request_hasher((b"UCM_HYBRID_FAWA_WA_STATE_ROW", row_id, store_key))
+            for row_id in range(self._wa_state_row_count())
+        ]
+
+    def _build_wa_state_row_task_data(
+        self,
+        store_keys: list[bytes],
+        vllm_ids,
+    ) -> tuple[list[bytes], list[int], np.ndarray]:
+        task_keys: list[bytes] = []
+        shard_indices: list[int] = []
+        ptr_rows: list[list[int]] = []
+
+        for shard_index, (group_id, row_slice, _) in enumerate(
+            self._wa_state_row_specs
+        ):
+            layout = self.group_layouts.get(group_id)
+            if layout is None:
+                raise RuntimeError(
+                    f"Hybrid FAWA WA row-sharded layout misses group {group_id}."
+                )
+            block_ids = np.asarray(vllm_ids[group_id], dtype=np.uint64)
+            if len(store_keys) == 1 and block_ids.size > 1:
+                block_ids = block_ids[-1:]
+            if block_ids.size != len(store_keys):
+                raise RuntimeError(
+                    "Hybrid FAWA WA row-sharded pointer rows do not match keys: "
+                    f"group_id={group_id}, keys={len(store_keys)}, "
+                    f"block_ids={block_ids.size}"
+                )
+
+            group_ptrs = layout.extract_addrs(block_ids)[:, row_slice]
+            for key, ptr_row in zip(store_keys, group_ptrs):
+                task_keys.append(
+                    self.request_hasher(
+                        (b"UCM_HYBRID_FAWA_WA_STATE_ROW", shard_index, key)
+                    )
+                )
+                shard_indices.append(0)
+                ptr_rows.append([int(ptr) for ptr in ptr_row.tolist()])
+
+        if not ptr_rows:
+            raise RuntimeError("Hybrid FAWA WA row-sharded task is empty.")
+        return task_keys, shard_indices, np.asarray(ptr_rows, dtype=np.uint64)
+
+    def _lookup_external_hit_blocks(self, external_keys: list[bytes]) -> int:
+        if not getattr(self, "_wa_state_row_sharded", False):
+            return super()._lookup_external_hit_blocks(external_keys)
+        if self.fa_store is None:
+            raise RuntimeError("FA store is not initialized.")
+        if self.wa_store is None:
+            raise RuntimeError("WA store is not initialized.")
+
+        fa_hit_blocks = self.fa_store.lookup_on_prefix(external_keys) + 1
+        if fa_hit_blocks <= 0:
+            return 0
+
+        for hit_blocks in range(fa_hit_blocks, 0, -1):
+            key = external_keys[hit_blocks - 1]
+            row_keys = self._wa_state_row_store_keys(key)
+            if row_keys and all(self.wa_store.lookup(row_keys)):
+                return hit_blocks
+        return 0
+
     def _rank_scoped_store_keys(self, keys: list[bytes]) -> list[bytes]:
         if self.tp_rank == 0:
             return keys
@@ -657,6 +856,30 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             anchor_vllm_block_ids,
         )
 
+    def _submit_load_task_with_shards(
+        self,
+        request_id: str,
+        label: str,
+        store,
+        keys: list[bytes],
+        shard_indices: list[int],
+        ptrs: np.ndarray,
+        anchor_vllm_block_ids: set[int],
+    ) -> FAWALoadTask:
+        task = store.load_data(
+            self._rank_scoped_store_keys(keys),
+            shard_indices,
+            ptrs,
+        )
+        return FAWALoadTask(
+            request_id=request_id,
+            label=label,
+            store=store,
+            task=task,
+            key_count=len(keys),
+            anchor_vllm_block_ids=anchor_vllm_block_ids,
+        )
+
     def _submit_dump_task(
         self,
         label: str,
@@ -672,6 +895,91 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             ptrs,
             event_handle,
         )
+
+    def _submit_dump_task_with_shards(
+        self,
+        label: str,
+        store,
+        keys: list[bytes],
+        shard_indices: list[int],
+        ptrs: np.ndarray,
+        event_handle,
+    ) -> FAWADumpTask:
+        task = store.dump_data(
+            self._rank_scoped_store_keys(keys),
+            shard_indices,
+            ptrs,
+            event_handle,
+        )
+        return FAWADumpTask(
+            label=label,
+            store=store,
+            task=task,
+            key_count=len(keys),
+            event_handle=event_handle,
+        )
+
+    def start_load_kv(self, forward_context, **kwargs) -> None:
+        if not getattr(self, "_wa_state_row_sharded", False):
+            return super().start_load_kv(forward_context, **kwargs)
+
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, UCMFAWAConnectorMetadata):
+            raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
+
+        tasks: list[FAWALoadTask] = []
+        for request_id, request in metadata.request_meta.items():
+            if not request.load_keys:
+                continue
+            group0_vllm_block_ids = set(request.load_vllm_block_ids[0])
+            try:
+                if self.fa_store is None:
+                    raise RuntimeError("FA store is not initialized.")
+                if self.wa_store is None:
+                    raise RuntimeError("WA store is not initialized.")
+
+                fa_ptrs = self._extract_fa_ptr(
+                    request.load_keys,
+                    request.load_hash_start,
+                    request.load_hash_end,
+                    request.load_vllm_block_ids,
+                )
+                tasks.append(
+                    self._submit_load_task(
+                        request_id,
+                        "FA",
+                        self.fa_store,
+                        request.load_keys,
+                        fa_ptrs,
+                        group0_vllm_block_ids,
+                    )
+                )
+
+                window_keys = request.load_keys[-1:]
+                wa_keys, wa_shards, wa_ptrs = self._build_wa_state_row_task_data(
+                    window_keys,
+                    request.load_vllm_block_ids,
+                )
+                tasks.append(
+                    self._submit_load_task_with_shards(
+                        request_id,
+                        "WA",
+                        self.wa_store,
+                        wa_keys,
+                        wa_shards,
+                        wa_ptrs,
+                        group0_vllm_block_ids,
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit hybrid FAWA load task "
+                    f"error. {type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(group0_vllm_block_ids)
+
+        for load_task in tasks:
+            self._wait_load_task(load_task)
 
     def wait_for_save(self) -> None:
         """Persist every TP rank under rank-scoped keys.
@@ -696,6 +1004,9 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             wa_dump_keys: list[bytes] = []
             fa_ptr_rows: list[np.ndarray] = []
             wa_ptr_rows: list[np.ndarray] = []
+            wa_sharded_keys: list[bytes] = []
+            wa_shard_indices: list[int] = []
+            wa_sharded_ptr_rows: list[np.ndarray] = []
             dump_request_ids: tuple[str, ...] = ()
 
             for request_id, request in metadata.request_meta.items():
@@ -712,13 +1023,24 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                     )
                 )
 
-                wa_dump_keys.extend(request.dump_keys[-1:])
-                wa_ptr_rows.append(
-                    self._extract_wa_ptr(
-                        request.dump_keys[-1:],
-                        request.dump_vllm_block_ids,
+                if getattr(self, "_wa_state_row_sharded", False):
+                    task_keys, shard_indices, ptrs = (
+                        self._build_wa_state_row_task_data(
+                            request.dump_keys[-1:],
+                            request.dump_vllm_block_ids,
+                        )
                     )
-                )
+                    wa_sharded_keys.extend(task_keys)
+                    wa_shard_indices.extend(shard_indices)
+                    wa_sharded_ptr_rows.append(ptrs)
+                else:
+                    wa_dump_keys.extend(request.dump_keys[-1:])
+                    wa_ptr_rows.append(
+                        self._extract_wa_ptr(
+                            request.dump_keys[-1:],
+                            request.dump_vllm_block_ids,
+                        )
+                    )
 
             if fa_dump_keys:
                 fa_ptrs = np.vstack(fa_ptr_rows)
@@ -733,7 +1055,21 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                         event_handle,
                     )
                 )
-            if wa_dump_keys:
+            if wa_sharded_keys:
+                window_ptrs = np.vstack(wa_sharded_ptr_rows)
+                if dump_request_ids not in self.tp_dump_tasks:
+                    self.tp_dump_tasks[dump_request_ids] = []
+                self.tp_dump_tasks[dump_request_ids].append(
+                    self._submit_dump_task_with_shards(
+                        "WA",
+                        self.wa_store,
+                        wa_sharded_keys,
+                        wa_shard_indices,
+                        window_ptrs,
+                        event_handle,
+                    )
+                )
+            elif wa_dump_keys:
                 window_ptrs = np.vstack(wa_ptr_rows)
                 if dump_request_ids not in self.tp_dump_tasks:
                     self.tp_dump_tasks[dump_request_ids] = []
