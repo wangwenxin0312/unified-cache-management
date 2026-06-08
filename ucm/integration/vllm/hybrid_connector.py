@@ -764,9 +764,25 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             return len(row_specs)
         return int(getattr(self, "_wa_state_row_count_hint", 0))
 
+    def _wa_state_row_store_key(self, row_id: int, store_key: bytes) -> bytes:
+        cache = getattr(self, "_wa_state_row_store_key_cache", None)
+        if cache is None:
+            cache = {}
+            self._wa_state_row_store_key_cache = cache
+        cache_key = (row_id, store_key)
+        row_key = cache.get(cache_key)
+        if row_key is None:
+            if len(cache) > 65536:
+                cache.clear()
+            row_key = self.request_hasher(
+                (b"UCM_HYBRID_FAWA_WA_STATE_ROW", row_id, store_key)
+            )
+            cache[cache_key] = row_key
+        return row_key
+
     def _wa_state_row_store_keys(self, store_key: bytes) -> list[bytes]:
         return [
-            self.request_hasher((b"UCM_HYBRID_FAWA_WA_STATE_ROW", row_id, store_key))
+            self._wa_state_row_store_key(row_id, store_key)
             for row_id in range(self._wa_state_row_count())
         ]
 
@@ -777,7 +793,8 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
     ) -> tuple[list[bytes], list[int], np.ndarray]:
         task_keys: list[bytes] = []
         shard_indices: list[int] = []
-        ptr_rows: list[list[int]] = []
+        ptr_rows: list[np.ndarray] = []
+        group_ptr_cache: dict[int, np.ndarray] = {}
 
         for shard_index, (group_id, row_slice, _) in enumerate(
             self._wa_state_row_specs
@@ -797,15 +814,13 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                     f"block_ids={block_ids.size}"
                 )
 
-            group_ptrs = layout.extract_addrs(block_ids)[:, row_slice]
+            if group_id not in group_ptr_cache:
+                group_ptr_cache[group_id] = layout.extract_addrs(block_ids)
+            group_ptrs = group_ptr_cache[group_id][:, row_slice]
             for key, ptr_row in zip(store_keys, group_ptrs):
-                task_keys.append(
-                    self.request_hasher(
-                        (b"UCM_HYBRID_FAWA_WA_STATE_ROW", shard_index, key)
-                    )
-                )
+                task_keys.append(self._wa_state_row_store_key(shard_index, key))
                 shard_indices.append(0)
-                ptr_rows.append([int(ptr) for ptr in ptr_row.tolist()])
+                ptr_rows.append(ptr_row)
 
         if not ptr_rows:
             raise RuntimeError("Hybrid FAWA WA row-sharded task is empty.")
@@ -823,20 +838,44 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
         if fa_hit_blocks <= 0:
             return 0
 
+        row_count = self._wa_state_row_count()
         for hit_blocks in range(fa_hit_blocks, 0, -1):
             key = external_keys[hit_blocks - 1]
-            row_keys = self._wa_state_row_store_keys(key)
-            if row_keys and all(self.wa_store.lookup(row_keys)):
+            if row_count <= 0:
+                continue
+
+            first_row_key = self._wa_state_row_store_key(0, key)
+            if not self.wa_store.lookup([first_row_key])[0]:
+                continue
+
+            row_keys = [
+                self._wa_state_row_store_key(row_id, key)
+                for row_id in range(1, row_count)
+            ]
+            if not row_keys or all(self.wa_store.lookup(row_keys)):
                 return hit_blocks
         return 0
 
     def _rank_scoped_store_keys(self, keys: list[bytes]) -> list[bytes]:
         if self.tp_rank == 0:
             return keys
-        return [
-            self.request_hasher((b"UCM_HYBRID_FAWA_TP_RANK", self.tp_rank, key))
-            for key in keys
-        ]
+        cache = getattr(self, "_rank_scoped_store_key_cache", None)
+        if cache is None:
+            cache = {}
+            self._rank_scoped_store_key_cache = cache
+
+        scoped_keys = []
+        for key in keys:
+            scoped_key = cache.get(key)
+            if scoped_key is None:
+                if len(cache) > 65536:
+                    cache.clear()
+                scoped_key = self.request_hasher(
+                    (b"UCM_HYBRID_FAWA_TP_RANK", self.tp_rank, key)
+                )
+                cache[key] = scoped_key
+            scoped_keys.append(scoped_key)
+        return scoped_keys
 
     def _submit_load_task(
         self,
