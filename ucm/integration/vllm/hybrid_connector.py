@@ -35,6 +35,7 @@ from ucm.store.factory_v1 import UcmConnectorFactoryV1
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -715,6 +716,58 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             except Exception as e:
                 logger.warning(f"Failed to bind worker: {e}")
 
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        if num_computed_tokens % self.hash_block_size != 0:
+            raise RuntimeError(
+                f"Hybrid FAWA requires aligned computed tokens, got "
+                f"{num_computed_tokens} with block size {self.hash_block_size}."
+            )
+        hbm_hit_block_num = num_computed_tokens // self.hash_block_size
+        canonical_hashes = self.generate_hash(
+            self.hash_block_size, request.all_token_ids, self._seed
+        )
+
+        if self.persist_token_threshold > request.num_tokens:
+            return 0, False
+
+        external_keys = canonical_hashes[hbm_hit_block_num:]
+        if not external_keys:
+            return 0, False
+
+        try:
+            external_hit_blocks = self._lookup_external_hit_blocks(external_keys)
+        except Exception as e:
+            external_hit_blocks = 0
+            logger.error(
+                f"request {request.request_id} hybrid FAWA lookup error. "
+                f"{type(e).__name__}: {e}"
+            )
+
+        total_hit_block_num = hbm_hit_block_num + external_hit_blocks
+        external_hit_tokens = external_hit_blocks * self.hash_block_size
+        num_total_hit_tokens = total_hit_block_num * self.hash_block_size
+        if num_total_hit_tokens == request.num_tokens:
+            external_hit_tokens -= 1
+
+        self.requests_meta[request.request_id] = FAWARequestMeta(
+            ucm_block_ids=canonical_hashes,
+            hbm_hit_block_num=hbm_hit_block_num,
+            total_hit_block_num=total_hit_block_num,
+            num_token_ids=len(request.all_token_ids),
+            token_processed=num_total_hit_tokens,
+        )
+        logger.info(
+            f"Hybrid FAWA request_id: {request.request_id}, "
+            f"total_blocks_num: {len(canonical_hashes)}, "
+            f"hit hbm: {hbm_hit_block_num}, "
+            f"hit external: {external_hit_blocks}"
+        )
+        return external_hit_tokens, False
+
     def _slice_group_block_ids_for_reason(
         self,
         group_id: int,
@@ -722,6 +775,10 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
         window_boundary_token_idx: np.ndarray,
         reason: str,
     ) -> list[int]:
+        if reason == "dump" and group_id in self.mamba_align_group_ids:
+            group_meta = self.group_metas[group_id]
+            boundary_block_idx = window_boundary_token_idx // group_meta.token_block_size
+            return np.asarray(group_block_ids)[boundary_block_idx].tolist()
         if (
             reason == "load"
             and group_id in self.mamba_align_group_ids
@@ -958,6 +1015,18 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             event_handle=event_handle,
         )
 
+    def _wait_dump_task(self, dump_task: FAWADumpTask) -> None:
+        try:
+            dump_task.store.wait(dump_task.task)
+        except Exception as e:
+            logger.error(
+                "Hybrid FAWA dump task failed; external cache may miss. "
+                f"label={dump_task.label}, keys={dump_task.key_count}, "
+                f"{type(e).__name__}: {e}"
+            )
+        finally:
+            self.device.destroy_event_handle(dump_task.event_handle)
+
     def start_load_kv(self, forward_context, **kwargs) -> None:
         if not getattr(self, "_wa_state_row_sharded", False):
             return super().start_load_kv(forward_context, **kwargs)
@@ -1032,97 +1101,133 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
 
-        try:
-            event_handle = self._get_dump_event_handle()
-            if self.fa_store is None:
-                raise RuntimeError("FA store is not initialized.")
-            if self.wa_store is None:
-                raise RuntimeError("WA store is not initialized.")
+        if self.fa_store is None:
+            raise RuntimeError("FA store is not initialized.")
+        if self.wa_store is None:
+            raise RuntimeError("WA store is not initialized.")
 
-            fa_dump_keys: list[bytes] = []
-            wa_dump_keys: list[bytes] = []
-            fa_ptr_rows: list[np.ndarray] = []
-            wa_ptr_rows: list[np.ndarray] = []
-            wa_sharded_keys: list[bytes] = []
-            wa_shard_indices: list[int] = []
-            wa_sharded_ptr_rows: list[np.ndarray] = []
-            dump_request_ids: tuple[str, ...] = ()
+        fa_dump_keys: list[bytes] = []
+        wa_dump_keys: list[bytes] = []
+        fa_ptr_rows: list[np.ndarray] = []
+        wa_ptr_rows: list[np.ndarray] = []
+        wa_sharded_keys: list[bytes] = []
+        wa_shard_indices: list[int] = []
+        wa_sharded_ptr_rows: list[np.ndarray] = []
+        dump_tasks: list[FAWADumpTask] = []
 
-            for request_id, request in metadata.request_meta.items():
-                if not request.dump_keys:
-                    continue
-                dump_request_ids += (request_id,)
-                fa_dump_keys.extend(request.dump_keys)
-                fa_ptr_rows.append(
-                    self._extract_fa_ptr(
-                        request.dump_keys,
-                        request.dump_hash_start,
-                        request.dump_hash_end,
+        for request_id, request in metadata.request_meta.items():
+            if not request.dump_keys:
+                continue
+            fa_dump_keys.extend(request.dump_keys)
+            fa_ptr_rows.append(
+                self._extract_fa_ptr(
+                    request.dump_keys,
+                    request.dump_hash_start,
+                    request.dump_hash_end,
+                    request.dump_vllm_block_ids,
+                )
+            )
+
+            if getattr(self, "_wa_state_row_sharded", False):
+                task_keys, shard_indices, ptrs = self._build_wa_state_row_task_data(
+                    request.dump_keys,
+                    request.dump_vllm_block_ids,
+                )
+                wa_sharded_keys.extend(task_keys)
+                wa_shard_indices.extend(shard_indices)
+                wa_sharded_ptr_rows.append(ptrs)
+            else:
+                wa_dump_keys.extend(request.dump_keys[-1:])
+                wa_ptr_rows.append(
+                    self._extract_wa_ptr(
+                        request.dump_keys[-1:],
                         request.dump_vllm_block_ids,
                     )
                 )
 
-                if getattr(self, "_wa_state_row_sharded", False):
-                    task_keys, shard_indices, ptrs = (
-                        self._build_wa_state_row_task_data(
-                            request.dump_keys[-1:],
-                            request.dump_vllm_block_ids,
-                        )
-                    )
-                    wa_sharded_keys.extend(task_keys)
-                    wa_shard_indices.extend(shard_indices)
-                    wa_sharded_ptr_rows.append(ptrs)
-                else:
-                    wa_dump_keys.extend(request.dump_keys[-1:])
-                    wa_ptr_rows.append(
-                        self._extract_wa_ptr(
-                            request.dump_keys[-1:],
-                            request.dump_vllm_block_ids,
-                        )
-                    )
-
-            if fa_dump_keys:
-                fa_ptrs = np.vstack(fa_ptr_rows)
-                if dump_request_ids not in self.tp_dump_tasks:
-                    self.tp_dump_tasks[dump_request_ids] = []
-                self.tp_dump_tasks[dump_request_ids].append(
+        if fa_dump_keys:
+            event_handle = self._get_dump_event_handle()
+            try:
+                dump_tasks.append(
                     self._submit_dump_task(
                         "FA",
                         self.fa_store,
                         fa_dump_keys,
-                        fa_ptrs,
+                        np.vstack(fa_ptr_rows),
                         event_handle,
                     )
                 )
-            if wa_sharded_keys:
-                window_ptrs = np.vstack(wa_sharded_ptr_rows)
-                if dump_request_ids not in self.tp_dump_tasks:
-                    self.tp_dump_tasks[dump_request_ids] = []
-                self.tp_dump_tasks[dump_request_ids].append(
+            except Exception as e:
+                self.device.destroy_event_handle(event_handle)
+                logger.error(
+                    f"dump hybrid FAWA FA kv cache failed. {type(e).__name__}: {e}"
+                )
+        if wa_sharded_keys:
+            event_handle = self._get_dump_event_handle()
+            try:
+                dump_tasks.append(
                     self._submit_dump_task_with_shards(
                         "WA",
                         self.wa_store,
                         wa_sharded_keys,
                         wa_shard_indices,
-                        window_ptrs,
+                        np.vstack(wa_sharded_ptr_rows),
                         event_handle,
                     )
                 )
-            elif wa_dump_keys:
-                window_ptrs = np.vstack(wa_ptr_rows)
-                if dump_request_ids not in self.tp_dump_tasks:
-                    self.tp_dump_tasks[dump_request_ids] = []
-                self.tp_dump_tasks[dump_request_ids].append(
+            except Exception as e:
+                self.device.destroy_event_handle(event_handle)
+                logger.error(
+                    f"dump hybrid FAWA WA kv cache failed. {type(e).__name__}: {e}"
+                )
+        elif wa_dump_keys:
+            event_handle = self._get_dump_event_handle()
+            try:
+                dump_tasks.append(
                     self._submit_dump_task(
                         "WA",
                         self.wa_store,
                         wa_dump_keys,
-                        window_ptrs,
+                        np.vstack(wa_ptr_rows),
                         event_handle,
                     )
                 )
-        except Exception as e:
-            logger.error(f"dump hybrid FAWA kv cache failed. {type(e).__name__}: {e}")
+            except Exception as e:
+                self.device.destroy_event_handle(event_handle)
+                logger.error(
+                    f"dump hybrid FAWA WA kv cache failed. {type(e).__name__}: {e}"
+                )
+
+        for dump_task in dump_tasks:
+            self._wait_dump_task(dump_task)
+
+    def _drain_best_effort_dump_tasks(self, finished_req_ids: set[str]) -> None:
+        if not finished_req_ids:
+            return
+
+        finished_chunk_req_ids = []
+        for request_ids, dump_tasks in self.tp_dump_tasks.items():
+            if finished_req_ids.intersection(request_ids):
+                finished_chunk_req_ids.append(request_ids)
+                for dump_task in dump_tasks:
+                    self._wait_dump_task(dump_task)
+
+        for request_ids in finished_chunk_req_ids:
+            self.tp_dump_tasks.pop(request_ids, None)
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str] | None, set[str] | None]:
+        self._drain_best_effort_dump_tasks(finished_req_ids)
+        return None, None
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, object] | None]:
+        return False, None
 
     def _generate_dispatch_meta(
         self,
