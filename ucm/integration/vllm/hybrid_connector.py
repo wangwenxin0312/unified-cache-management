@@ -774,6 +774,7 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
         group_block_ids: list[int],
         window_boundary_token_idx: np.ndarray,
         reason: str,
+        fetch_wa_block_wise: bool,
     ) -> list[int]:
         if reason == "dump" and group_id in self.mamba_align_group_ids:
             group_meta = self.group_metas[group_id]
@@ -792,6 +793,7 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             group_id,
             group_block_ids,
             window_boundary_token_idx,
+            fetch_wa_block_wise=fetch_wa_block_wise,
         )
 
     def _extract_wa_ptr(self, store_keys, vllm_ids):
@@ -1090,11 +1092,13 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
             self._wait_load_task(load_task)
 
     def wait_for_save(self) -> None:
-        """Persist every TP rank under rank-scoped keys.
+        """Submit rank-scoped dumps without waiting for store completion.
 
         The base FAWA connector balances canonical blocks across TP ranks.
         Qwen hybrid KV/state tensors are TP-sharded, so every rank must save
-        and later load its own shard for every reusable block.
+        and later load its own shard for every reusable block. The returned
+        dump tasks are drained when the corresponding request finishes, matching
+        the async lifecycle used by :class:`UCMFAWAConnector`.
         """
 
         metadata = self._get_connector_metadata()
@@ -1114,10 +1118,12 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
         wa_shard_indices: list[int] = []
         wa_sharded_ptr_rows: list[np.ndarray] = []
         dump_tasks: list[FAWADumpTask] = []
+        dump_request_ids: tuple[str, ...] = ()
 
         for request_id, request in metadata.request_meta.items():
             if not request.dump_keys:
                 continue
+            dump_request_ids += (request_id,)
             fa_dump_keys.extend(request.dump_keys)
             fa_ptr_rows.append(
                 self._extract_fa_ptr(
@@ -1198,8 +1204,10 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                     f"dump hybrid FAWA WA kv cache failed. {type(e).__name__}: {e}"
                 )
 
-        for dump_task in dump_tasks:
-            self._wait_dump_task(dump_task)
+        if dump_tasks:
+            if dump_request_ids not in self.tp_dump_tasks:
+                self.tp_dump_tasks[dump_request_ids] = []
+            self.tp_dump_tasks[dump_request_ids].extend(dump_tasks)
 
     def _drain_best_effort_dump_tasks(self, finished_req_ids: set[str]) -> None:
         if not finished_req_ids:
@@ -1267,6 +1275,7 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                         group_block_ids,
                         window_boundary_token_idx,
                         "load",
+                        fetch_wa_block_wise=False,
                     )
                 )
 
@@ -1290,6 +1299,7 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                         group_block_ids,
                         window_boundary_token_idx,
                         "dump",
+                        fetch_wa_block_wise=self.wa_dump_block_wise,
                     )
                 )
         req_meta.token_processed = computed_end_token
