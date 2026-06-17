@@ -1134,19 +1134,23 @@ class UCMHybridFAWAConnector(UCMFAWAConnector):
                 )
             )
 
+            # Linear-attention state is only materialized for the state page as
+            # it exists after this forward. Do not write that final state under
+            # intermediate 384-token boundary keys.
+            wa_final_keys = request.dump_keys[-1:]
             if getattr(self, "_wa_state_row_sharded", False):
                 task_keys, shard_indices, ptrs = self._build_wa_state_row_task_data(
-                    request.dump_keys,
+                    wa_final_keys,
                     request.dump_vllm_block_ids,
                 )
                 wa_sharded_keys.extend(task_keys)
                 wa_shard_indices.extend(shard_indices)
                 wa_sharded_ptr_rows.append(ptrs)
             else:
-                wa_dump_keys.extend(request.dump_keys[-1:])
+                wa_dump_keys.extend(wa_final_keys)
                 wa_ptr_rows.append(
                     self._extract_wa_ptr(
-                        request.dump_keys[-1:],
+                        wa_final_keys,
                         request.dump_vllm_block_ids,
                     )
                 )
